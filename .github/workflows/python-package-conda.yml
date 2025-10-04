@@ -1,4 +1,4 @@
-name: Python Package using Conda + EchoOps (OS Upgrade mandatory)
+name: Python Package using Conda + EchoOps (OS Upgrade + AutoFix PR, sed-safe)
 
 on:
   push:
@@ -90,17 +90,78 @@ jobs:
           show-channel-urls: true
           use-only-tar-bz2: true
 
-      # 🔧 IPython '??' 라인 제거(견고/안전, bash -c 제거 & 이스케이프 보강)
-      - name: Sanitize stray IPython help lines
+      # 🔧 sed/xargs 미사용: awk로 안전하게 '??' 제거 + 자동 import 패치 + PR
+      - name: Auto-fix notebook artifacts & missing imports (sed-safe)
         shell: bash -l {0}
+        env:
+          PR_BRANCH: fix/autofix-notebook-and-imports
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          # '??'로 시작하는 라인 제거. GNU grep 기본 BRE에서 '?'는 리터럴이지만, 이스케이프로 명확화.
-          # 파일 목록만 뽑아 sed에 안전 전달
-          run_cmd grep -RIl -- '^\?\?' . | xargs -r sed -i -e '/^\?\?/d'
-          # 보조: 앞에 공백이 포함된 '  ??something' 도 제거
-          run_cmd grep -RIl -- '^[[:space:]]\+\?\?' . | xargs -r sed -i -E '/^[[:space:]]+\?\?/d' || true
+
+          # 0) Git 설정(권한/세이프 디렉토리)
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+
+          # 1) '??'로 시작(앞 공백 허용)하는 라인 제거 — awk 사용 (sed/xargs 미사용)
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            # awk ERE: ^[[:space:]]*\?\?  => 라인 앞 공백 후 '??'로 시작하면 제거
+            awk '!/^[[:space:]]*\?\?/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+          done < <(git ls-files '*.py')
+
+          # 2) 'spla.' 사용 파일 → import scipy.linalg as spla 주입(없을 때만)
+          while IFS= read -r -d '' f; do
+            if ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f"; then
+              awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              logf "Inserted: import scipy.linalg as spla -> $f"
+            fi
+          done < <(grep -RlZ -- 'spla\.' --include='*.py' . || true)
+
+          # 3) 'pearsonr' 사용 파일 → from scipy.stats import pearsonr 주입(없을 때만)
+          while IFS= read -r -d '' f; do
+            if ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f"; then
+              awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              logf "Inserted: from scipy.stats import pearsonr -> $f"
+            fi
+          done < <(grep -RlZ -- 'pearsonr' --include='*.py' . || true)
+
+          # 4) 'np.' 사용 파일 → import numpy as np 주입(없을 때만)
+          while IFS= read -r -d '' f; do
+            if ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f"; then
+              awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              logf "Inserted: import numpy as np -> $f"
+            fi
+          done < <(grep -RlZ -E -- '(^|[^a-zA-Z0-9_])np\.' --include='*.py' . || true)
+
+          # 변경 요약
+          run_cmd git status --porcelain | tee "${LOG_DIR}/echo-autofix-status.txt"
+
+          # 변경 있으면 커밋 (PR 생성은 다음 스텝에서)
+          if [ -n "$(git status --porcelain)" ]; then
+            run_cmd git config user.name "github-actions[bot]"
+            run_cmd git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            run_cmd git checkout -B "${PR_BRANCH}"
+            run_cmd git add -A
+            run_cmd git commit -m "chore: auto-fix notebook artifacts (??) and missing imports (spla, pearsonr, numpy)"
+          else
+            ok "No changes to commit; skipping PR commit."
+          fi
+
+      - name: Create Pull Request (if changes)
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: auto-fix notebook artifacts (??) and missing imports"
+          title: "Auto-fix: notebook artifacts & missing imports"
+          body: |
+            자동 패치:
+            - 노트북 유입 `??` 라인 제거(awk 기반)
+            - `spla`, `pearsonr`, `numpy` 누락 import 자동 삽입
+            - Echo 로그에 상세 내용 기록
+          branch: fix/autofix-notebook-and-imports
+          add-paths: |
+            **/*.py
+            .github/echo_logs/**
 
       - name: Create/Update Conda environment from environment.yml
         shell: bash -l {0}
