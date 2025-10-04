@@ -35,13 +35,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # forge-only condarc
       - name: Write quiet condarc (forge-only)
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p .github/conda
           cat > .github/conda/condarc <<'CONDARC'
-          # forge 단일 채널만 사용
           channels:
             - conda-forge
           channel_priority: strict
@@ -53,7 +53,6 @@ jobs:
           pkgs_dirs:
             - /home/runner/conda_pkgs_dir
           use_only_tar_bz2: true
-          # 기본 채널도 conda-forge로 강제 (repo.anaconda.com 접근 차단)
           default_channels:
             - https://conda.anaconda.org/conda-forge
           custom_channels: {}
@@ -124,8 +123,25 @@ jobs:
           use-only-tar-bz2: true
           condarc-file: .github/conda/condarc
 
-      # 🔧 .py만 대상으로 안전 정리 + 자동 import + 커밋(괄호 메시지 보호)
+      # system 레벨에서도 forge-only 강제 (repo.anaconda.com 경고 추가 차단)
+      - name: Enforce forge-only (system-level, pre-env)
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          conda config --system --remove channels defaults || true
+          conda config --system --set channel_priority strict
+          conda config --system --set show_channel_urls true
+          conda config --system --set solver libmamba
+          conda config --system --set use_only_tar_bz2 true
+          conda config --system --remove-key default_channels || true
+          conda config --system --add default_channels https://conda.anaconda.org/conda-forge
+          conda config --system --remove-key custom_channels || true
+          conda config --system --remove-key custom_multichannels || true
+          conda info
+
+      # 🔧 .py만 대상으로 안전 정리 + 자동 import + 커밋
       - name: Auto-fix notebook artifacts & missing imports (py-only)
+        id: autofix
         shell: bash -l {0}
         env:
           PR_BRANCH: fix/autofix-notebook-and-imports
@@ -134,7 +150,7 @@ jobs:
           source /tmp/echo_helpers.sh
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
 
-          # 추적되는 .py 목록만 사용 (YAML/IPYNB 오염 방지)
+          # 추적되는 .py만 처리 (YAML/IPYNB 오염 방지)
           mapfile -d '' PYFILES < <(git ls-files -z '*.py')
 
           # 1) '??'로 시작(앞 공백 허용) 라인 제거
@@ -143,54 +159,49 @@ jobs:
             awk '!/^[[:space:]]*\?\?/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
-          # 2) spla 사용 파일 → import scipy.linalg as spla (없으면 주입)
+          # 2) spla 사용 파일 → import scipy.linalg as spla
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
-            if grep -q 'spla\.' "$f"; then
-              if ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f"; then
-                awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-                logf "Inserted: import scipy.linalg as spla -> $f"
-              fi
+            if grep -q 'spla\.' "$f" && ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f"; then
+              awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              logf "Inserted: import scipy.linalg as spla -> $f"
             fi
           done
 
-          # 3) pearsonr 사용 파일 → from scipy.stats import pearsonr (없으면 주입)
+          # 3) pearsonr 사용 파일 → from scipy.stats import pearsonr
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
-            if grep -q 'pearsonr' "$f"; then
-              if ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f"; then
-                awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-                logf "Inserted: from scipy.stats import pearsonr -> $f"
-              fi
+            if grep -q 'pearsonr' "$f" && ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f"; then
+              awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              logf "Inserted: from scipy.stats import pearsonr -> $f"
             fi
           done
 
-          # 4) np. 사용 파일 → import numpy as np (없으면 주입)
+          # 4) np. 사용 파일 → import numpy as np
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
-            if grep -qE '(^|[^A-Za-z0-9_])np\.' "$f"; then
-              if ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f"; then
-                awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-                logf "Inserted: import numpy as np -> $f"
-              fi
+            if grep -qE '(^|[^A-Za-z0-9_])np\.' "$f" && ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f"; then
+              awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+              logf "Inserted: import numpy as np -> $f"
             fi
           done
 
-          # 변경 요약
-          run_cmd git status --porcelain | tee "${LOG_DIR}/echo-autofix-status.txt"
+          git status --porcelain | tee "${LOG_DIR}/echo-autofix-status.txt"
 
-          # 변경 있으면 커밋 (괄호/특수문자 안전하게 큰따옴표로)
           if [ -n "$(git status --porcelain)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git checkout -B "${PR_BRANCH}"
             git add -A
+            # 괄호/특수문자 안전
             git commit -m "chore: auto-fix notebook artifacts (??) and missing imports (spla, pearsonr, numpy)"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
-            ok "No changes to commit; skipping PR commit."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Pull Request (if changes)
+        if: steps.autofix.outputs.has_changes == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -205,23 +216,6 @@ jobs:
           add-paths: |
             **/*.py
             .github/echo_logs/**
-
-      - name: Enforce forge-only channels post-setup (belt & suspenders)
-        shell: bash -l {0}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          # 혹시 모를 defaults 흔적 제거 및 기본채널 강제 지정
-          conda config --remove channels defaults || true
-          conda config --set channel_priority strict
-          conda config --set show_channel_urls true
-          conda config --set solver libmamba
-          conda config --set use_only_tar_bz2 true
-          conda config --remove-key default_channels || true
-          conda config --add default_channels https://conda.anaconda.org/conda-forge
-          conda config --remove-key custom_channels || true
-          conda config --remove-key custom_multichannels || true
-          conda config --show | tee -a "${LOG_DIR}/echo-main.log"
 
       - name: Create/Update Conda environment from environment.yml
         shell: bash -l {0}
