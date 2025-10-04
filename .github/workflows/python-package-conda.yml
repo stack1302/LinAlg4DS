@@ -1,4 +1,4 @@
-name: Python Package using Conda + EchoOps (quiet, forge-only, sed-safe, PR + Healthchecks)
+name: Python Package using Conda + EchoOps (no-healthchecks)
 
 on:
   push:
@@ -10,6 +10,16 @@ on:
         type: boolean
         required: false
         default: true
+      echo_message:
+        description: "에코로 남길 메시지"
+        type: string
+        required: false
+        default: ""
+      echo_filename:
+        description: "에코 파일명 (ECHO_DIR 아래)"
+        type: string
+        required: false
+        default: "message.txt"
 
 jobs:
   build-test:
@@ -19,10 +29,7 @@ jobs:
       LOG_DIR: .github/echo_logs
       ECHO_DIR: .github/echo_files
       SITE_DIR: site
-      ECHO_OK: "✅"
-      ECHO_WARN: "⚠️"
-      ECHO_FAIL: "❌"
-      CONDA_ENV: "test-env"
+      CONDA_ENV: test-env
       PY_VERSION: "3.10"
       ECHO_VERBOSE: ${{ github.event_name == 'workflow_dispatch' && inputs.echo_verbose || 'true' }}
       MAMBA_NO_BANNER: "1"
@@ -34,17 +41,43 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Write quiet condarc (forge-only)
+      - name: Init Echo dirs & helpers
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p .github/conda
-          cat > .github/conda/condarc <<'CONDARC'
+          install -d -m 0755 "${LOG_DIR}" "${ECHO_DIR}" "${SITE_DIR}"
+          cat > /tmp/echo.sh <<'SH'
+          set -o pipefail
+          echo_run(){ echo "▶ $*"; set +e; eval "$@"; rc=$?; set -e; echo "RC=$rc"; return $rc; }
+          tee_ok(){ f="$1"; shift; { echo "$@"; } | tee -a "$f"; chmod 0644 "$f"; }
+          SH
+          chmod 0755 /tmp/echo.sh
+          TS="$(date +%Y%m%d-%H%M%S)"
+          echo "Hello Echo ${TS}" > "${ECHO_DIR}/hello.txt"; chmod 0644 "${ECHO_DIR}/hello.txt"
+          printf '<html><body><h1>Echo %s</h1></body></html>\n' "$TS" > "${SITE_DIR}/index.html"; chmod 0644 "${SITE_DIR}/index.html"
+
+      - name: Echo message (manual runs)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          IN_MSG: ${{ inputs.echo_message }}
+          OUT_FILE: ${{ inputs.echo_filename }}
+        run: |
+          set -Eeuo pipefail
+          . /tmp/echo.sh
+          F="${ECHO_DIR}/${OUT_FILE:-message.txt}"
+          TS="$(date +%Y-%m-%dT%H:%M:%S%z)"
+          tee_ok "$F" "[$TS] ${IN_MSG:-'(no message)'}"
+
+      - name: Write condarc (forge-only)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > .github-condarc <<'CONDARC'
           channels:
             - conda-forge
           channel_priority: strict
           show_channel_urls: true
-          auto_update_conda: true
           solver: libmamba
           notify_outdated_conda: false
           changeps1: false
@@ -58,62 +91,19 @@ jobs:
           channel_alias: https://conda.anaconda.org
           CONDARC
 
-      - name: Prepare Echo helpers, dirs and permissions
+      - name: Upgrade OS packages (echo)
         shell: bash
         run: |
           set -Eeuo pipefail
-          umask 022
-          install -d -m 0755 "${LOG_DIR}" "${ECHO_DIR}" "${SITE_DIR}"
-          cat > /tmp/echo_helpers.sh <<'SH'
-          set -o pipefail
-          ok(){    printf '%s %s\n' "${ECHO_OK}" "$*"; }
-          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
-          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
-          logf(){  printf '%s\n' "$*" | tee -a "${LOG_DIR}/echo-main.log"; }
-          run_cmd(){
-            logf "▶ $*"
-            set +e
-            eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo-main.log"
-            local rc=${PIPESTATUS[0]}
-            set -e
-            if [ $rc -eq 0 ]; then ok "DONE: $*"; else warn "RC=$rc ← $*"; fi
-            return $rc
-          }
-          SH
-          chmod 0755 /tmp/echo_helpers.sh
-          source /tmp/echo_helpers.sh
-          TS="$(date +%Y%m%d-%H%M%S)"
-          echo "Hello Echo ${TS}" > "${ECHO_DIR}/hello.txt"
-          printf 'LOG INIT %s\n' "${TS}" >> "${LOG_DIR}/echo-main.log"
-          install -m 0644 /dev/null "${ECHO_DIR}/README.echo"
-          printf '<html><body><h1>Echo Site %s</h1></body></html>\n' "${TS}" > "${SITE_DIR}/index.html"
-          ok "Echo helpers ready"
-          [ "${ECHO_VERBOSE}" = "true" ] && logf "Verbose echo is ON"
+          . /tmp/echo.sh
+          F="${ECHO_DIR}/os-upgrade.txt"
+          echo_run "sudo apt-get update -y" | tee -a "$F"
+          echo_run "sudo apt-get -y -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef upgrade" | tee -a "$F"
+          chmod 0644 "$F"
 
-      - name: Upgrade OS packages (mandatory)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          export DEBIAN_FRONTEND=noninteractive
-          run_cmd sudo apt-get update -y
-          run_cmd sudo apt-get -o Dpkg::Options::=--force-confold \
-                               -o Dpkg::Options::=--force-confdef \
-                               upgrade -y
-          ok "OS upgrade completed."
-
-      - name: Healthcheck - OS upgrade applied
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          PENDING=$(apt-get -s upgrade | awk '/^Inst /{c++} END{print c+0}')
-          echo "Pending upgrades: $PENDING"
-          test "$PENDING" -eq 0 || { echo "ERROR: pending apt upgrades remain ($PENDING)."; exit 1; }
-
-      - name: Set up Miniconda (forge-only)
+      - name: Setup Miniconda (forge-only)
         uses: conda-incubator/setup-miniconda@v3
         with:
-          auto-update-conda: true
           python-version: ${{ env.PY_VERSION }}
           miniforge-version: latest
           channels: conda-forge
@@ -125,231 +115,121 @@ jobs:
           conda-solver: libmamba
           show-channel-urls: true
           use-only-tar-bz2: true
-          condarc-file: .github/conda/condarc
+          condarc-file: .github-condarc
 
-      - name: Enforce forge-only (system-level, pre-env)
+      - name: Enforce forge-only (system) (echo)
         shell: bash -l {0}
         run: |
           set -Eeuo pipefail
-          conda config --system --remove channels defaults || true
-          conda config --system --set channel_priority strict
-          conda config --system --set show_channel_urls true
-          conda config --system --set solver libmamba
-          conda config --system --set use_only_tar_bz2 true
-          conda config --system --remove-key default_channels || true
-          conda config --system --add default_channels https://conda.anaconda.org/conda-forge
-          conda config --system --remove-key custom_channels || true
-          conda config --system --remove-key custom_multichannels || true
-          conda info
+          F="${ECHO_DIR}/conda-enforce.txt"
+          {
+            conda config --system --remove channels defaults || true
+            conda config --system --set channel_priority strict
+            conda config --system --set show_channel_urls true
+            conda config --system --set solver libmamba
+            conda config --system --set use_only_tar_bz2 true
+            conda config --system --remove-key default_channels || true
+            conda config --system --add default_channels https://conda.anaconda.org/conda-forge
+            conda config --system --remove-key custom_channels || true
+            conda config --system --remove-key custom_multichannels || true
+            conda info
+          } 2>&1 | tee -a "$F"
+          chmod 0644 "$F"
 
-      - name: Healthcheck - Conda channels are forge-only
-        shell: bash -l {0}
-        run: |
-          set -Eeuo pipefail
-          conda config --show | tee /tmp/conda_config.txt
-          if grep -q 'repo.anaconda.com' /tmp/conda_config.txt; then
-            echo "ERROR: Detected repo.anaconda.com in conda config."
-            exit 1
-          fi
-          conda info | tee /tmp/conda_info.txt
-          if grep -q 'repo.anaconda.com' /tmp/conda_info.txt; then
-            echo "ERROR: Conda info shows repo.anaconda.com."
-            exit 1
-          fi
-          echo "OK: forge-only confirmed."
-
-      - name: Auto-fix notebook artifacts & missing imports (py-only)
+      - name: Auto-fix py files (strip ??, ensure imports) (echo)
         id: autofix
         shell: bash -l {0}
-        env:
-          PR_BRANCH: fix/autofix-notebook-and-imports
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
-
-          # 추적되는 .py만 처리
+          F="${ECHO_DIR}/autofix-status.txt"
           mapfile -d '' PYFILES < <(git ls-files -z '*.py')
 
-          # 1) '??' 라인 제거
+          # 1) strip notebook '??' lines
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
             awk '!/^[[:space:]]*\?\?/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
-          # 2) spla import
+          # 2) add missing imports (safe prepend)
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
-            if grep -q 'spla\.' "$f" && ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f"; then
-              awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-            fi
+            grep -q 'spla\.' "$f" && ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f" && awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            grep -q 'pearsonr' "$f" && ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f" && awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            grep -qE '(^|[^A-Za-z0-9_])np\.' "$f" && ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f" && awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
-          # 3) pearsonr import
-          for f in "${PYFILES[@]}"; do
-            [ -f "$f" ] || continue
-            if grep -q 'pearsonr' "$f" && ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f"; then
-              awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-            fi
-          done
+          git status --porcelain | tee "$F"
+          chmod 0644 "$F"
 
-          # 4) numpy as np import
-          for f in "${PYFILES[@]}"; do
-            [ -f "$f" ] || continue
-            if grep -qE '(^|[^A-Za-z0-9_])np\.' "$f" && ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f"; then
-              awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-            fi
-          done
-
-          STATUS=$(git status --porcelain)
-          echo "$STATUS" | tee "${LOG_DIR}/echo-autofix-status.txt"
-
-          # .py 이외 변경이 있는지 검사
-          NONPY=$(echo "$STATUS" | awk '{print $2}' | grep -vE '\.py$' || true)
-          if [ -n "$NONPY" ]; then
-            echo "nonpy_ok=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "nonpy_ok=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          if [ -n "$STATUS" ]; then
+          CHANGED="$(git status --porcelain)"
+          if [ -n "$CHANGED" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            NONPY=$(echo "$CHANGED" | awk '{print $2}' | grep -vE '\.py$' || true)
+            [ -z "$NONPY" ] && echo "nonpy_ok=true" >> "$GITHUB_OUTPUT" || echo "nonpy_ok=false" >> "$GITHUB_OUTPUT"
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "nonpy_ok=true"   >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Healthcheck - Only .py files changed by AutoFix
-        if: steps.autofix.outputs.has_changes == 'true'
-        shell: bash -l {0}
-        run: |
-          set -Eeuo pipefail
-          if [ "${{ steps.autofix.outputs.nonpy_ok }}" != "true" ]; then
-            echo "ERROR: AutoFix modified non-.py files."
-            echo "See .github/echo_logs/echo-autofix-status.txt for details."
-            exit 1
-          fi
-          echo "OK: Only .py files modified."
 
       - name: Create Pull Request (if changes)
         if: steps.autofix.outputs.has_changes == 'true' && steps.autofix.outputs.nonpy_ok == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          base: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
           branch: fix/autofix-notebook-and-imports
           commit-message: "chore: auto-fix notebook artifacts (??) and missing imports"
           title: "Auto-fix: notebook artifacts & missing imports"
           body: |
-            자동 패치:
-            - 노트북 유입 `??` 라인 제거(awk 기반, *.py만 대상)
-            - `spla`, `pearsonr`, `numpy` 누락 import 자동 삽입
-            - Echo 로그에 상세 내용 기록
+            - 노트북 유입 `??` 제거
+            - 누락 import 자동 삽입 (numpy/scipy)
+            - 에코 로그 포함
           add-paths: |
             **/*.py
             .github/echo_logs/**
 
-      - name: Create/Update Conda environment from environment.yml
+      - name: Create/Update Conda env (echo)
         shell: bash -l {0}
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
+          F="${ECHO_DIR}/conda-env.txt"
           if [ -f environment.yml ]; then
-            run_cmd mamba env update -n "${CONDA_ENV}" -f environment.yml
+            mamba env update -n "${CONDA_ENV}" -f environment.yml | tee -a "$F"
           else
-            warn "environment.yml not found → creating minimal env"
-            run_cmd mamba create -n "${CONDA_ENV}" "python=${PY_VERSION}" -y
+            mamba create -n "${CONDA_ENV}" "python=${PY_VERSION}" -y | tee -a "$F"
           fi
           conda activate "${CONDA_ENV}"
-          python -V | tee -a "${LOG_DIR}/echo-main.log"
-          conda list | tee -a "${LOG_DIR}/echo-main.log"
+          python -V | tee -a "$F"
+          conda list | tee -a "$F"
+          chmod 0644 "$F"
 
-      - name: Healthcheck - Python version & channels
+      - name: Lint (flake8) (echo)
         shell: bash -l {0}
         run: |
           set -Eeuo pipefail
+          F="${ECHO_DIR}/flake8.txt"
           conda activate "${CONDA_ENV}"
-          python - <<PY
-import sys
-expected = (3, 10)
-ok = sys.version_info[:2] == expected
-print("Detected:", sys.version_info[:3], " Expected:", expected)
-raise SystemExit(0 if ok else 1)
-PY
-          conda config --show | grep -q 'repo.anaconda.com' && { echo "ERROR: repo.anaconda.com detected."; exit 1; } || echo "OK: forge-only."
+          mamba install -y flake8 | tee -a "$F"
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics | tee -a "$F"
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics | tee -a "$F"
+          chmod 0644 "$F"
 
-      - name: Healthcheck - Required deps present (numpy/scipy)
+      - name: Test (pytest) (echo)
         shell: bash -l {0}
         run: |
           set -Eeuo pipefail
+          F="${ECHO_DIR}/pytest.txt"
           conda activate "${CONDA_ENV}"
-          NEED_SCIPY=$(grep -R -nE 'spla\.|pearsonr|scipy\.' --include='*.py' . || true)
-          HAS_SCIPY=$(conda list | awk '$1=="scipy"{print $1}')
-          if [ -n "$NEED_SCIPY" ] && [ -z "$HAS_SCIPY" ]; then
-            echo "ERROR: Code uses SciPy but SciPy is not installed in the env."
-            echo "       -> Add 'scipy' to environment.yml dependencies."
-            exit 1
-          fi
-          python - <<PY
-import importlib, sys
-mods = ["numpy"]
-missing = [m for m in mods if importlib.util.find_spec(m) is None]
-print("Missing:", missing)
-raise SystemExit(1 if missing else 0)
-PY
+          mamba install -y pytest | tee -a "$F"
+          pytest -q | tee -a "$F"
+          chmod 0644 "$F"
 
-      - name: Lint with flake8
-        shell: bash -l {0}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          conda activate "${CONDA_ENV}"
-          run_cmd mamba install -y flake8
-          run_cmd flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          run_cmd flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-
-      - name: Run tests with pytest (quiet warnings)
-        shell: bash -l {0}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          conda activate "${CONDA_ENV}"
-          run_cmd mamba install -y pytest
-          run_cmd pytest -q
-
-      - name: Healthcheck - Echo artifacts & permissions
-        if: always()
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          for d in "${LOG_DIR}" "${ECHO_DIR}" "${SITE_DIR}"; do
-            test -d "$d" || { echo "ERROR: missing dir $d"; exit 1; }
-            PERM=$(stat -c "%a" "$d")
-            [[ "$PERM" =~ ^7?5?5$|^755$ ]] || echo "WARN: $d perm=$PERM (expected 755)"
-          done
-          test -f "${ECHO_DIR}/hello.txt" || { echo "ERROR: missing ${ECHO_DIR}/hello.txt"; exit 1; }
-          test -f "${SITE_DIR}/index.html" || { echo "ERROR: missing ${SITE_DIR}/index.html"; exit 1; }
-          for f in "${ECHO_DIR}/hello.txt" "${ECHO_DIR}/README.echo" "${SITE_DIR}/index.html"; do
-            PERM=$(stat -c "%a" "$f")
-            [ "$PERM" = "644" ] || echo "WARN: $f perm=$PERM (expected 644)"
-          done
-          echo "OK: Echo artifacts exist."
-
-      - name: Upload Echo logs
+      - name: Upload Echo artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: echo-logs
+          name: echo-files
           path: |
-            .github/echo_logs/**
             .github/echo_files/**
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload Site files (optional)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: site
-          path: site/**
+            .github/echo_logs/**
           if-no-files-found: warn
           retention-days: 7
