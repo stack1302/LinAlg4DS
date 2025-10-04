@@ -1,4 +1,4 @@
-name: Python Package using Conda + EchoOps (Upgrade + File/Perm)
+name: Python Package using Conda + EchoOps (Fixed Inputs)
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       upgrade_os:
-        description: "러너 OS 패키지 업그레이드 진행 (apt-get upgrade)"
+        description: "러너 OS 패키지 업그레이드 (apt-get upgrade)"
         type: boolean
         required: false
         default: false
@@ -36,15 +36,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 공통 Echo 헬퍼 + 디렉토리/권한 준비
       - name: Prepare Echo helpers, dirs and permissions
         shell: bash
         run: |
           set -Eeuo pipefail
           umask 022
-          echo "::group::make-dirs"
           install -d -m 0755 "${LOG_DIR}" "${ECHO_DIR}" "${SITE_DIR}"
-          echo "::endgroup::"
 
           cat > /tmp/echo_helpers.sh <<'SH'
           set -o pipefail
@@ -65,44 +62,26 @@ jobs:
           chmod 0755 /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
 
-          # 샘플 파일 생성 + 권한 지정
-          echo "::group::seed-files"
           TS="$(date +%Y%m%d-%H%M%S)"
-          echo "Hello Echo ${TS}" | tee "${ECHO_DIR}/hello.txt" >/dev/null
-          printf 'LOG INIT %s\n' "${TS}" | tee -a "${LOG_DIR}/echo-main.log" >/dev/null
+          echo "Hello Echo ${TS}" > "${ECHO_DIR}/hello.txt"
+          printf 'LOG INIT %s\n' "${TS}" >> "${LOG_DIR}/echo-main.log"
           install -m 0644 /dev/null "${ECHO_DIR}/README.echo"
-          install -m 0644 /dev/null "${SITE_DIR}/index.html"
           printf '<html><body><h1>Echo Site %s</h1></body></html>\n' "${TS}" > "${SITE_DIR}/index.html"
-          chmod 0644 "${ECHO_DIR}/hello.txt" "${ECHO_DIR}/README.echo" "${SITE_DIR}/index.html"
-          echo "::endgroup::"
-
-          # 권한 및 소유자 확인
-          echo "::group::show-perms"
-          ls -l "${LOG_DIR}" || true
-          ls -l "${ECHO_DIR}" || true
-          ls -l "${SITE_DIR}" || true
-          echo "::endgroup::"
-
           ok "Echo helpers ready"
           [ "${ECHO_VERBOSE}" = "true" ] && logf "Verbose echo is ON"
 
-      # (옵션) 러너 OS 패키지 업그레이드 — 안전 가드 포함
       - name: Upgrade OS packages (optional)
         if: ${{ env.UPGRADE_OS == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          logf "Starting OS upgrade (apt-get)."
           export DEBIAN_FRONTEND=noninteractive
           run_cmd sudo apt-get update -y
-          # 보수적으로 upgrade만 수행, dist-upgrade/auto-remove는 생략 (원하면 추가)
-          run_cmd sudo apt-get -o Dpkg::Options::=--force-confold \
-                               -o Dpkg::Options::=--force-confdef \
-                               upgrade -y
+          run_cmd sudo apt-get -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef upgrade -y
           ok "OS upgrade completed."
 
-      # Miniconda 설정 (mamba, cache)
+      # ✅ v3 액션의 유효한 입력만 사용 (경고 원인 제거)
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
@@ -113,10 +92,18 @@ jobs:
           channel-priority: strict
           activate-environment: ${{ env.CONDA_ENV }}
           use-mamba: true
-          use-only-tar-bz2: true
-          cache-downloads: true
           show-channel-urls: true
-          use-mamba-batch-install: true
+          use-only-tar-bz2: true
+          # 필요 시 여기에 environment-file: environment.yml 추가 가능
+
+      # 🔧 노트북에서 export된 `??` 헬프라인 자동 제거(추가 안전망)
+      - name: Sanitize stray IPython help lines
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          # '??'로 시작하는 라인 제거 (예: "??np.corrcoef")
+          run_cmd bash -c "grep -RIl '^[?][?]' . | xargs -r sed -i '/^[?][?]/d'"
 
       - name: Create/Update Conda environment from environment.yml
         shell: bash -l {0}
@@ -124,7 +111,6 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           if [ -f environment.yml ]; then
-            logf "environment.yml detected → mamba env update"
             run_cmd mamba env update -n "${CONDA_ENV}" -f environment.yml
           else
             warn "environment.yml not found → creating minimal env"
@@ -153,7 +139,6 @@ jobs:
           run_cmd mamba install -y pytest
           run_cmd pytest -q
 
-      # 에코 산출물 및 로그 업로드
       - name: Upload Echo logs
         if: always()
         uses: actions/upload-artifact@v4
