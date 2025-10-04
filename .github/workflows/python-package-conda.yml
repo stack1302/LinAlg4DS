@@ -1,0 +1,175 @@
+name: Python Package using Conda + EchoOps (Upgrade + File/Perm)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      upgrade_os:
+        description: "러너 OS 패키지 업그레이드 진행 (apt-get upgrade)"
+        type: boolean
+        required: false
+        default: false
+      echo_verbose:
+        description: "에코 로깅 상세 출력"
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Seoul
+      LOG_DIR: .github/echo_logs
+      ECHO_DIR: .github/echo_files
+      SITE_DIR: site
+      ECHO_OK: "✅"
+      ECHO_WARN: "⚠️"
+      ECHO_FAIL: "❌"
+      CONDA_ENV: "test-env"
+      PY_VERSION: "3.10"
+      UPGRADE_OS: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_os || 'false' }}
+      ECHO_VERBOSE: ${{ github.event_name == 'workflow_dispatch' && inputs.echo_verbose || 'true' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 공통 Echo 헬퍼 + 디렉토리/권한 준비
+      - name: Prepare Echo helpers, dirs and permissions
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 022
+          echo "::group::make-dirs"
+          install -d -m 0755 "${LOG_DIR}" "${ECHO_DIR}" "${SITE_DIR}"
+          echo "::endgroup::"
+
+          cat > /tmp/echo_helpers.sh <<'SH'
+          set -o pipefail
+          ok(){    printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "${LOG_DIR}/echo-main.log"; }
+          run_cmd(){
+            logf "▶ $*"
+            set +e
+            eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo-main.log"
+            local rc=${PIPESTATUS[0]}
+            set -e
+            if [ $rc -eq 0 ]; then ok "DONE: $*"; else warn "RC=$rc ← $*"; fi
+            return $rc
+          }
+          SH
+          chmod 0755 /tmp/echo_helpers.sh
+          source /tmp/echo_helpers.sh
+
+          # 샘플 파일 생성 + 권한 지정
+          echo "::group::seed-files"
+          TS="$(date +%Y%m%d-%H%M%S)"
+          echo "Hello Echo ${TS}" | tee "${ECHO_DIR}/hello.txt" >/dev/null
+          printf 'LOG INIT %s\n' "${TS}" | tee -a "${LOG_DIR}/echo-main.log" >/dev/null
+          install -m 0644 /dev/null "${ECHO_DIR}/README.echo"
+          install -m 0644 /dev/null "${SITE_DIR}/index.html"
+          printf '<html><body><h1>Echo Site %s</h1></body></html>\n' "${TS}" > "${SITE_DIR}/index.html"
+          chmod 0644 "${ECHO_DIR}/hello.txt" "${ECHO_DIR}/README.echo" "${SITE_DIR}/index.html"
+          echo "::endgroup::"
+
+          # 권한 및 소유자 확인
+          echo "::group::show-perms"
+          ls -l "${LOG_DIR}" || true
+          ls -l "${ECHO_DIR}" || true
+          ls -l "${SITE_DIR}" || true
+          echo "::endgroup::"
+
+          ok "Echo helpers ready"
+          [ "${ECHO_VERBOSE}" = "true" ] && logf "Verbose echo is ON"
+
+      # (옵션) 러너 OS 패키지 업그레이드 — 안전 가드 포함
+      - name: Upgrade OS packages (optional)
+        if: ${{ env.UPGRADE_OS == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          logf "Starting OS upgrade (apt-get)."
+          export DEBIAN_FRONTEND=noninteractive
+          run_cmd sudo apt-get update -y
+          # 보수적으로 upgrade만 수행, dist-upgrade/auto-remove는 생략 (원하면 추가)
+          run_cmd sudo apt-get -o Dpkg::Options::=--force-confold \
+                               -o Dpkg::Options::=--force-confdef \
+                               upgrade -y
+          ok "OS upgrade completed."
+
+      # Miniconda 설정 (mamba, cache)
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          auto-update-conda: true
+          python-version: ${{ env.PY_VERSION }}
+          miniforge-version: latest
+          channels: conda-forge,defaults
+          channel-priority: strict
+          activate-environment: ${{ env.CONDA_ENV }}
+          use-mamba: true
+          use-only-tar-bz2: true
+          cache-downloads: true
+          show-channel-urls: true
+          use-mamba-batch-install: true
+
+      - name: Create/Update Conda environment from environment.yml
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          if [ -f environment.yml ]; then
+            logf "environment.yml detected → mamba env update"
+            run_cmd mamba env update -n "${CONDA_ENV}" -f environment.yml
+          else
+            warn "environment.yml not found → creating minimal env"
+            run_cmd mamba create -n "${CONDA_ENV}" "python=${PY_VERSION}" -y
+          fi
+          conda activate "${CONDA_ENV}"
+          python -V | tee -a "${LOG_DIR}/echo-main.log"
+          conda list | tee -a "${LOG_DIR}/echo-main.log"
+
+      - name: Lint with flake8
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          conda activate "${CONDA_ENV}"
+          run_cmd mamba install -y flake8
+          run_cmd flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          run_cmd flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run tests with pytest
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          conda activate "${CONDA_ENV}"
+          run_cmd mamba install -y pytest
+          run_cmd pytest -q
+
+      # 에코 산출물 및 로그 업로드
+      - name: Upload Echo logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: echo-logs
+          path: |
+            .github/echo_logs/**
+            .github/echo_files/**
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload Site files (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site/**
+          if-no-files-found: warn
+          retention-days: 7
