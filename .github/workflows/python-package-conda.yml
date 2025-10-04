@@ -1,15 +1,10 @@
-name: Python Package using Conda + EchoOps (Fixed Inputs)
+name: Python Package using Conda + EchoOps (OS Upgrade mandatory)
 
 on:
   push:
   pull_request:
   workflow_dispatch:
     inputs:
-      upgrade_os:
-        description: "러너 OS 패키지 업그레이드 (apt-get upgrade)"
-        type: boolean
-        required: false
-        default: false
       echo_verbose:
         description: "에코 로깅 상세 출력"
         type: boolean
@@ -29,7 +24,6 @@ jobs:
       ECHO_FAIL: "❌"
       CONDA_ENV: "test-env"
       PY_VERSION: "3.10"
-      UPGRADE_OS: ${{ github.event_name == 'workflow_dispatch' && inputs.upgrade_os || 'false' }}
       ECHO_VERBOSE: ${{ github.event_name == 'workflow_dispatch' && inputs.echo_verbose || 'true' }}
 
     steps:
@@ -70,18 +64,19 @@ jobs:
           ok "Echo helpers ready"
           [ "${ECHO_VERBOSE}" = "true" ] && logf "Verbose echo is ON"
 
-      - name: Upgrade OS packages (optional)
-        if: ${{ env.UPGRADE_OS == 'true' }}
+      # ✅ 항상 실행(필수 업그레이드)
+      - name: Upgrade OS packages (mandatory)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           export DEBIAN_FRONTEND=noninteractive
           run_cmd sudo apt-get update -y
-          run_cmd sudo apt-get -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef upgrade -y
+          run_cmd sudo apt-get -o Dpkg::Options::=--force-confold \
+                               -o Dpkg::Options::=--force-confdef \
+                               upgrade -y
           ok "OS upgrade completed."
 
-      # ✅ v3 액션의 유효한 입력만 사용 (경고 원인 제거)
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@v3
         with:
@@ -94,16 +89,18 @@ jobs:
           use-mamba: true
           show-channel-urls: true
           use-only-tar-bz2: true
-          # 필요 시 여기에 environment-file: environment.yml 추가 가능
 
-      # 🔧 노트북에서 export된 `??` 헬프라인 자동 제거(추가 안전망)
+      # 🔧 IPython '??' 라인 제거(견고/안전, bash -c 제거 & 이스케이프 보강)
       - name: Sanitize stray IPython help lines
         shell: bash -l {0}
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          # '??'로 시작하는 라인 제거 (예: "??np.corrcoef")
-          run_cmd bash -c "grep -RIl '^[?][?]' . | xargs -r sed -i '/^[?][?]/d'"
+          # '??'로 시작하는 라인 제거. GNU grep 기본 BRE에서 '?'는 리터럴이지만, 이스케이프로 명확화.
+          # 파일 목록만 뽑아 sed에 안전 전달
+          run_cmd grep -RIl -- '^\?\?' . | xargs -r sed -i -e '/^\?\?/d'
+          # 보조: 앞에 공백이 포함된 '  ??something' 도 제거
+          run_cmd grep -RIl -- '^[[:space:]]\+\?\?' . | xargs -r sed -i -E '/^[[:space:]]+\?\?/d' || true
 
       - name: Create/Update Conda environment from environment.yml
         shell: bash -l {0}
