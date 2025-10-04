@@ -1,4 +1,4 @@
-name: Python Package using Conda + EchoOps (OS Upgrade + AutoFix PR, sed-safe)
+name: Python Package using Conda + EchoOps (quiet, forge-only, sed-safe, PR)
 
 on:
   push:
@@ -25,10 +25,41 @@ jobs:
       CONDA_ENV: "test-env"
       PY_VERSION: "3.10"
       ECHO_VERBOSE: ${{ github.event_name == 'workflow_dispatch' && inputs.echo_verbose || 'true' }}
+      # 조용/경고 억제
+      MAMBA_NO_BANNER: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONWARNINGS: "ignore"
+      PYTHONNOUSERSITE: "1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Write quiet condarc (forge-only)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p .github/conda
+          cat > .github/conda/condarc <<'CONDARC'
+          # forge 단일 채널만 사용
+          channels:
+            - conda-forge
+          channel_priority: strict
+          show_channel_urls: true
+          auto_update_conda: true
+          solver: libmamba
+          notify_outdated_conda: false
+          changeps1: false
+          pkgs_dirs:
+            - /home/runner/conda_pkgs_dir
+          use_only_tar_bz2: true
+          # 기본 채널도 conda-forge로 강제 (repo.anaconda.com 접근 차단)
+          default_channels:
+            - https://conda.anaconda.org/conda-forge
+          custom_channels: {}
+          custom_multichannels: {}
+          channel_alias: https://conda.anaconda.org
+          CONDARC
 
       - name: Prepare Echo helpers, dirs and permissions
         shell: bash
@@ -55,7 +86,6 @@ jobs:
           SH
           chmod 0755 /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
-
           TS="$(date +%Y%m%d-%H%M%S)"
           echo "Hello Echo ${TS}" > "${ECHO_DIR}/hello.txt"
           printf 'LOG INIT %s\n' "${TS}" >> "${LOG_DIR}/echo-main.log"
@@ -64,7 +94,7 @@ jobs:
           ok "Echo helpers ready"
           [ "${ECHO_VERBOSE}" = "true" ] && logf "Verbose echo is ON"
 
-      # ✅ 항상 실행(필수 업그레이드)
+      # ✅ 필수 OS 업그레이드
       - name: Upgrade OS packages (mandatory)
         shell: bash
         run: |
@@ -77,72 +107,85 @@ jobs:
                                upgrade -y
           ok "OS upgrade completed."
 
-      - name: Set up Miniconda
+      - name: Set up Miniconda (forge-only)
         uses: conda-incubator/setup-miniconda@v3
         with:
           auto-update-conda: true
           python-version: ${{ env.PY_VERSION }}
           miniforge-version: latest
-          channels: conda-forge,defaults
+          channels: conda-forge
+          conda-remove-defaults: true
           channel-priority: strict
           activate-environment: ${{ env.CONDA_ENV }}
           use-mamba: true
+          mamba-version: "2.*"
+          conda-solver: libmamba
           show-channel-urls: true
           use-only-tar-bz2: true
+          condarc-file: .github/conda/condarc
 
-      # 🔧 sed/xargs 미사용: awk로 안전하게 '??' 제거 + 자동 import 패치 + PR
-      - name: Auto-fix notebook artifacts & missing imports (sed-safe)
+      # 🔧 .py만 대상으로 안전 정리 + 자동 import + 커밋(괄호 메시지 보호)
+      - name: Auto-fix notebook artifacts & missing imports (py-only)
         shell: bash -l {0}
         env:
           PR_BRANCH: fix/autofix-notebook-and-imports
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-
-          # 0) Git 설정(권한/세이프 디렉토리)
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
 
-          # 1) '??'로 시작(앞 공백 허용)하는 라인 제거 — awk 사용 (sed/xargs 미사용)
-          while IFS= read -r f; do
+          # 추적되는 .py 목록만 사용 (YAML/IPYNB 오염 방지)
+          mapfile -d '' PYFILES < <(git ls-files -z '*.py')
+
+          # 1) '??'로 시작(앞 공백 허용) 라인 제거
+          for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
-            # awk ERE: ^[[:space:]]*\?\?  => 라인 앞 공백 후 '??'로 시작하면 제거
             awk '!/^[[:space:]]*\?\?/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-          done < <(git ls-files '*.py')
+          done
 
-          # 2) 'spla.' 사용 파일 → import scipy.linalg as spla 주입(없을 때만)
-          while IFS= read -r -d '' f; do
-            if ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f"; then
-              awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-              logf "Inserted: import scipy.linalg as spla -> $f"
+          # 2) spla 사용 파일 → import scipy.linalg as spla (없으면 주입)
+          for f in "${PYFILES[@]}"; do
+            [ -f "$f" ] || continue
+            if grep -q 'spla\.' "$f"; then
+              if ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f"; then
+                awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+                logf "Inserted: import scipy.linalg as spla -> $f"
+              fi
             fi
-          done < <(grep -RlZ -- 'spla\.' --include='*.py' . || true)
+          done
 
-          # 3) 'pearsonr' 사용 파일 → from scipy.stats import pearsonr 주입(없을 때만)
-          while IFS= read -r -d '' f; do
-            if ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f"; then
-              awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-              logf "Inserted: from scipy.stats import pearsonr -> $f"
+          # 3) pearsonr 사용 파일 → from scipy.stats import pearsonr (없으면 주입)
+          for f in "${PYFILES[@]}"; do
+            [ -f "$f" ] || continue
+            if grep -q 'pearsonr' "$f"; then
+              if ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f"; then
+                awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+                logf "Inserted: from scipy.stats import pearsonr -> $f"
+              fi
             fi
-          done < <(grep -RlZ -- 'pearsonr' --include='*.py' . || true)
+          done
 
-          # 4) 'np.' 사용 파일 → import numpy as np 주입(없을 때만)
-          while IFS= read -r -d '' f; do
-            if ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f"; then
-              awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-              logf "Inserted: import numpy as np -> $f"
+          # 4) np. 사용 파일 → import numpy as np (없으면 주입)
+          for f in "${PYFILES[@]}"; do
+            [ -f "$f" ] || continue
+            if grep -qE '(^|[^A-Za-z0-9_])np\.' "$f"; then
+              if ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f"; then
+                awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+                logf "Inserted: import numpy as np -> $f"
+              fi
             fi
-          done < <(grep -RlZ -E -- '(^|[^a-zA-Z0-9_])np\.' --include='*.py' . || true)
+          done
 
           # 변경 요약
           run_cmd git status --porcelain | tee "${LOG_DIR}/echo-autofix-status.txt"
 
-          # 변경 있으면 커밋 (PR 생성은 다음 스텝에서)
+          # 변경 있으면 커밋 (괄호/특수문자 안전하게 큰따옴표로)
           if [ -n "$(git status --porcelain)" ]; then
-            run_cmd git config user.name "github-actions[bot]"
-            run_cmd git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            run_cmd git checkout -B "${PR_BRANCH}"
-            run_cmd git add -A
-            run_cmd git commit -m "chore: auto-fix notebook artifacts (??) and missing imports (spla, pearsonr, numpy)"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout -B "${PR_BRANCH}"
+            git add -A
+            git commit -m "chore: auto-fix notebook artifacts (??) and missing imports (spla, pearsonr, numpy)"
           else
             ok "No changes to commit; skipping PR commit."
           fi
@@ -155,13 +198,30 @@ jobs:
           title: "Auto-fix: notebook artifacts & missing imports"
           body: |
             자동 패치:
-            - 노트북 유입 `??` 라인 제거(awk 기반)
+            - 노트북 유입 `??` 라인 제거(awk 기반, *.py만 대상)
             - `spla`, `pearsonr`, `numpy` 누락 import 자동 삽입
             - Echo 로그에 상세 내용 기록
           branch: fix/autofix-notebook-and-imports
           add-paths: |
             **/*.py
             .github/echo_logs/**
+
+      - name: Enforce forge-only channels post-setup (belt & suspenders)
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          # 혹시 모를 defaults 흔적 제거 및 기본채널 강제 지정
+          conda config --remove channels defaults || true
+          conda config --set channel_priority strict
+          conda config --set show_channel_urls true
+          conda config --set solver libmamba
+          conda config --set use_only_tar_bz2 true
+          conda config --remove-key default_channels || true
+          conda config --add default_channels https://conda.anaconda.org/conda-forge
+          conda config --remove-key custom_channels || true
+          conda config --remove-key custom_multichannels || true
+          conda config --show | tee -a "${LOG_DIR}/echo-main.log"
 
       - name: Create/Update Conda environment from environment.yml
         shell: bash -l {0}
@@ -188,7 +248,7 @@ jobs:
           run_cmd flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
           run_cmd flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
-      - name: Run tests with pytest
+      - name: Run tests with pytest (quiet warnings)
         shell: bash -l {0}
         run: |
           set -Eeuo pipefail
