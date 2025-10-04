@@ -1,4 +1,4 @@
-name: Python Package using Conda + EchoOps (quiet, forge-only, sed-safe, PR)
+name: Python Package using Conda + EchoOps (quiet, forge-only, sed-safe, PR + Healthchecks)
 
 on:
   push:
@@ -25,7 +25,6 @@ jobs:
       CONDA_ENV: "test-env"
       PY_VERSION: "3.10"
       ECHO_VERBOSE: ${{ github.event_name == 'workflow_dispatch' && inputs.echo_verbose || 'true' }}
-      # 조용/경고 억제
       MAMBA_NO_BANNER: "1"
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PYTHONWARNINGS: "ignore"
@@ -35,7 +34,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # forge-only condarc
       - name: Write quiet condarc (forge-only)
         shell: bash
         run: |
@@ -66,7 +64,6 @@ jobs:
           set -Eeuo pipefail
           umask 022
           install -d -m 0755 "${LOG_DIR}" "${ECHO_DIR}" "${SITE_DIR}"
-
           cat > /tmp/echo_helpers.sh <<'SH'
           set -o pipefail
           ok(){    printf '%s %s\n' "${ECHO_OK}" "$*"; }
@@ -93,7 +90,6 @@ jobs:
           ok "Echo helpers ready"
           [ "${ECHO_VERBOSE}" = "true" ] && logf "Verbose echo is ON"
 
-      # ✅ 필수 OS 업그레이드
       - name: Upgrade OS packages (mandatory)
         shell: bash
         run: |
@@ -105,6 +101,14 @@ jobs:
                                -o Dpkg::Options::=--force-confdef \
                                upgrade -y
           ok "OS upgrade completed."
+
+      - name: Healthcheck - OS upgrade applied
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PENDING=$(apt-get -s upgrade | awk '/^Inst /{c++} END{print c+0}')
+          echo "Pending upgrades: $PENDING"
+          test "$PENDING" -eq 0 || { echo "ERROR: pending apt upgrades remain ($PENDING)."; exit 1; }
 
       - name: Set up Miniconda (forge-only)
         uses: conda-incubator/setup-miniconda@v3
@@ -123,7 +127,6 @@ jobs:
           use-only-tar-bz2: true
           condarc-file: .github/conda/condarc
 
-      # system 레벨에서도 forge-only 강제 (repo.anaconda.com 경고 추가 차단)
       - name: Enforce forge-only (system-level, pre-env)
         shell: bash -l {0}
         run: |
@@ -139,7 +142,22 @@ jobs:
           conda config --system --remove-key custom_multichannels || true
           conda info
 
-      # 🔧 .py만 대상으로 안전 정리 + 자동 import + 커밋
+      - name: Healthcheck - Conda channels are forge-only
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          conda config --show | tee /tmp/conda_config.txt
+          if grep -q 'repo.anaconda.com' /tmp/conda_config.txt; then
+            echo "ERROR: Detected repo.anaconda.com in conda config."
+            exit 1
+          fi
+          conda info | tee /tmp/conda_info.txt
+          if grep -q 'repo.anaconda.com' /tmp/conda_info.txt; then
+            echo "ERROR: Conda info shows repo.anaconda.com."
+            exit 1
+          fi
+          echo "OK: forge-only confirmed."
+
       - name: Auto-fix notebook artifacts & missing imports (py-only)
         id: autofix
         shell: bash -l {0}
@@ -150,61 +168,75 @@ jobs:
           source /tmp/echo_helpers.sh
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
 
-          # 추적되는 .py만 처리 (YAML/IPYNB 오염 방지)
+          # 추적되는 .py만 처리
           mapfile -d '' PYFILES < <(git ls-files -z '*.py')
 
-          # 1) '??'로 시작(앞 공백 허용) 라인 제거
+          # 1) '??' 라인 제거
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
             awk '!/^[[:space:]]*\?\?/' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
           done
 
-          # 2) spla 사용 파일 → import scipy.linalg as spla
+          # 2) spla import
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
             if grep -q 'spla\.' "$f" && ! grep -Eq '^import[[:space:]]+scipy\.linalg[[:space:]]+as[[:space:]]+spla' "$f"; then
               awk 'NR==1{print "import scipy.linalg as spla"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-              logf "Inserted: import scipy.linalg as spla -> $f"
             fi
           done
 
-          # 3) pearsonr 사용 파일 → from scipy.stats import pearsonr
+          # 3) pearsonr import
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
             if grep -q 'pearsonr' "$f" && ! grep -Eq '^from[[:space:]]+scipy\.stats[[:space:]]+import[[:space:]]+pearsonr' "$f"; then
               awk 'NR==1{print "from scipy.stats import pearsonr"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-              logf "Inserted: from scipy.stats import pearsonr -> $f"
             fi
           done
 
-          # 4) np. 사용 파일 → import numpy as np
+          # 4) numpy as np import
           for f in "${PYFILES[@]}"; do
             [ -f "$f" ] || continue
             if grep -qE '(^|[^A-Za-z0-9_])np\.' "$f" && ! grep -Eq '^import[[:space:]]+numpy[[:space:]]+as[[:space:]]+np' "$f"; then
               awk 'NR==1{print "import numpy as np"}1' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
-              logf "Inserted: import numpy as np -> $f"
             fi
           done
 
-          git status --porcelain | tee "${LOG_DIR}/echo-autofix-status.txt"
+          STATUS=$(git status --porcelain)
+          echo "$STATUS" | tee "${LOG_DIR}/echo-autofix-status.txt"
 
-          if [ -n "$(git status --porcelain)" ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git checkout -B "${PR_BRANCH}"
-            git add -A
-            # 괄호/특수문자 안전
-            git commit -m "chore: auto-fix notebook artifacts (??) and missing imports (spla, pearsonr, numpy)"
+          # .py 이외 변경이 있는지 검사
+          NONPY=$(echo "$STATUS" | awk '{print $2}' | grep -vE '\.py$' || true)
+          if [ -n "$NONPY" ]; then
+            echo "nonpy_ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "nonpy_ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "$STATUS" ]; then
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create Pull Request (if changes)
+      - name: Healthcheck - Only .py files changed by AutoFix
         if: steps.autofix.outputs.has_changes == 'true'
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          if [ "${{ steps.autofix.outputs.nonpy_ok }}" != "true" ]; then
+            echo "ERROR: AutoFix modified non-.py files."
+            echo "See .github/echo_logs/echo-autofix-status.txt for details."
+            exit 1
+          fi
+          echo "OK: Only .py files modified."
+
+      - name: Create Pull Request (if changes)
+        if: steps.autofix.outputs.has_changes == 'true' && steps.autofix.outputs.nonpy_ok == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          base: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
+          branch: fix/autofix-notebook-and-imports
           commit-message: "chore: auto-fix notebook artifacts (??) and missing imports"
           title: "Auto-fix: notebook artifacts & missing imports"
           body: |
@@ -212,7 +244,6 @@ jobs:
             - 노트북 유입 `??` 라인 제거(awk 기반, *.py만 대상)
             - `spla`, `pearsonr`, `numpy` 누락 import 자동 삽입
             - Echo 로그에 상세 내용 기록
-          branch: fix/autofix-notebook-and-imports
           add-paths: |
             **/*.py
             .github/echo_logs/**
@@ -232,6 +263,40 @@ jobs:
           python -V | tee -a "${LOG_DIR}/echo-main.log"
           conda list | tee -a "${LOG_DIR}/echo-main.log"
 
+      - name: Healthcheck - Python version & channels
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          conda activate "${CONDA_ENV}"
+          python - <<PY
+import sys
+expected = (3, 10)
+ok = sys.version_info[:2] == expected
+print("Detected:", sys.version_info[:3], " Expected:", expected)
+raise SystemExit(0 if ok else 1)
+PY
+          conda config --show | grep -q 'repo.anaconda.com' && { echo "ERROR: repo.anaconda.com detected."; exit 1; } || echo "OK: forge-only."
+
+      - name: Healthcheck - Required deps present (numpy/scipy)
+        shell: bash -l {0}
+        run: |
+          set -Eeuo pipefail
+          conda activate "${CONDA_ENV}"
+          NEED_SCIPY=$(grep -R -nE 'spla\.|pearsonr|scipy\.' --include='*.py' . || true)
+          HAS_SCIPY=$(conda list | awk '$1=="scipy"{print $1}')
+          if [ -n "$NEED_SCIPY" ] && [ -z "$HAS_SCIPY" ]; then
+            echo "ERROR: Code uses SciPy but SciPy is not installed in the env."
+            echo "       -> Add 'scipy' to environment.yml dependencies."
+            exit 1
+          fi
+          python - <<PY
+import importlib, sys
+mods = ["numpy"]
+missing = [m for m in mods if importlib.util.find_spec(m) is None]
+print("Missing:", missing)
+raise SystemExit(1 if missing else 0)
+PY
+
       - name: Lint with flake8
         shell: bash -l {0}
         run: |
@@ -250,6 +315,24 @@ jobs:
           conda activate "${CONDA_ENV}"
           run_cmd mamba install -y pytest
           run_cmd pytest -q
+
+      - name: Healthcheck - Echo artifacts & permissions
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for d in "${LOG_DIR}" "${ECHO_DIR}" "${SITE_DIR}"; do
+            test -d "$d" || { echo "ERROR: missing dir $d"; exit 1; }
+            PERM=$(stat -c "%a" "$d")
+            [[ "$PERM" =~ ^7?5?5$|^755$ ]] || echo "WARN: $d perm=$PERM (expected 755)"
+          done
+          test -f "${ECHO_DIR}/hello.txt" || { echo "ERROR: missing ${ECHO_DIR}/hello.txt"; exit 1; }
+          test -f "${SITE_DIR}/index.html" || { echo "ERROR: missing ${SITE_DIR}/index.html"; exit 1; }
+          for f in "${ECHO_DIR}/hello.txt" "${ECHO_DIR}/README.echo" "${SITE_DIR}/index.html"; do
+            PERM=$(stat -c "%a" "$f")
+            [ "$PERM" = "644" ] || echo "WARN: $f perm=$PERM (expected 644)"
+          done
+          echo "OK: Echo artifacts exist."
 
       - name: Upload Echo logs
         if: always()
