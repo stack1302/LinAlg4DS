@@ -58,6 +58,10 @@ permissions:
   packages: write        # GHCR 푸시에 필요
   actions: read
 
+concurrency:
+  group: pypkg-echo-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
@@ -95,6 +99,14 @@ jobs:
           export BASH_ENV="$GITHUB_WORKSPACE/.bashenv"
           echo "BASH_ENV=$BASH_ENV" >> "$GITHUB_ENV"
           bash -lc 'echoe "helpers loaded"; logf "helpers ready"'
+
+      - name: Better fail trap (tail last logs on error)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trap 'echo "❌ Failed at line $LINENO"; tail -n 200 ${LOG_DIR}/run-* 2>/dev/null || true' ERR
+          echo "✅ trap ready"
+
       - name: Install toolchain (Python, ISO, copy, deploy)
         shell: bash
         run: |
@@ -107,6 +119,7 @@ jobs:
           pip3 --version | tee -a "$LOG_DIR/pip.txt"
           rsync --version | head -n1 | tee -a "$LOG_DIR/rsync.txt"
           logf "Installed: xorriso/genisoimage/jq/rsync/ssh"
+
       - name: Parse inputs (metadata_json, image_ref, copy_plan_json, advanced_json)
         id: parse
         shell: bash
@@ -174,6 +187,31 @@ jobs:
           printf '%s' "$CP" > copy_plan.json
           printf '%s' "$ADV" > advanced.json
           logf "copy_plan.json & advanced.json saved"
+
+      - name: Validate inputs (regex & semantic)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          err(){ echo "❌ $*"; exit 1; }
+          [[ "${{ inputs.package_name }}" =~ ^[a-z0-9_]+$ ]] || err "package_name 은 소문자/숫자/언더스코어만 허용"
+          [[ "${{ inputs.package_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || err "package_version 은 SemVer 형식 필요"
+          [[ "${{ inputs.image_ref }}" =~ ^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]] || err "image_ref 형식 오류"
+          if [[ "${{ steps.parse.outputs.rel_enable }}" == "true" ]]; then
+            [[ "${{ steps.parse.outputs.rel_tag }}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || err "rel_tag 는 vX.Y.Z 형식 필요"
+          fi
+          echo "✅ input validation passed"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml') }}
+
       - name: Create Python package skeleton (PEP 621 / pyproject.toml + server scripts)
         shell: bash
         run: |
@@ -282,6 +320,20 @@ jobs:
           sed -i "s/__APP__/${P}/g" "$ROOT/server/install_deploy.sh"
           chmod +x "$ROOT/server/install_deploy.sh"
           logf "Python skeleton + server scripts created at $ROOT"
+
+      - name: Install test deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install build pytest
+
+      - name: Run unit tests (pytest)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd workspace/${{ inputs.package_name }}
+          pytest -q
+
       # Packaging 모드에 따라 빌드
       - name: Build (pip/poetry/conda)
         id: buildpkg
@@ -295,12 +347,10 @@ jobs:
             poetry)
               logf "Packaging mode: poetry"
               python3 -m pip install --upgrade pip poetry build
-              # poetry가 기존 pyproject로도 동작(PEP517) → poetry build
               (cd "$ROOT" && poetry build)
               ;;
             conda)
               logf "Packaging mode: conda (env pack)"
-              # Miniconda 설치 후 conda-pack 기반으로 실행 환경 아카이브
               sudo apt-get update -y && sudo apt-get install -y wget bzip2
               MINI="$HOME/miniconda"
               wget -qO ~/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
@@ -322,6 +372,7 @@ jobs:
               ;;
           esac
           ls -al "$ROOT/dist" | tee -a "$LOG_DIR/dist.txt"
+
       - name: Massive directory generation (+ echo-style permission files)
         shell: bash
         run: |
@@ -349,6 +400,17 @@ jobs:
           mapfile -t DLIST < <(seq -w 1 "$COUNT" | xargs -I{} echo "$BASE/dir_{}")
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
           logf "Generated $COUNT directories with permission echoes."
+
+      - name: Copy plan dry-run summary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -f copy_plan.json ]]; then
+            jq -r '.plans[] | "\(.src) -> \(.dest_rel) include:\(.include_globs|join("|")) exclude:\(.exclude_globs|join("|")) max:\(.max_mb)MB"' copy_plan.json || true
+          else
+            echo "no copy_plan.json"
+          fi
+
       # === 디렉토리 복사(경로 해석 + required + 용량 제한 + 매니페스트/체크섬 + ISO 포함 마커) ===
       - name: Copy directories by copy_plan_json (echo + manifest + checksums)
         shell: bash
@@ -373,7 +435,6 @@ jobs:
             REQUIRED=$(jq -r ".plans[$i].required // false" "$PLAN_FILE")
             mapfile -t INCLUDES < <(jq -r ".plans[$i].include_globs[]?" "$PLAN_FILE")
             mapfile -t EXCLUDES < <(jq -r ".plans[$i].exclude_globs[]?" "$PLAN_FILE")
-            # 경로 해석: repo-root → package-root → literal/absolute
             RESOLVED_SRC=""
             if [[ "$SRC" == /* ]]; then
               [[ -d "$SRC" ]] && RESOLVED_SRC="$SRC"
@@ -434,7 +495,8 @@ jobs:
             logf "Plan[$i] done → $DEST_DIR"
           done
           logf "Manifest generated: $MANIFEST_CSV"
-      - name: Optional Docker build + save
+
+      - name: Optional Docker build + save (single-arch local)
         if: ${{ inputs.build_docker == true }}
         shell: bash
         run: |
@@ -447,6 +509,38 @@ jobs:
           mkdir -p artifacts
           docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
           logf "Saved image tar.gz under artifacts/"
+
+      # ==== 보안/무결성: Syft SBOM + Trivy ====
+      - name: Install Syft & Trivy
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          sudo apt-get update -y && sudo apt-get install -y rpm
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Generate SBOM for package dir
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p security
+          syft packages dir:workspace/${{ inputs.package_name }} -o spdx-json > security/pkg-sbom.spdx.json
+
+      - name: Generate SBOM for image (if built)
+        if: ${{ inputs.build_docker == true }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          syft ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json > security/image-sbom.spdx.json
+
+      - name: Vulnerability scan (Trivy; image)
+        if: ${{ inputs.build_docker == true }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          trivy image --no-progress --severity HIGH,CRITICAL --format table \
+            -o security/image-vuln.txt ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}
+
       - name: Prepare ISO staging & info injection (includes copied data + server scripts)
         shell: bash
         run: |
@@ -462,7 +556,6 @@ jobs:
           cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || true
           [[ -d "$ROOT/extra_manifests" ]] && cp -a "$ROOT/extra_manifests" "$STAGE/docs/" || true
           cp -a "$ROOT/server" "$STAGE/"
-          # include_in_iso=true 마커 대상만 ISO 반영 (STAGE/extra/)
           if [[ -d "$ROOT" ]]; then
             while IFS= read -r -d '' marker; do
               d="$(dirname "$marker")"
@@ -482,6 +575,16 @@ jobs:
           - server/*: install_deploy.sh & systemd unit template (generated)
           TXT
           logf "ISO staging prepared at $STAGE"
+
+      - name: Add ISO integrity bundle (SHA256 + SBOM copy)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          STAGE="iso_stage/${{ inputs.package_name }}"
+          mkdir -p "$STAGE/docs"
+          (cd "$STAGE" && find . -type f -print0 | xargs -0 sha256sum) > "$STAGE/docs/ISO_FILES.sha256"
+          cp -a security/*.json "$STAGE/docs/" 2>/dev/null || true
+
       - name: Build ISO (xorriso / genisoimage fallback)
         shell: bash
         run: |
@@ -499,25 +602,39 @@ jobs:
           fi
           (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
           logf "ISO built: artifacts/${ISO_NAME}"
-      # === (옵션) GHCR / Docker Hub 푸시 ===
-      - name: Push image to GHCR
-        if: ${{ inputs.build_docker && steps.parse.outputs.ghcr_enable == 'true' }}
+
+      # === GHCR 멀티아키 빌드/푸시(선택) ===
+      - name: Setup Buildx
+        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute GHCR semver tags
+        id: ghcrtags
+        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
         shell: bash
-        env:
-          CR_PAT: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
-          SRC_IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
-          DEST_REPO="${{ steps.parse.outputs.ghcr_repo }}"
-          DEST_TAG="${{ steps.parse.outputs.ghcr_tag }}"
-          [[ -z "$DEST_REPO" ]] && { warn "ghcr.repo empty, skip"; exit 0; }
-          [[ -z "$DEST_TAG"  ]] && DEST_TAG="${{ steps.parse.outputs.image_tag }}"
-          docker login ghcr.io -u ${{ github.actor }} -p "$CR_PAT"
-          docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
-          docker push "$DEST_REPO:$DEST_TAG"
-          logf "Pushed to GHCR: $DEST_REPO:$DEST_TAG"
+          REPO="${{ steps.parse.outputs.ghcr_repo }}"
+          V="${{ inputs.package_version }}"
+          MAJOR="${V%%.*}"
+          MINOR="${V%.*}"
+          TAGS="${REPO}:${V},${REPO}:${MAJOR}.${MINOR#${MAJOR}.},${REPO}:${MAJOR},${REPO}:latest"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Computed tags: ${TAGS}"
+
+      - name: Build multi-arch and push (GHCR)
+        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        uses: docker/build-push-action@v6
+        with:
+          context: workspace/${{ inputs.package_name }}
+          file: workspace/${{ inputs.package_name }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.ghcrtags.outputs.tags }}
+
+      # === Docker Hub 푸시(선택, 단일 태그) ===
       - name: Push image to Docker Hub
-        if: ${{ inputs.build_docker && steps.parse.outputs.dh_enable == 'true' }}
+        if: ${{ inputs.build_docker == true && steps.parse.outputs.dh_enable == 'true' }}
         shell: bash
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -534,6 +651,40 @@ jobs:
           docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
           docker push "$DEST_REPO:$DEST_TAG"
           logf "Pushed to Docker Hub: $DEST_REPO:$DEST_TAG"
+
+      # === (옵션) Cosign 서명 (GHCR에 푸시된 태그 전체) ===
+      - name: Cosign sign GHCR images (optional)
+        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' && secrets.COSIGN_KEY != '' }}
+        shell: bash
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin
+          IFS=',' read -r -a TAGS <<< "${{ steps.ghcrtags.outputs.tags }}"
+          for t in "${TAGS[@]}"; do
+            echo "Signing $t"
+            COSIGN_EXPERIMENTAL=1 cosign sign --key env://COSIGN_KEY "$t"
+          done
+          # SBOM 어태스트(있을 경우)
+          if [[ -f security/image-sbom.spdx.json ]]; then
+            COSIGN_EXPERIMENTAL=1 cosign attest --key env://COSIGN_KEY \
+              --predicate security/image-sbom.spdx.json --type spdx "${TAGS[0]}"
+          fi
+
+      - name: Generate changelog (for release)
+        if: ${{ steps.parse.outputs.rel_enable == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p artifacts
+          git fetch --tags --force || true
+          PREV_TAG=$(git tag --sort=-creatordate | sed -n '2p')
+          CURR_TAG="${{ steps.parse.outputs.rel_tag }}"
+          git log --pretty=format:"* %h %s (%an)" ${PREV_TAG}..HEAD > artifacts/CHANGELOG.txt || true
+          [[ -s artifacts/CHANGELOG.txt ]] || echo "* Initial release" > artifacts/CHANGELOG.txt
+
       # === (옵션) GitHub Release 생성 + ISO/이미지 아티팩트 첨부 ===
       - name: Create GitHub Release
         if: ${{ steps.parse.outputs.rel_enable == 'true' }}
@@ -545,7 +696,9 @@ jobs:
           files: |
             artifacts/*.iso
             artifacts/*.sha256
+            artifacts/CHANGELOG.txt
             artifacts/*.tar.gz
+            security/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -571,15 +724,23 @@ jobs:
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "mkdir -p $DEST"
-          # rsync 코드 전송
           rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=no" "$ROOT/" "$USER@$HOST:$DEST/"
-          # 원격 설치 실행
           SUDO_FLAG=""
           [[ "$USE_SUDO" == "true" ]] && SUDO_FLAG="SUDO=sudo"
           ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
             "cd $DEST && $SUDO_FLAG APP_NAME=${P} DEPLOY_PATH=$DEST START_CMD='$CMD' bash ./server/install_deploy.sh"
           logf "Deployed to $USER@$HOST:$DEST"
-      - name: Upload artifacts
+
+      - name: Post-deploy health check
+        if: ${{ steps.parse.outputs.dep_enable == 'true' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ssh -o StrictHostKeyChecking=no -p "${{ steps.parse.outputs.dep_port }}" \
+            "${{ steps.parse.outputs.dep_user }}@${{ steps.parse.outputs.dep_host }}" \
+            "sudo systemctl is-active ${{ steps.parse.outputs.dep_svc }} && sudo systemctl status --no-pager ${{ steps.parse.outputs.dep_svc }} | tail -n 50"
+
+      - name: Upload artifacts (retention 7d)
         uses: actions/upload-artifact@v4
         with:
           name: echo-image-iso-${{ github.run_id }}
@@ -587,4 +748,6 @@ jobs:
             artifacts/**
             workspace/**/dist/**
             .github/echo_logs/**
+            security/**
+          retention-days: 7
           if-no-files-found: warn
