@@ -11,30 +11,10 @@ on:
         description: "패키지 버전"
         required: true
         default: "0.1.0"
-      author_name:
-        description: "작성자"
-        required: true
-        default: "Your Name"
-      author_email:
-        description: "작성자 이메일"
-        required: true
-        default: "you@example.com"
-      license_name:
-        description: "라이선스 표기"
-        required: true
-        default: "MIT"
       dirs_count:
         description: "대량 생성 디렉토리 개수 (예: 2000)"
         required: true
         default: "500"
-      image_name:
-        description: "Docker 이미지명 (태그는 자동)"
-        required: true
-        default: "mypkg-app"
-      image_tag:
-        description: "Docker 태그"
-        required: true
-        default: "latest"
       iso_label:
         description: "ISO 볼륨 라벨(영문/숫자/언더스코어)"
         required: true
@@ -43,6 +23,14 @@ on:
         description: "ISO에 주입할 JSON(예: {\"env\":\"prod\",\"team\":\"devops\"})"
         required: false
         default: "{\"env\":\"dev\",\"team\":\"finops\"}"
+      metadata_json:
+        description: "패키지 메타(JSON): {\"author_name\":\"...\",\"author_email\":\"...\",\"license_name\":\"MIT\"}"
+        required: false
+        default: "{\"author_name\":\"Your Name\",\"author_email\":\"you@example.com\",\"license_name\":\"MIT\"}"
+      image_ref:
+        description: "Docker 이미지 참조(이름:태그) 예: mypkg-app:latest"
+        required: true
+        default: "mypkg-app:latest"
       build_docker:
         description: "Docker 이미지 빌드/저장 수행"
         required: true
@@ -93,21 +81,56 @@ jobs:
           pip3 --version | tee -a "$LOG_DIR/pip.txt"
           logf "Installed: xorriso/genisoimage for ISO, jq for JSON"
 
+      - name: Parse inputs (metadata_json, image_ref)
+        id: parse
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          MJ='${{ inputs.metadata_json }}'
+          A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
+          A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
+          L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
+
+          IMG='${{ inputs.image_ref }}'
+          # image:tag 분리 (태그 없으면 latest 가정)
+          if [[ "$IMG" == *:* ]]; then
+            IMG_NAME="${IMG%%:*}"
+            IMG_TAG="${IMG##*:}"
+          else
+            IMG_NAME="$IMG"
+            IMG_TAG="latest"
+          fi
+
+          {
+            echo "author_name=$A_NAME"
+            echo "author_email=$A_EMAIL"
+            echo "license_name=$L_NAME"
+            echo "image_name=$IMG_NAME"
+            echo "image_tag=$IMG_TAG"
+          } | tee -a "$LOG_DIR/parsed_inputs.env"
+
+          echo "author_name=$A_NAME"   >> "$GITHUB_OUTPUT"
+          echo "author_email=$A_EMAIL" >> "$GITHUB_OUTPUT"
+          echo "license_name=$L_NAME"  >> "$GITHUB_OUTPUT"
+          echo "image_name=$IMG_NAME"  >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMG_TAG"    >> "$GITHUB_OUTPUT"
+
       - name: Create Python package skeleton (PEP 621 / pyproject.toml)
         shell: bash
         run: |
           set -Eeuo pipefail
           P="${{ inputs.package_name }}"
           V="${{ inputs.package_version }}"
-          A="${{ inputs.author_name }}"
-          E="${{ inputs.author_email }}"
-          L="${{ inputs.license_name }}"
+          A="${{ steps.parse.outputs.author_name }}"
+          E="${{ steps.parse.outputs.author_email }}"
+          L="${{ steps.parse.outputs.license_name }}"
           ROOT="workspace/${P}"
           PKG_DIR="$ROOT/src/${P}"
           TEST_DIR="$ROOT/tests"
           DOC_DIR="$ROOT/docs"
           mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
-          # core files
+
+          # core files (safe heredoc)
           cat > "$ROOT/pyproject.toml" <<'PYT'
           [build-system]
           requires = ["setuptools>=68", "wheel"]
@@ -220,11 +243,11 @@ jobs:
           set -Eeuo pipefail
           P="${{ inputs.package_name }}"
           ROOT="workspace/${P}"
-          IMG="${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
           logf "Building Docker image: $IMG"
           docker build -t "$IMG" "$ROOT"
           mkdir -p artifacts
-          docker save "$IMG" | gzip -c > "artifacts/${{ inputs.image_name }}-${{ inputs.image_tag }}.tar.gz"
+          docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
           logf "Saved image tar.gz under artifacts/"
 
       - name: Prepare ISO staging & info injection
