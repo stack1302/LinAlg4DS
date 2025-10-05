@@ -54,8 +54,8 @@ on:
         default: "{\"packaging\":{\"mode\":\"pip\"},\"ghcr\":{\"enable\":false},\"dockerhub\":{\"enable\":false},\"release\":{\"enable\":false},\"server\":{\"enable\":false}}"
 
 permissions:
-  contents: write        # Release에 필요
-  packages: write        # GHCR 푸시에 필요
+  contents: write
+  packages: write
   actions: read
 
 concurrency:
@@ -79,7 +79,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 모든 bash 스텝에서 에코 헬퍼 사용 (현재/다음 스텝 모두)
       - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
@@ -134,7 +133,7 @@ jobs:
           CP='${{ inputs.copy_plan_json }}'
           printf '%s' "$CP" | jq . >/dev/null
           ADV='${{ inputs.advanced_json }}'
-          printf '%s' "$ADV" | jq . >/dev/null
+          printf '%s' "$ADV" | jq . >/dev놓
           PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"') # pip|poetry|conda
           GHCR_ENABLE=$(printf '%s' "$ADV" | jq -r '.ghcr.enable // false')
           GHCR_REPO=$(printf '%s' "$ADV" | jq -r '.ghcr.repo // ""')
@@ -226,7 +225,6 @@ jobs:
           TEST_DIR="$ROOT/tests"
           DOC_DIR="$ROOT/docs"
           mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
-          # pyproject (setuptools)
           cat > "$ROOT/pyproject.toml" <<'PYT'
           [build-system]
           requires = ["setuptools>=68", "wheel"]
@@ -253,13 +251,11 @@ jobs:
           sed -i "s/__AUTHOR__/${A}/g" "$ROOT/pyproject.toml"
           sed -i "s/__EMAIL__/${E}/g" "$ROOT/pyproject.toml"
           sed -i "s/__LICENSE__/${L}/g" "$ROOT/pyproject.toml"
-          # README
           cat > "$ROOT/README.md" <<'MD'
           # Auto Generated Python Package
           - EchoOps generated.
           - Includes Dockerfile, ISO injection artifacts, copy-plan manifest, and server deploy scripts.
           MD
-          # package
           cat > "$PKG_DIR/__init__.py" <<'PY'
           __all__ = ["hello"]
           __version__ = "__VER__"
@@ -274,7 +270,6 @@ jobs:
               assert hello("Echo") == "Hello, Echo!"
           PY
           sed -i "s/__pkg__/${P}/g" "$TEST_DIR/test_hello.py"
-          # Dockerfile
           cat > "$ROOT/Dockerfile" <<'DOCKER'
           FROM python:3.11-slim
           WORKDIR /app
@@ -283,7 +278,6 @@ jobs:
           CMD ["python","-c","import __PKG__; print(__PKG__.hello('Docker'))"]
           DOCKER
           sed -i "s/__PKG__/${P}/g" "$ROOT/Dockerfile"
-          # --- Server deploy artifacts (install script + systemd unit) ---
           mkdir -p "$ROOT/server"
           cat > "$ROOT/server/install_deploy.sh" <<'SH'
           #!/usr/bin/env bash
@@ -334,7 +328,6 @@ jobs:
           cd workspace/${{ inputs.package_name }}
           pytest -q
 
-      # Packaging 모드에 따라 빌드
       - name: Build (pip/poetry/conda)
         id: buildpkg
         shell: bash
@@ -406,12 +399,11 @@ jobs:
         run: |
           set -Eeuo pipefail
           if [[ -f copy_plan.json ]]; then
-            jq -r '.plans[] | "\(.src) -> \(.dest_rel) include:\(.include_globs|join("|")) exclude:\(.exclude_globs|join("|")) max:\(.max_mb)MB"' copy_plan.json || true
+            jq -r '.plans[] | "\(.src) -> \(.dest_rel) include:\(.include_globs|join(\"|\")) exclude:\(.exclude_globs|join(\"|\")) max:\(.max_mb)MB"' copy_plan.json || true
           else
             echo "no copy_plan.json"
           fi
 
-      # === 디렉토리 복사(경로 해석 + required + 용량 제한 + 매니페스트/체크섬 + ISO 포함 마커) ===
       - name: Copy directories by copy_plan_json (echo + manifest + checksums)
         shell: bash
         run: |
@@ -510,7 +502,6 @@ jobs:
           docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
           logf "Saved image tar.gz under artifacts/"
 
-      # ==== 보안/무결성: Syft SBOM + Trivy ====
       - name: Install Syft & Trivy
         shell: bash
         run: |
@@ -603,7 +594,6 @@ jobs:
           (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
           logf "ISO built: artifacts/${ISO_NAME}"
 
-      # === GHCR 멀티아키 빌드/푸시(선택) ===
       - name: Setup Buildx
         if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/setup-buildx-action@v3
@@ -632,7 +622,6 @@ jobs:
           push: true
           tags: ${{ steps.ghcrtags.outputs.tags }}
 
-      # === Docker Hub 푸시(선택, 단일 태그) ===
       - name: Push image to Docker Hub
         if: ${{ inputs.build_docker == true && steps.parse.outputs.dh_enable == 'true' }}
         shell: bash
@@ -652,22 +641,25 @@ jobs:
           docker push "$DEST_REPO:$DEST_TAG"
           logf "Pushed to Docker Hub: $DEST_REPO:$DEST_TAG"
 
-      # === (옵션) Cosign 서명 (GHCR에 푸시된 태그 전체) ===
+      # !! 수정된 Cosign 스텝 (if: 에 secrets 사용 제거, 내부 체크로 스킵 처리) !!
       - name: Cosign sign GHCR images (optional)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' && secrets.COSIGN_KEY != '' }}
+        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
         shell: bash
         env:
           COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           set -Eeuo pipefail
+          if [[ -z "${COSIGN_KEY}" ]]; then
+            echo "COSIGN_KEY secret not set; skipping cosign."
+            exit 0
+          fi
           curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin
           IFS=',' read -r -a TAGS <<< "${{ steps.ghcrtags.outputs.tags }}"
           for t in "${TAGS[@]}"; do
             echo "Signing $t"
             COSIGN_EXPERIMENTAL=1 cosign sign --key env://COSIGN_KEY "$t"
           done
-          # SBOM 어태스트(있을 경우)
           if [[ -f security/image-sbom.spdx.json ]]; then
             COSIGN_EXPERIMENTAL=1 cosign attest --key env://COSIGN_KEY \
               --predicate security/image-sbom.spdx.json --type spdx "${TAGS[0]}"
@@ -685,7 +677,6 @@ jobs:
           git log --pretty=format:"* %h %s (%an)" ${PREV_TAG}..HEAD > artifacts/CHANGELOG.txt || true
           [[ -s artifacts/CHANGELOG.txt ]] || echo "* Initial release" > artifacts/CHANGELOG.txt
 
-      # === (옵션) GitHub Release 생성 + ISO/이미지 아티팩트 첨부 ===
       - name: Create GitHub Release
         if: ${{ steps.parse.outputs.rel_enable == 'true' }}
         uses: softprops/action-gh-release@v2
@@ -702,7 +693,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # === (옵션) 서버 배포 (SSH) ===
       - name: Deploy to server via SSH (optional)
         if: ${{ steps.parse.outputs.dep_enable == 'true' }}
         shell: bash
