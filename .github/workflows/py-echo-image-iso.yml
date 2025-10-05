@@ -1,4 +1,4 @@
-name: "🐍 PyPkg + Echo Dirs + Perm/Echo Files + Docker Image + ISO (All-in-One)"
+name: "🐍 PyPkg + Echo Dirs + Perm/Echo Files + Docker Image + ISO + CopyPlan (All-in-One)"
 
 on:
   workflow_dispatch:
@@ -36,6 +36,12 @@ on:
         required: true
         type: boolean
         default: true
+      copy_plan_json:
+        description: >-
+          디렉토리 복사 계획(JSON).
+          예: {"plans":[{"src":"samples","dest_rel":"extra/samples","include_globs":["**/*.md","**/*.txt"],"exclude_globs":["**/tmp/**"],"max_mb":50,"include_in_iso":true}]}
+        required: false
+        default: "{\"plans\":[{\"src\":\"samples\",\"dest_rel\":\"extra/samples\",\"include_globs\":[\"**/*\"],\"exclude_globs\":[\"**/.git/**\",\"**/.github/**\"],\"max_mb\":100,\"include_in_iso\":true}]}"
 
 permissions:
   contents: write
@@ -52,12 +58,13 @@ env:
 jobs:
   all-in-one:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ★ 수정: 현재 스텝 즉시 + 다음 스텝 자동 로드 (BASH_ENV 이중 적용)
+      # 현재 스텝 즉시 + 다음 스텝 자동 로드(BASH_ENV)
       - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
@@ -74,37 +81,35 @@ jobs:
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           logf(){  printf '%s\n' "$*" | tee -a "$SAFE_LOG"; }
           SH
-
-          # 1) 현재 스텝에 즉시 적용
           export BASH_ENV="$GITHUB_WORKSPACE/.bashenv"
-          # 2) 다음 스텝에도 자동 적용
           echo "BASH_ENV=$BASH_ENV" >> "$GITHUB_ENV"
-
-          # 스모크 테스트 (이 스텝에서도 바로 동작해야 함)
           bash -lc 'echoe "helpers loaded"; logf "helpers ready"'
 
-      - name: Install toolchain (Python, build tools, ISO tools)
+      - name: Install toolchain (Python, ISO, copy utilities)
         shell: bash
         run: |
           set -Eeuo pipefail
-          logf "Installing build tools"
+          logf "Installing build/copy tools"
           sudo apt-get update -y
           sudo apt-get install -y python3 python3-venv python3-pip python3-setuptools python3-wheel \
-              git jq xorriso genisoimage dosfstools
+              git jq rsync xorriso genisoimage dosfstools
           python3 --version | tee -a "$LOG_DIR/python.txt"
           pip3 --version | tee -a "$LOG_DIR/pip.txt"
-          logf "Installed: xorriso/genisoimage for ISO, jq for JSON"
+          rsync --version | head -n1 | tee -a "$LOG_DIR/rsync.txt"
+          logf "Installed: xorriso/genisoimage/jq/rsync"
 
-      - name: Parse inputs (metadata_json, image_ref)
+      - name: Parse inputs (metadata_json, image_ref, copy_plan_json)
         id: parse
         shell: bash
         run: |
           set -Eeuo pipefail
+          # metadata_json
           MJ='${{ inputs.metadata_json }}'
           A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
           A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
 
+          # image_ref
           IMG='${{ inputs.image_ref }}'
           if [[ "$IMG" == *:* ]]; then
             IMG_NAME="${IMG%%:*}"
@@ -113,6 +118,11 @@ jobs:
             IMG_NAME="$IMG"
             IMG_TAG="latest"
           fi
+
+          # copy_plan_json
+          CP='${{ inputs.copy_plan_json }}'
+          # 유효성 간단 체크
+          printf '%s' "$CP" | jq . >/dev/null
 
           {
             echo "author_name=$A_NAME"
@@ -127,6 +137,9 @@ jobs:
           echo "license_name=$L_NAME"  >> "$GITHUB_OUTPUT"
           echo "image_name=$IMG_NAME"  >> "$GITHUB_OUTPUT"
           echo "image_tag=$IMG_TAG"    >> "$GITHUB_OUTPUT"
+          # copy_plan_json은 파일로 저장(다음 스텝 사용)
+          printf '%s' "$CP" > copy_plan.json
+          logf "copy_plan.json saved"
 
       - name: Create Python package skeleton (PEP 621 / pyproject.toml)
         shell: bash
@@ -143,7 +156,7 @@ jobs:
           DOC_DIR="$ROOT/docs"
           mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
 
-          # core files (safe heredoc)
+          # core files
           cat > "$ROOT/pyproject.toml" <<'PYT'
           [build-system]
           requires = ["setuptools>=68", "wheel"]
@@ -177,7 +190,7 @@ jobs:
           cat > "$ROOT/README.md" <<'MD'
           # Auto Generated Python Package
           - EchoOps generated.
-          - Includes Dockerfile and ISO injection artifacts.
+          - Includes Dockerfile, ISO injection artifacts, and copy-plan manifest.
           MD
 
           cat > "$PKG_DIR/__init__.py" <<'PY'
@@ -250,6 +263,100 @@ jobs:
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
           logf "Generated $COUNT directories with permission echoes."
 
+      # === 새 기능: 디렉토리 정보 복사(필터링/사이즈 제한/매니페스트/체크섬) & ISO 포함 옵션 ===
+      - name: Copy directories by copy_plan_json (echo + manifest + checksums)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          P="${{ inputs.package_name }}"
+          ROOT="workspace/${P}"
+          PLAN_FILE="copy_plan.json"
+          DEST_BASE="$ROOT"  # dest_rel은 ROOT 기준
+
+          [[ -f "$PLAN_FILE" ]] || { warn "copy_plan.json not found, skipping"; exit 0; }
+
+          mkdir -p "$ROOT/extra_manifests"
+          MANIFEST_CSV="$ROOT/extra_manifests/manifest-$(date +%Y%m%d%H%M%S).csv"
+          echo "src,dest_rel,relpath,bytes,sha256" > "$MANIFEST_CSV"
+
+          COUNT_PLANS=$(jq -r '.plans | length' "$PLAN_FILE")
+          logf "Copy plans: $COUNT_PLANS"
+
+          for i in $(seq 0 $((COUNT_PLANS-1))); do
+            SRC=$(jq -r ".plans[$i].src" "$PLAN_FILE")
+            DEST_REL=$(jq -r ".plans[$i].dest_rel // \"extra\"" "$PLAN_FILE")
+            MAX_MB=$(jq -r ".plans[$i].max_mb // 100" "$PLAN_FILE")
+            INCLUDE_ISO=$(jq -r ".plans[$i].include_in_iso // true" "$PLAN_FILE")
+            # arrays
+            mapfile -t INCLUDES < <(jq -r ".plans[$i].include_globs[]?" "$PLAN_FILE")
+            mapfile -t EXCLUDES < <(jq -r ".plans[$i].exclude_globs[]?" "$PLAN_FILE")
+
+            DEST_DIR="$DEST_BASE/$DEST_REL"
+            mkdir -p "$DEST_DIR"
+
+            if [[ ! -d "$SRC" ]]; then
+              warn "SRC not found or not a directory: $SRC — skipping plan $i"
+              continue
+            fi
+
+            logf "Plan[$i] SRC=$SRC DEST_REL=$DEST_REL MAX_MB=$MAX_MB INCLUDE_ISO=$INCLUDE_ISO"
+            # rsync 필터 구성
+            RSYNC_ARGS=(-a --delete --prune-empty-dirs)
+            for p in "${INCLUDES[@]}";  do RSYNC_ARGS+=(--include "$p"); done
+            for p in "${EXCLUDES[@]}";  do RSYNC_ARGS+=(--exclude "$p"); done
+            RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/')
+            RSYNC_ARGS+=(--include '*/' --exclude '*') # 위 include에 매치된 파일만 복사
+
+            # 임시 스테이징 후 용량 제한 검사
+            TMP_STAGE="$(mktemp -d)"
+            rsync "${RSYNC_ARGS[@]}" "$SRC/" "$TMP_STAGE/"
+
+            TOTAL_BYTES=$(du -sb "$TMP_STAGE" | awk '{print $1}')
+            LIMIT_BYTES=$((MAX_MB * 1024 * 1024))
+
+            if (( TOTAL_BYTES > LIMIT_BYTES )); then
+              warn "Plan[$i] size exceed: $(numfmt --to=iec $TOTAL_BYTES) > $(numfmt --to=iec $LIMIT_BYTES). Truncating by newest-first copy."
+              # 최신 파일 우선으로 제한 용량까지 복사
+              mkdir -p "$DEST_DIR"
+              REMAIN=$LIMIT_BYTES
+              # 최신순 목록
+              mapfile -t FILES < <(find "$TMP_STAGE" -type f -printf '%T@ %p\n' | sort -nr | awk '{sub($1 FS,""); print}')
+              for f in "${FILES[@]}"; do
+                sz=$(stat -c%s "$f")
+                (( sz <= REMAIN )) || continue
+                rel="${f#"$TMP_STAGE/"}"
+                mkdir -p "$DEST_DIR/$(dirname "$rel")"
+                cp -a "$f" "$DEST_DIR/$rel"
+                REMAIN=$((REMAIN - sz))
+              done
+            else
+              # 전체 복사
+              rsync -a --delete "$TMP_STAGE/" "$DEST_DIR/"
+            fi
+
+            # 매니페스트+체크섬
+            if [[ -d "$DEST_DIR" ]]; then
+              while IFS= read -r -d '' f; do
+                rel="${f#"$DEST_BASE/"}"
+                bytes=$(stat -c%s "$f")
+                sha=$(sha256sum "$f" | awk '{print $1}')
+                printf '%s,%s,%s,%s,%s\n' "$SRC" "$DEST_REL" "${rel#"$DEST_REL/"}" "$bytes" "$sha" >> "$MANIFEST_CSV"
+              done < <(find "$DEST_DIR" -type f -print0)
+            fi
+
+            rm -rf "$TMP_STAGE"
+            # ISO 포함 표시 파일
+            if [[ "$INCLUDE_ISO" == "true" ]]; then
+              echo "include_in_iso=true" > "$DEST_DIR/.iso.include"
+            else
+              echo "include_in_iso=false" > "$DEST_DIR/.iso.include"
+            fi
+
+            logf "Plan[$i] done → $DEST_DIR"
+          done
+
+          logf "Manifest generated: $MANIFEST_CSV"
+
       - name: Optional Docker build + save
         if: ${{ inputs.build_docker == true }}
         shell: bash
@@ -264,35 +371,53 @@ jobs:
           docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
           logf "Saved image tar.gz under artifacts/"
 
-      - name: Prepare ISO staging & info injection
+      - name: Prepare ISO staging & info injection (includes copied data)
         shell: bash
         run: |
           set -Eeuo pipefail
           P="${{ inputs.package_name }}"
           ROOT="workspace/${P}"
           STAGE="iso_stage/${P}"
-          mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs"
+          mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs" "$STAGE/extra"
 
-          # Inject build metadata
+          # Build metadata
           echo "${{ github.repository }},${{ github.run_id }},${{ github.ref_name }}" > "$STAGE/build_info.csv"
 
-          # Inject user JSON info
+          # Inject user JSON
           printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
 
           # Include built distributions
           cp -a "$ROOT/dist" "$STAGE/pkg/"
 
-          # Include echo logs & permission script
+          # Include echo logs & scripts
           cp -a .github/echo_logs "$STAGE/docs/" || true
           cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || true
 
+          # Include manifests
+          if [[ -d "$ROOT/extra_manifests" ]]; then
+            cp -a "$ROOT/extra_manifests" "$STAGE/docs/" || true
+          fi
+
+          # CopyPlan 결과 중 include_in_iso=true 인 디렉토리만 ISO로 편입
+          if [[ -d "$ROOT" ]]; then
+            while IFS= read -r -d '' marker; do
+              d="$(dirname "$marker")"
+              rel="${d#"$ROOT/"}"
+              # STAGE/extra 아래 동일 경로로 반영
+              mkdir -p "$STAGE/extra/$rel"
+              rsync -a "$d/" "$STAGE/extra/$rel/"
+            done < <(find "$ROOT" -type f -name ".iso.include" -print0 | xargs -0 grep -l "include_in_iso=true" || true)
+          fi
+
           # README
           cat > "$STAGE/README.txt" <<'TXT'
-          Echo ISO — contains:
+          Echo ISO — includes:
           - pkg/dist: built wheels/sdists
           - config/inject.json: injected metadata
           - docs/echo_logs: run logs
           - docs/perm_apply.sh: permission script
+          - docs/extra_manifests: copy-plan manifest & checksums
+          - extra/*: directories copied per copy_plan (only include_in_iso=true)
           TXT
 
           logf "ISO staging prepared at $STAGE"
