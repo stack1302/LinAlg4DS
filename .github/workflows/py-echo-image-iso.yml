@@ -128,12 +128,20 @@ jobs:
           A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
           A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
+
           IMG='${{ inputs.image_ref }}'
-          if [[ "$IMG" == *:* ]]; then IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"; else IMG_NAME="$IMG"; IMG_TAG="latest"; fi
+          if [[ "$IMG" == *:* ]]; then
+            IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"
+          else
+            IMG_NAME="$IMG"; IMG_TAG="latest"
+          fi
+
           CP='${{ inputs.copy_plan_json }}'
-          printf '%s' "$CP" | jq . >/dev/null
+          printf '%s' "$CP"  | jq . >/dev/null  || { echo "copy_plan_json invalid JSON"; exit 1; }
+
           ADV='${{ inputs.advanced_json }}'
-          printf '%s' "$ADV" | jq . >/dev놓
+          printf '%s' "$ADV" | jq . >/dev/null  || { echo "advanced_json invalid JSON"; exit 1; }
+
           PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"') # pip|poetry|conda
           GHCR_ENABLE=$(printf '%s' "$ADV" | jq -r '.ghcr.enable // false')
           GHCR_REPO=$(printf '%s' "$ADV" | jq -r '.ghcr.repo // ""')
@@ -153,6 +161,7 @@ jobs:
           DEP_SVC=$(printf '%s' "$ADV" | jq -r '.server.service_name // "mypkg"')
           DEP_CMD=$(printf '%s' "$ADV" | jq -r '.server.start_cmd // "python -m mypkg"')
           DEP_SUDO=$(printf '%s' "$ADV" | jq -r '.server.use_sudo // true')
+
           {
             echo "author_name=$A_NAME"
             echo "author_email=$A_EMAIL"
@@ -179,11 +188,13 @@ jobs:
             echo "dep_cmd=$DEP_CMD"
             echo "dep_sudo=$DEP_SUDO"
           } | tee -a "$LOG_DIR/parsed_inputs.env"
+
           for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh_enable dh_repo dh_tag rel_enable rel_tag rel_draft rel_prerelease dep_enable dep_host dep_user dep_port dep_path dep_svc dep_cmd dep_sudo; do
             v=$(grep "^$k=" "$LOG_DIR/parsed_inputs.env" | cut -d= -f2-)
             echo "$k=$v" >> "$GITHUB_OUTPUT"
           done
-          printf '%s' "$CP" > copy_plan.json
+
+          printf '%s' "$CP"  > copy_plan.json
           printf '%s' "$ADV" > advanced.json
           logf "copy_plan.json & advanced.json saved"
 
@@ -225,6 +236,7 @@ jobs:
           TEST_DIR="$ROOT/tests"
           DOC_DIR="$ROOT/docs"
           mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
+
           cat > "$ROOT/pyproject.toml" <<'PYT'
           [build-system]
           requires = ["setuptools>=68", "wheel"]
@@ -251,11 +263,13 @@ jobs:
           sed -i "s/__AUTHOR__/${A}/g" "$ROOT/pyproject.toml"
           sed -i "s/__EMAIL__/${E}/g" "$ROOT/pyproject.toml"
           sed -i "s/__LICENSE__/${L}/g" "$ROOT/pyproject.toml"
+
           cat > "$ROOT/README.md" <<'MD'
           # Auto Generated Python Package
           - EchoOps generated.
           - Includes Dockerfile, ISO injection artifacts, copy-plan manifest, and server deploy scripts.
           MD
+
           cat > "$PKG_DIR/__init__.py" <<'PY'
           __all__ = ["hello"]
           __version__ = "__VER__"
@@ -263,6 +277,7 @@ jobs:
               return f"Hello, {name}!"
           PY
           sed -i "s/__VER__/${V}/g" "$PKG_DIR/__init__.py"
+
           cat > "$TEST_DIR/test_hello.py" <<'PY'
           from __future__ import annotations
           from __pkg__.__init__ import hello
@@ -270,6 +285,7 @@ jobs:
               assert hello("Echo") == "Hello, Echo!"
           PY
           sed -i "s/__pkg__/${P}/g" "$TEST_DIR/test_hello.py"
+
           cat > "$ROOT/Dockerfile" <<'DOCKER'
           FROM python:3.11-slim
           WORKDIR /app
@@ -278,6 +294,7 @@ jobs:
           CMD ["python","-c","import __PKG__; print(__PKG__.hello('Docker'))"]
           DOCKER
           sed -i "s/__PKG__/${P}/g" "$ROOT/Dockerfile"
+
           mkdir -p "$ROOT/server"
           cat > "$ROOT/server/install_deploy.sh" <<'SH'
           #!/usr/bin/env bash
@@ -641,7 +658,7 @@ jobs:
           docker push "$DEST_REPO:$DEST_TAG"
           logf "Pushed to Docker Hub: $DEST_REPO:$DEST_TAG"
 
-      # !! 수정된 Cosign 스텝 (if: 에 secrets 사용 제거, 내부 체크로 스킵 처리) !!
+      # (수정) Cosign: if: 에 secrets 제거, 내부에서 키 유무로 스킵
       - name: Cosign sign GHCR images (optional)
         if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
         shell: bash
