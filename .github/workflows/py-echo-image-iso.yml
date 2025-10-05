@@ -38,10 +38,10 @@ on:
         default: true
       copy_plan_json:
         description: >-
-          디렉토리 복사 계획(JSON).
-          예: {"plans":[{"src":"samples","dest_rel":"extra/samples","include_globs":["**/*.md","**/*.txt"],"exclude_globs":["**/tmp/**"],"max_mb":50,"include_in_iso":true}]}
+          디렉토리 복사 계획(JSON). 필드: src, dest_rel, include_globs[], exclude_globs[], max_mb, include_in_iso, required
+          예: {"plans":[{"src":"samples","dest_rel":"extra/samples","include_globs":["**/*.md","**/*.txt"],"exclude_globs":["**/tmp/**"],"max_mb":50,"include_in_iso":true,"required":false}]}
         required: false
-        default: "{\"plans\":[{\"src\":\"samples\",\"dest_rel\":\"extra/samples\",\"include_globs\":[\"**/*\"],\"exclude_globs\":[\"**/.git/**\",\"**/.github/**\"],\"max_mb\":100,\"include_in_iso\":true}]}"
+        default: "{\"plans\":[{\"src\":\"samples\",\"dest_rel\":\"extra/samples\",\"include_globs\":[\"**/*\"],\"exclude_globs\":[\"**/.git/**\",\"**/.github/**\"],\"max_mb\":100,\"include_in_iso\":true,\"required\":false}]}"
 
 permissions:
   contents: write
@@ -64,7 +64,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 현재 스텝 즉시 + 다음 스텝 자동 로드(BASH_ENV)
+      # 모든 bash 스텝에서 에코 헬퍼 자동 로드 (현재 스텝 즉시 + 다음 스텝 자동)
       - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
@@ -121,7 +121,6 @@ jobs:
 
           # copy_plan_json
           CP='${{ inputs.copy_plan_json }}'
-          # 유효성 간단 체크
           printf '%s' "$CP" | jq . >/dev/null
 
           {
@@ -137,7 +136,6 @@ jobs:
           echo "license_name=$L_NAME"  >> "$GITHUB_OUTPUT"
           echo "image_name=$IMG_NAME"  >> "$GITHUB_OUTPUT"
           echo "image_tag=$IMG_TAG"    >> "$GITHUB_OUTPUT"
-          # copy_plan_json은 파일로 저장(다음 스텝 사용)
           printf '%s' "$CP" > copy_plan.json
           logf "copy_plan.json saved"
 
@@ -263,7 +261,7 @@ jobs:
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
           logf "Generated $COUNT directories with permission echoes."
 
-      # === 새 기능: 디렉토리 정보 복사(필터링/사이즈 제한/매니페스트/체크섬) & ISO 포함 옵션 ===
+      # === [업데이트 반영] 디렉토리 복사 (경로 해석 + required + 용량 제한 + 매니페스트/체크섬 + ISO 포함 마커) ===
       - name: Copy directories by copy_plan_json (echo + manifest + checksums)
         shell: bash
         run: |
@@ -277,7 +275,10 @@ jobs:
 
           mkdir -p "$ROOT/extra_manifests"
           MANIFEST_CSV="$ROOT/extra_manifests/manifest-$(date +%Y%m%d%H%M%S).csv"
-          echo "src,dest_rel,relpath,bytes,sha256" > "$MANIFEST_CSV"
+          echo "src,resolved_src,dest_rel,relpath,bytes,sha256" > "$MANIFEST_CSV"
+
+          # 사람이 읽기 쉬운 사이즈 출력 (numfmt 없으면 bytes)
+          nf(){ if command -v numfmt >/dev/null 2>&1; then numfmt --to=iec "$1"; else echo "$1 bytes"; fi; }
 
           COUNT_PLANS=$(jq -r '.plans | length' "$PLAN_FILE")
           logf "Copy plans: $COUNT_PLANS"
@@ -287,39 +288,55 @@ jobs:
             DEST_REL=$(jq -r ".plans[$i].dest_rel // \"extra\"" "$PLAN_FILE")
             MAX_MB=$(jq -r ".plans[$i].max_mb // 100" "$PLAN_FILE")
             INCLUDE_ISO=$(jq -r ".plans[$i].include_in_iso // true" "$PLAN_FILE")
+            REQUIRED=$(jq -r ".plans[$i].required // false" "$PLAN_FILE")
             # arrays
             mapfile -t INCLUDES < <(jq -r ".plans[$i].include_globs[]?" "$PLAN_FILE")
             mapfile -t EXCLUDES < <(jq -r ".plans[$i].exclude_globs[]?" "$PLAN_FILE")
 
+            # 경로 해석: repo-root → package-root → literal/absolute
+            RESOLVED_SRC=""
+            if [[ "$SRC" == /* ]]; then
+              [[ -d "$SRC" ]] && RESOLVED_SRC="$SRC"
+            else
+              [[ -d "$GITHUB_WORKSPACE/$SRC" ]] && RESOLVED_SRC="$GITHUB_WORKSPACE/$SRC"
+              [[ -z "$RESOLVED_SRC" && -d "$DEST_BASE/$SRC" ]] && RESOLVED_SRC="$DEST_BASE/$SRC"
+              [[ -z "$RESOLVED_SRC" && -d "$SRC" ]] && RESOLVED_SRC="$SRC"
+            fi
+
+            if [[ -z "$RESOLVED_SRC" ]]; then
+              if [[ "$REQUIRED" == "true" ]]; then
+                fail "Plan[$i] required=true but src not found: $SRC (tried: $GITHUB_WORKSPACE/$SRC , $DEST_BASE/$SRC , $SRC)"
+                exit 1
+              else
+                warn "Plan[$i] SRC not found: $SRC — skipping (set required=true to fail)"
+                continue
+              fi
+            fi
+
             DEST_DIR="$DEST_BASE/$DEST_REL"
             mkdir -p "$DEST_DIR"
 
-            if [[ ! -d "$SRC" ]]; then
-              warn "SRC not found or not a directory: $SRC — skipping plan $i"
-              continue
-            fi
+            logf "Plan[$i] SRC=$SRC → RESOLVED=$RESOLVED_SRC DEST_REL=$DEST_REL MAX_MB=${MAX_MB}MB INCLUDE_ISO=$INCLUDE_ISO REQUIRED=$REQUIRED"
 
-            logf "Plan[$i] SRC=$SRC DEST_REL=$DEST_REL MAX_MB=$MAX_MB INCLUDE_ISO=$INCLUDE_ISO"
             # rsync 필터 구성
             RSYNC_ARGS=(-a --delete --prune-empty-dirs)
             for p in "${INCLUDES[@]}";  do RSYNC_ARGS+=(--include "$p"); done
             for p in "${EXCLUDES[@]}";  do RSYNC_ARGS+=(--exclude "$p"); done
             RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/')
-            RSYNC_ARGS+=(--include '*/' --exclude '*') # 위 include에 매치된 파일만 복사
+            RSYNC_ARGS+=(--include '*/' --exclude '*') # include 매치된 파일만 복사
 
             # 임시 스테이징 후 용량 제한 검사
             TMP_STAGE="$(mktemp -d)"
-            rsync "${RSYNC_ARGS[@]}" "$SRC/" "$TMP_STAGE/"
+            rsync "${RSYNC_ARGS[@]}" "$RESOLVED_SRC/" "$TMP_STAGE/"
 
             TOTAL_BYTES=$(du -sb "$TMP_STAGE" | awk '{print $1}')
             LIMIT_BYTES=$((MAX_MB * 1024 * 1024))
 
             if (( TOTAL_BYTES > LIMIT_BYTES )); then
-              warn "Plan[$i] size exceed: $(numfmt --to=iec $TOTAL_BYTES) > $(numfmt --to=iec $LIMIT_BYTES). Truncating by newest-first copy."
-              # 최신 파일 우선으로 제한 용량까지 복사
+              warn "Plan[$i] size exceed: $(nf "$TOTAL_BYTES") > $(nf "$LIMIT_BYTES"). Truncating by newest-first copy."
               mkdir -p "$DEST_DIR"
               REMAIN=$LIMIT_BYTES
-              # 최신순 목록
+              # 최신순 목록 (mtime 기준)
               mapfile -t FILES < <(find "$TMP_STAGE" -type f -printf '%T@ %p\n' | sort -nr | awk '{sub($1 FS,""); print}')
               for f in "${FILES[@]}"; do
                 sz=$(stat -c%s "$f")
@@ -340,11 +357,12 @@ jobs:
                 rel="${f#"$DEST_BASE/"}"
                 bytes=$(stat -c%s "$f")
                 sha=$(sha256sum "$f" | awk '{print $1}')
-                printf '%s,%s,%s,%s,%s\n' "$SRC" "$DEST_REL" "${rel#"$DEST_REL/"}" "$bytes" "$sha" >> "$MANIFEST_CSV"
+                printf '%s,%s,%s,%s,%s\n' "$SRC" "$RESOLVED_SRC" "$DEST_REL" "${rel#"$DEST_REL/"}" "$bytes" "$sha" >> "$MANIFEST_CSV"
               done < <(find "$DEST_DIR" -type f -print0)
             fi
 
             rm -rf "$TMP_STAGE"
+
             # ISO 포함 표시 파일
             if [[ "$INCLUDE_ISO" == "true" ]]; then
               echo "include_in_iso=true" > "$DEST_DIR/.iso.include"
@@ -398,12 +416,11 @@ jobs:
             cp -a "$ROOT/extra_manifests" "$STAGE/docs/" || true
           fi
 
-          # CopyPlan 결과 중 include_in_iso=true 인 디렉토리만 ISO로 편입
+          # CopyPlan 결과 중 include_in_iso=true 만 ISO에 편입 (STAGE/extra 아래 반영)
           if [[ -d "$ROOT" ]]; then
             while IFS= read -r -d '' marker; do
               d="$(dirname "$marker")"
               rel="${d#"$ROOT/"}"
-              # STAGE/extra 아래 동일 경로로 반영
               mkdir -p "$STAGE/extra/$rel"
               rsync -a "$d/" "$STAGE/extra/$rel/"
             done < <(find "$ROOT" -type f -name ".iso.include" -print0 | xargs -0 grep -l "include_in_iso=true" || true)
