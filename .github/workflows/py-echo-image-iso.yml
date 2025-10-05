@@ -1,4 +1,4 @@
-name: "🐍 PyPkg + Echo/CopyPlan + Docker Image + ISO + Push + Release + Deploy + SBOM/Scan/Sign (No-Skip Max + Full Echo)"
+name: "🐍 PyPkg + Echo/CopyPlan + Docker Image + ISO + Push + Release + Deploy"
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ on:
         required: true
         default: "mypkg-app:latest"
       build_docker:
-        description: "Docker 이미지 빌드/저장 수행 (false여도 폴백 산출물 생성)"
+        description: "Docker 이미지 빌드/저장 수행"
         required: true
         type: boolean
         default: true
@@ -44,21 +44,18 @@ on:
       advanced_json:
         description: >-
           확장 설정(JSON). 예: {
-            "packaging":{"mode":"pip|poetry|conda"},
-            "ghcr":{"enable":true,"repo":"ghcr.io/OWNER/NAME","tag":"latest"},
-            "dockerhub":{"enable":true,"repo":"user/name","tag":"latest"},
+            "packaging":{"mode":"pip"}, 
+            "ghcr":{"enable":true,"repo":"ghcr.io/<OWNER>/<NAME>","tag":"latest"},
+            "dockerhub":{"enable":false,"repo":"<user>/<name>","tag":"latest"},
             "release":{"enable":true,"tag":"v0.1.0","draft":false,"prerelease":false},
-            "server":{"enable":true,"host":"example.com","user":"ubuntu","port":22,"deploy_path":"/opt/mypkg","service_name":"mypkg","start_cmd":"python -m mypkg","use_sudo":true},
-            "sbom":{"enable":true,"tool":"syft|cyclonedx-python"},
-            "scan":{"enable":true,"tool":"trivy|grype"},
-            "sign":{"enable":true,"attest":true}
+            "server":{"enable":false,"host":"example.com","user":"ubuntu","port":22,"deploy_path":"/opt/mypkg","service_name":"mypkg","start_cmd":"python -m mypkg","use_sudo":true}
           }
         required: false
-        default: "{\"packaging\":{\"mode\":\"pip\"},\"ghcr\":{\"enable\":false},\"dockerhub\":{\"enable\":false},\"release\":{\"enable\":false},\"server\":{\"enable\":false},\"sbom\":{\"enable\":true,\"tool\":\"syft\"},\"scan\":{\"enable\":true,\"tool\":\"trivy\"},\"sign\":{\"enable\":false,\"attest\":false}}"
+        default: "{\"packaging\":{\"mode\":\"pip\"},\"ghcr\":{\"enable\":false},\"dockerhub\":{\"enable\":false},\"release\":{\"enable\":false},\"server\":{\"enable\":false}}"
 
 permissions:
-  contents: write
-  packages: write
+  contents: write        # Release에 필요
+  packages: write        # GHCR 푸시에 필요
   actions: read
 
 env:
@@ -72,12 +69,13 @@ env:
 jobs:
   all-in-one:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 모든 bash 스텝에서 에코 헬퍼 사용 (현재/다음 스텝 모두)
       - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
@@ -87,84 +85,30 @@ jobs:
           ECHO_WARN="${ECHO_WARN:-⚠️}"
           ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"
-          ECHO_MARK_DIR="${ECHO_MARK_DIR:-.github/echo_marks}"
-          ECHO_CODE_DIR="${ECHO_CODE_DIR:-artifacts/echo_code}"
-          mkdir -p "$LOG_DIR" "$ECHO_MARK_DIR" "$ECHO_CODE_DIR"
-
+          mkdir -p "$LOG_DIR"
           SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d%H%M%S).log}"
-
-          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "$SAFE_LOG"; }
-          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "$SAFE_LOG"; }
-          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "$SAFE_LOG"; }
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           logf(){  printf '%s\n' "$*" | tee -a "$SAFE_LOG"; }
-
-          # 파일 에코(코드/설정 본문을 로그와 파일로 같이 저장)
-          echo_file(){ # usage: echo_file <label> <path>
-            local label="$1" p="$2"
-            if [[ -f "$p" ]]; then
-              local out="${ECHO_CODE_DIR}/$(basename "$p").echo.txt"
-              { echo "===== BEGIN $label : $p ====="; cat "$p"; echo "===== END $label : $p ====="; } | tee -a "$SAFE_LOG" > "$out"
-            else
-              warn "[echo_file] not found: $p"
-            fi
-          }
-
-          # 명령 트레이스(옵션) — 안전한 xtrace. 필요 스텝에서 OPT_TRACE=1 설정
-          begin_trace(){
-            # 민감 단어는 PS4 라인에 노출될 수 있으므로 사용 최소화, 기본 OFF
-            [[ "${OPT_TRACE:-}" == "1" ]] || return 0
-            exec 9>>"$SAFE_LOG"
-            export BASH_XTRACEFD=9
-            export PS4='+ [${BASH_SOURCE##*/}:${LINENO}] $(date -Is) → '
-            set -x
-          }
-          end_trace(){
-            [[ "${OPT_TRACE:-}" == "1" ]] || return 0
-            { set +x; } 2>/dev/null
-            exec 9>&-
-          }
-
-          step_begin(){ local n="$1"; echo "$(date -Is) START $n" | tee -a "$SAFE_LOG"; : > "${ECHO_MARK_DIR}/$(date +%H%M%S)-${n}.start"; }
-          step_ok(){     local n="$1"; echo "$(date -Is) OK    $n" | tee -a "$SAFE_LOG"; : > "${ECHO_MARK_DIR}/$(date +%H%M%S)-${n}.ok"; }
-          step_fail(){   local n="$1"; echo "$(date -Is) FAIL  $n" | tee -a "$SAFE_LOG"; : > "${ECHO_MARK_DIR}/$(date +%H%M%S)-${n}.fail"; }
-
-          if [[ -n "${OPT_STEP_NAME:-}" ]]; then
-            step_begin "${OPT_STEP_NAME}"
-            begin_trace
-            trap 'step_fail "${OPT_STEP_NAME}"; end_trace' ERR
-            trap 'step_ok   "${OPT_STEP_NAME}"; end_trace' EXIT
-          fi
           SH
-
           export BASH_ENV="$GITHUB_WORKSPACE/.bashenv"
           echo "BASH_ENV=$BASH_ENV" >> "$GITHUB_ENV"
-          bash -lc 'echoe "echo helpers loaded"; logf "log: $SAFE_LOG  marks: .github/echo_marks  code: artifacts/echo_code"'
-
-      - name: Install toolchain (Python, ISO, copy, deploy, sbom/scan/sign)
-        env: { OPT_STEP_NAME: "install-toolchain", OPT_TRACE: "1" }
+          bash -lc 'echoe "helpers loaded"; logf "helpers ready"'
+      - name: Install toolchain (Python, ISO, copy, deploy)
         shell: bash
         run: |
           set -Eeuo pipefail
           logf "Installing build/copy/deploy tools"
           sudo apt-get update -y
           sudo apt-get install -y python3 python3-venv python3-pip python3-setuptools python3-wheel \
-              git jq rsync xorriso genisoimage dosfstools openssh-client curl wget ca-certificates tree
+              git jq rsync xorriso genisoimage dosfstools openssh-client
           python3 --version | tee -a "$LOG_DIR/python.txt"
           pip3 --version | tee -a "$LOG_DIR/pip.txt"
           rsync --version | head -n1 | tee -a "$LOG_DIR/rsync.txt"
-          logf "Installing optional tools (syft/trivy/cosign) with fallbacks"
-          (curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true) && syft version || true
-          (sudo apt-get install -y gnupg || true; \
-           curl -fsSL https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo gpg --dearmor -o /usr/share/keyrings/trivy.gpg || true; \
-           echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb stable main" | sudo tee /etc/apt/sources.list.d/trivy.list >/dev/null || true; \
-           sudo apt-get update -y || true; sudo apt-get install -y trivy || true) && trivy --version || true
-          (curl -sSfL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o /usr/local/bin/cosign && chmod +x /usr/local/bin/cosign) || true
-          cosign version || true
-          logf "Tool install done"
-
+          logf "Installed: xorriso/genisoimage/jq/rsync/ssh"
       - name: Parse inputs (metadata_json, image_ref, copy_plan_json, advanced_json)
         id: parse
-        env: { OPT_STEP_NAME: "parse-inputs", OPT_TRACE: "1" }
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -172,31 +116,23 @@ jobs:
           A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
           A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
-
           IMG='${{ inputs.image_ref }}'
           if [[ "$IMG" == *:* ]]; then IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"; else IMG_NAME="$IMG"; IMG_TAG="latest"; fi
-
           CP='${{ inputs.copy_plan_json }}'
           printf '%s' "$CP" | jq . >/dev/null
-
           ADV='${{ inputs.advanced_json }}'
           printf '%s' "$ADV" | jq . >/dev/null
-
-          PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"')
-
+          PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"') # pip|poetry|conda
           GHCR_ENABLE=$(printf '%s' "$ADV" | jq -r '.ghcr.enable // false')
           GHCR_REPO=$(printf '%s' "$ADV" | jq -r '.ghcr.repo // ""')
           GHCR_TAG=$(printf '%s' "$ADV" | jq -r '.ghcr.tag // ""')
-
           DH_ENABLE=$(printf '%s' "$ADV" | jq -r '.dockerhub.enable // false')
           DH_REPO=$(printf '%s' "$ADV" | jq -r '.dockerhub.repo // ""')
           DH_TAG=$(printf '%s' "$ADV" | jq -r '.dockerhub.tag // ""')
-
           REL_ENABLE=$(printf '%s' "$ADV" | jq -r '.release.enable // false')
           REL_TAG=$(printf '%s' "$ADV" | jq -r '.release.tag // ""')
           REL_DRAFT=$(printf '%s' "$ADV" | jq -r '.release.draft // false')
           REL_PRE=$(printf '%s' "$ADV" | jq -r '.release.prerelease // false')
-
           DEP_ENABLE=$(printf '%s' "$ADV" | jq -r '.server.enable // false')
           DEP_HOST=$(printf '%s' "$ADV" | jq -r '.server.host // ""')
           DEP_USER=$(printf '%s' "$ADV" | jq -r '.server.user // "ubuntu"')
@@ -205,14 +141,6 @@ jobs:
           DEP_SVC=$(printf '%s' "$ADV" | jq -r '.server.service_name // "mypkg"')
           DEP_CMD=$(printf '%s' "$ADV" | jq -r '.server.start_cmd // "python -m mypkg"')
           DEP_SUDO=$(printf '%s' "$ADV" | jq -r '.server.use_sudo // true')
-
-          SBOM_ENABLE=$(printf '%s' "$ADV" | jq -r '.sbom.enable // true')
-          SBOM_TOOL=$(printf '%s' "$ADV" | jq -r '.sbom.tool // "syft"')
-          SCAN_ENABLE=$(printf '%s' "$ADV" | jq -r '.scan.enable // true')
-          SCAN_TOOL=$(printf '%s' "$ADV" | jq -r '.scan.tool // "trivy"')
-          SIGN_ENABLE=$(printf '%s' "$ADV" | jq -r '.sign.enable // false')
-          ATTEST_ENABLE=$(printf '%s' "$ADV" | jq -r '.sign.attest // false')
-
           {
             echo "author_name=$A_NAME"
             echo "author_email=$A_EMAIL"
@@ -238,42 +166,15 @@ jobs:
             echo "dep_svc=$DEP_SVC"
             echo "dep_cmd=$DEP_CMD"
             echo "dep_sudo=$DEP_SUDO"
-            echo "sbom_enable=$SBOM_ENABLE"
-            echo "sbom_tool=$SBOM_TOOL"
-            echo "scan_enable=$SCAN_ENABLE"
-            echo "scan_tool=$SCAN_TOOL"
-            echo "sign_enable=$SIGN_ENABLE"
-            echo "attest_enable=$ATTEST_ENABLE"
           } | tee -a "$LOG_DIR/parsed_inputs.env"
-
-          for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh_enable dh_repo dh_tag rel_enable rel_tag rel_draft rel_prerelease dep_enable dep_host dep_user dep_port dep_path dep_svc dep_cmd dep_sudo sbom_enable sbom_tool scan_enable scan_tool sign_enable attest_enable; do
+          for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh_enable dh_repo dh_tag rel_enable rel_tag rel_draft rel_prerelease dep_enable dep_host dep_user dep_port dep_path dep_svc dep_cmd dep_sudo; do
             v=$(grep "^$k=" "$LOG_DIR/parsed_inputs.env" | cut -d= -f2-)
             echo "$k=$v" >> "$GITHUB_OUTPUT"
           done
-
           printf '%s' "$CP" > copy_plan.json
           printf '%s' "$ADV" > advanced.json
           logf "copy_plan.json & advanced.json saved"
-          echo_file "COPY_PLAN_JSON" "copy_plan.json"
-          echo_file "ADVANCED_JSON" "advanced.json"
-
-      - name: Echo: parsed inputs preview
-        env: { OPT_STEP_NAME: "echo-parsed-inputs" }
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          echoe "author=${{ steps.parse.outputs.author_name }} <${{ steps.parse.outputs.author_email }}>, license=${{ steps.parse.outputs.license_name }}"
-          echoe "pkg=${{ inputs.package_name }}:${{ inputs.package_version }}  image=${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
-          echoe "packaging=${{ steps.parse.outputs.pkg_mode }}  docker_build=${{ inputs.build_docker }}"
-          echoe "ghcr.enable=${{ steps.parse.outputs.ghcr_enable }} repo=${{ steps.parse.outputs.ghcr_repo }} tag=${{ steps.parse.outputs.ghcr_tag }}"
-          echoe "dh.enable=${{ steps.parse.outputs.dh_enable }} repo=${{ steps.parse.outputs.dh_repo }} tag=${{ steps.parse.outputs.dh_tag }}"
-          echoe "release.enable=${{ steps.parse.outputs.rel_enable }} tag=${{ steps.parse.outputs.rel_tag }}"
-          echoe "server.enable=${{ steps.parse.outputs.dep_enable }} host=${{ steps.parse.outputs.dep_host }} path=${{ steps.parse.outputs.dep_path }}"
-          echoe "sbom=${{ steps.parse.outputs.sbom_enable }} tool=${{ steps.parse.outputs.sbom_tool }}  scan=${{ steps.parse.outputs.scan_enable }} tool=${{ steps.parse.outputs.scan_tool }}"
-          echoe "sign=${{ steps.parse.outputs.sign_enable }} attest=${{ steps.parse.outputs.attest_enable }}"
-
       - name: Create Python package skeleton (PEP 621 / pyproject.toml + server scripts)
-        env: { OPT_STEP_NAME: "create-skeleton", OPT_TRACE: "1" }
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -287,7 +188,7 @@ jobs:
           TEST_DIR="$ROOT/tests"
           DOC_DIR="$ROOT/docs"
           mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
-
+          # pyproject (setuptools)
           cat > "$ROOT/pyproject.toml" <<'PYT'
           [build-system]
           requires = ["setuptools>=68", "wheel"]
@@ -300,7 +201,10 @@ jobs:
           license = { text="__LICENSE__" }
           readme = "README.md"
           requires-python = ">=3.9"
-          classifiers = ["Programming Language :: Python :: 3","License :: OSI Approved :: MIT License"]
+          classifiers = [
+            "Programming Language :: Python :: 3",
+            "License :: OSI Approved :: MIT License"
+          ]
           [project.urls]
           Homepage = "https://example.com"
           [tool.setuptools.packages.find]
@@ -311,15 +215,13 @@ jobs:
           sed -i "s/__AUTHOR__/${A}/g" "$ROOT/pyproject.toml"
           sed -i "s/__EMAIL__/${E}/g" "$ROOT/pyproject.toml"
           sed -i "s/__LICENSE__/${L}/g" "$ROOT/pyproject.toml"
-          echo_file "PYPROJECT" "$ROOT/pyproject.toml"
-
+          # README
           cat > "$ROOT/README.md" <<'MD'
           # Auto Generated Python Package
           - EchoOps generated.
           - Includes Dockerfile, ISO injection artifacts, copy-plan manifest, and server deploy scripts.
           MD
-          echo_file "README" "$ROOT/README.md"
-
+          # package
           cat > "$PKG_DIR/__init__.py" <<'PY'
           __all__ = ["hello"]
           __version__ = "__VER__"
@@ -327,8 +229,6 @@ jobs:
               return f"Hello, {name}!"
           PY
           sed -i "s/__VER__/${V}/g" "$PKG_DIR/__init__.py"
-          echo_file "__init__.py" "$PKG_DIR/__init__.py"
-
           cat > "$TEST_DIR/test_hello.py" <<'PY'
           from __future__ import annotations
           from __pkg__.__init__ import hello
@@ -336,8 +236,7 @@ jobs:
               assert hello("Echo") == "Hello, Echo!"
           PY
           sed -i "s/__pkg__/${P}/g" "$TEST_DIR/test_hello.py"
-          echo_file "test_hello.py" "$TEST_DIR/test_hello.py"
-
+          # Dockerfile
           cat > "$ROOT/Dockerfile" <<'DOCKER'
           FROM python:3.11-slim
           WORKDIR /app
@@ -346,8 +245,7 @@ jobs:
           CMD ["python","-c","import __PKG__; print(__PKG__.hello('Docker'))"]
           DOCKER
           sed -i "s/__PKG__/${P}/g" "$ROOT/Dockerfile"
-          echo_file "Dockerfile" "$ROOT/Dockerfile"
-
+          # --- Server deploy artifacts (install script + systemd unit) ---
           mkdir -p "$ROOT/server"
           cat > "$ROOT/server/install_deploy.sh" <<'SH'
           #!/usr/bin/env bash
@@ -383,13 +281,10 @@ jobs:
           SH
           sed -i "s/__APP__/${P}/g" "$ROOT/server/install_deploy.sh"
           chmod +x "$ROOT/server/install_deploy.sh"
-          echo_file "install_deploy.sh" "$ROOT/server/install_deploy.sh"
-
           logf "Python skeleton + server scripts created at $ROOT"
-
-      - name: Build (pip/poetry/conda) — always runs with fallback
+      # Packaging 모드에 따라 빌드
+      - name: Build (pip/poetry/conda)
         id: buildpkg
-        env: { OPT_STEP_NAME: "build-package", OPT_TRACE: "1" }
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -400,34 +295,34 @@ jobs:
             poetry)
               logf "Packaging mode: poetry"
               python3 -m pip install --upgrade pip poetry build
-              (cd "$ROOT" && poetry build || { warn "poetry build failed, falling back to pip build"; python3 -m pip install --upgrade build && python3 -m build "$ROOT"; })
+              # poetry가 기존 pyproject로도 동작(PEP517) → poetry build
+              (cd "$ROOT" && poetry build)
               ;;
             conda)
               logf "Packaging mode: conda (env pack)"
-              sudo apt-get update -y && sudo apt-get install -y wget bzip2 || true
+              # Miniconda 설치 후 conda-pack 기반으로 실행 환경 아카이브
+              sudo apt-get update -y && sudo apt-get install -y wget bzip2
               MINI="$HOME/miniconda"
-              wget -qO ~/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh || true
-              bash ~/miniconda.sh -b -p "$MINI" || true
-              source "$MINI/etc/profile.d/conda.sh" || true
-              conda create -y -n "${P}" python=3.11 || true
-              conda activate "${P}" || true
-              pip install --upgrade pip || true
-              (cd "$ROOT" && pip install .) || true
-              pip install conda-pack || true
+              wget -qO ~/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+              bash ~/miniconda.sh -b -p "$MINI"
+              source "$MINI/etc/profile.d/conda.sh"
+              conda create -y -n "${P}" python=3.11
+              conda activate "${P}"
+              pip install --upgrade pip
+              (cd "$ROOT" && pip install .)
+              pip install conda-pack
               mkdir -p "$ROOT/dist"
-              conda pack -n "${P}" -o "$ROOT/dist/${P}-env.tar.gz" || { echo "conda-pack unavailable; creating placeholder"; :; }
-              [[ -f "$ROOT/dist/${P}-env.tar.gz" ]] || touch "$ROOT/dist/${P}-env.tar.gz"
+              conda pack -n "${P}" -o "$ROOT/dist/${P}-env.tar.gz"
+              logf "Conda env packed at dist/${P}-env.tar.gz"
               ;;
             *)
               logf "Packaging mode: pip (default)"
               python3 -m pip install --upgrade pip build
-              python3 -m build "$ROOT" || { warn "pip build failed, creating placeholder wheel"; mkdir -p "$ROOT/dist"; echo "placeholder" > "$ROOT/dist/placeholder.txt"; }
+              python3 -m build "$ROOT"
               ;;
           esac
           ls -al "$ROOT/dist" | tee -a "$LOG_DIR/dist.txt"
-
       - name: Massive directory generation (+ echo-style permission files)
-        env: { OPT_STEP_NAME: "massive-dirs", OPT_TRACE: "1" }
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -454,9 +349,8 @@ jobs:
           mapfile -t DLIST < <(seq -w 1 "$COUNT" | xargs -I{} echo "$BASE/dir_{}")
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
           logf "Generated $COUNT directories with permission echoes."
-
-      - name: "Copy directories by copy_plan_json (no-skip: auto-create src if missing)"
-        env: { OPT_STEP_NAME: "copy-plan", OPT_TRACE: "1" }
+      # === 디렉토리 복사(경로 해석 + required + 용량 제한 + 매니페스트/체크섬 + ISO 포함 마커) ===
+      - name: Copy directories by copy_plan_json (echo + manifest + checksums)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -464,10 +358,8 @@ jobs:
           ROOT="workspace/${P}"
           PLAN_FILE="copy_plan.json"
           DEST_BASE="$ROOT"
-          [[ -f "$PLAN_FILE" ]] || { warn "copy_plan.json not found — creating default plan"; printf '{"plans":[{"src":"samples","dest_rel":"extra/samples","include_globs":["**/*"],"exclude_globs":["**/.git/**","**/.github/**"],"max_mb":50,"include_in_iso":true,"required":false}]}' > "$PLAN_FILE"; }
-          mkdir -p "$ROOT/extra_manifests" "$DEST_BASE/samples"
-          [[ -d "$GITHUB_WORKSPACE/samples" ]] || { echo "demo" > "$GITHUB_WORKSPACE/samples.txt"; mkdir -p "$GITHUB_WORKSPACE/samples"; mv "$GITHUB_WORKSPACE/samples.txt" "$GITHUB_WORKSPACE/samples/HELLO.txt"; }
-          echo_file "COPY_PLAN_JSON" "$PLAN_FILE"
+          [[ -f "$PLAN_FILE" ]] || { warn "copy_plan.json not found, skipping"; exit 0; }
+          mkdir -p "$ROOT/extra_manifests"
           MANIFEST_CSV="$ROOT/extra_manifests/manifest-$(date +%Y%m%d%H%M%S).csv"
           echo "src,resolved_src,dest_rel,relpath,bytes,sha256" > "$MANIFEST_CSV"
           nf(){ if command -v numfmt >/dev/null 2>&1; then numfmt --to=iec "$1"; else echo "$1 bytes"; fi; }
@@ -481,19 +373,26 @@ jobs:
             REQUIRED=$(jq -r ".plans[$i].required // false" "$PLAN_FILE")
             mapfile -t INCLUDES < <(jq -r ".plans[$i].include_globs[]?" "$PLAN_FILE")
             mapfile -t EXCLUDES < <(jq -r ".plans[$i].exclude_globs[]?" "$PLAN_FILE")
+            # 경로 해석: repo-root → package-root → literal/absolute
             RESOLVED_SRC=""
-            if [[ "$SRC" == /* ]]; then [[ -d "$SRC" ]] && RESOLVED_SRC="$SRC"; else
+            if [[ "$SRC" == /* ]]; then
+              [[ -d "$SRC" ]] && RESOLVED_SRC="$SRC"
+            else
               [[ -d "$GITHUB_WORKSPACE/$SRC" ]] && RESOLVED_SRC="$GITHUB_WORKSPACE/$SRC"
               [[ -z "$RESOLVED_SRC" && -d "$DEST_BASE/$SRC" ]] && RESOLVED_SRC="$DEST_BASE/$SRC"
               [[ -z "$RESOLVED_SRC" && -d "$SRC" ]] && RESOLVED_SRC="$SRC"
             fi
             if [[ -z "$RESOLVED_SRC" ]]; then
-              warn "Plan[$i] src not found → auto-create at $GITHUB_WORKSPACE/$SRC"
-              mkdir -p "$GITHUB_WORKSPACE/$SRC"
-              echo "auto" > "$GITHUB_WORKSPACE/$SRC/AUTO-GENERATED.txt"
-              RESOLVED_SRC="$GITHUB_WORKSPACE/$SRC"
+              if [[ "$REQUIRED" == "true" ]]; then
+                fail "Plan[$i] required=true but src not found: $SRC (tried: $GITHUB_WORKSPACE/$SRC , $DEST_BASE/$SRC , $SRC)"
+                exit 1
+              else
+                warn "Plan[$i] SRC not found: $SRC — skipping (set required=true to fail)"
+                continue
+              fi
             fi
-            DEST_DIR="$DEST_BASE/$DEST_REL"; mkdir -p "$DEST_DIR"
+            DEST_DIR="$DEST_BASE/$DEST_REL"
+            mkdir -p "$DEST_DIR"
             logf "Plan[$i] SRC=$SRC → RESOLVED=$RESOLVED_SRC DEST_REL=$DEST_REL MAX_MB=${MAX_MB}MB INCLUDE_ISO=$INCLUDE_ISO REQUIRED=$REQUIRED"
             RSYNC_ARGS=(-a --delete --prune-empty-dirs)
             for p in "${INCLUDES[@]}";  do RSYNC_ARGS+=(--include "$p"); done
@@ -501,7 +400,7 @@ jobs:
             RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/')
             RSYNC_ARGS+=(--include '*/' --exclude '*')
             TMP_STAGE="$(mktemp -d)"
-            rsync "${RSYNC_ARGS[@]}" "$RESOLVED_SRC/" "$TMP_STAGE/" || true
+            rsync "${RSYNC_ARGS[@]}" "$RESOLVED_SRC/" "$TMP_STAGE/"
             TOTAL_BYTES=$(du -sb "$TMP_STAGE" | awk '{print $1}')
             LIMIT_BYTES=$((MAX_MB * 1024 * 1024))
             if (( TOTAL_BYTES > LIMIT_BYTES )); then
@@ -511,170 +410,79 @@ jobs:
               for f in "${FILES[@]}"; do
                 sz=$(stat -c%s "$f"); (( sz <= REMAIN )) || continue
                 rel="${f#"$TMP_STAGE/"}"
-                mkdir -p "$DEST_DIR/$(dirname "$rel")"; cp -a "$f" "$DEST_DIR/$rel"; REMAIN=$((REMAIN - sz))
+                mkdir -p "$DEST_DIR/$(dirname "$rel")"
+                cp -a "$f" "$DEST_DIR/$rel"
+                REMAIN=$((REMAIN - sz))
               done
             else
-              rsync -a --delete "$TMP_STAGE/" "$DEST_DIR/" || true
+              rsync -a --delete "$TMP_STAGE/" "$DEST_DIR/"
             fi
             if [[ -d "$DEST_DIR" ]]; then
               while IFS= read -r -d '' f; do
-                rel="${f#"$DEST_BASE/"}"; bytes=$(stat -c%s "$f"); sha=$(sha256sum "$f" | awk '{print $1}')
+                rel="${f#"$DEST_BASE/"}"
+                bytes=$(stat -c%s "$f")
+                sha=$(sha256sum "$f" | awk '{print $1}')
                 printf '%s,%s,%s,%s,%s\n' "$SRC" "$RESOLVED_SRC" "$DEST_REL" "${rel#"$DEST_REL/"}" "$bytes" "$sha" >> "$MANIFEST_CSV"
               done < <(find "$DEST_DIR" -type f -print0)
             fi
             rm -rf "$TMP_STAGE"
-            echo "include_in_iso=$([[ "$INCLUDE_ISO" == "true" ]] && echo true || echo false)" > "$DEST_DIR/.iso.include"
+            if [[ "$INCLUDE_ISO" == "true" ]]; then
+              echo "include_in_iso=true" > "$DEST_DIR/.iso.include"
+            else
+              echo "include_in_iso=false" > "$DEST_DIR/.iso.include"
+            fi
             logf "Plan[$i] done → $DEST_DIR"
           done
           logf "Manifest generated: $MANIFEST_CSV"
-          echo_file "COPY_MANIFEST" "$MANIFEST_CSV"
-
-      - name: Docker image build/save (no-skip with fallback)
-        id: buildimage
-        env: { OPT_STEP_NAME: "docker-build-save", OPT_TRACE: "1" }
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p artifacts
-          IMG_NAME="${{ steps.parse.outputs.image_name }}"
-          IMG_TAG="${{ steps.parse.outputs.image_tag }}"
-          IMG="${IMG_NAME}:${IMG_TAG}"
-          TAR="artifacts/${IMG_NAME}-${IMG_TAG}.tar.gz"
-          if [[ "${{ inputs.build_docker }}" == "true" ]]; then
-            logf "Building Docker image: $IMG"
-            docker build -t "$IMG" "workspace/${{ inputs.package_name }}" || { warn "docker build failed; creating placeholder tar.gz"; echo "placeholder" | gzip -c > "$TAR"; echo "tar=$TAR" >> "$GITHUB_OUTPUT"; exit 0; }
-            docker save "$IMG" | gzip -c > "$TAR"
-            logf "Saved image tar.gz under $TAR"
-          else
-            warn "build_docker=false → creating placeholder image tar.gz"
-            echo "no-image (build_docker=false)" | gzip -c > "$TAR"
-          fi
-          echo "image=$IMG" >> "$GITHUB_OUTPUT"
-          echo "tar=$TAR" >> "$GITHUB_OUTPUT"
-
-      - name: SBOM generate (image or fs) — no-skip
-        env: { OPT_STEP_NAME: "sbom" }
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p artifacts/sbom
-          IMG="${{ steps.buildimage.outputs.image }}"
-          TAR="${{ steps.buildimage.outputs.tar }}"
-          TOOL="${{ steps.parse.outputs.sbom_tool }}"
-          ENABLE="${{ steps.parse.outputs.sbom_enable }}"
-          if [[ "$ENABLE" == "true" ]]; then
-            if command -v syft >/dev/null 2>&1 && [[ "$TOOL" == "syft" ]]; then
-              if [[ -n "$IMG" ]]; then
-                syft "$IMG" -o cyclonedx-json=artifacts/sbom/sbom-image-cdx.json || syft dir:workspace -o cyclonedx-json=artifacts/sbom/sbom-fs-cdx.json || true
-              else
-                syft dir:workspace -o cyclonedx-json=artifacts/sbom/sbom-fs-cdx.json || true
-              fi
-            else
-              python3 -m pip install --upgrade cyclonedx-bom >/dev/null 2>&1 || true
-              if command -v cyclonedx-py >/dev/null 2>&1; then
-                (cd workspace/${{ inputs.package_name }} && cyclonedx-py -o ../../artifacts/sbom/sbom-cdx.json -F json || true)
-              fi
-            fi
-          else
-            warn "SBOM disabled — creating placeholder"
-          fi
-          [[ -e artifacts/sbom/sbom-image-cdx.json || -e artifacts/sbom/sbom-fs-cdx.json || -e artifacts/sbom/sbom-cdx.json ]] || echo "{}" > artifacts/sbom/SBOM_PLACEHOLDER.json
-          logf "SBOM step done"
-
-      - name: Vulnerability scan (image or fs) — no-skip
-        env: { OPT_STEP_NAME: "vuln-scan" }
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p artifacts/scan
-          IMG="${{ steps.buildimage.outputs.image }}"
-          ENABLE="${{ steps.parse.outputs.scan_enable }}"
-          TOOL="${{ steps.parse.outputs.scan_tool }}"
-          if [[ "$ENABLE" == "true" ]]; then
-            if [[ "$TOOL" == "trivy" ]] && command -v trivy >/dev/null 2>&1; then
-              if [[ -n "$IMG" ]]; then
-                trivy image -q -f sarif -o artifacts/scan/trivy-image.sarif "$IMG" || trivy fs -q -f sarif -o artifacts/scan/trivy-fs.sarif workspace || true
-              else
-                trivy fs -q -f sarif -o artifacts/scan/trivy-fs.sarif workspace || true
-              fi
-            else
-              (curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin || true) && grype version || true
-              if command -v grype >/dev/null 2>&1 && [[ -n "$IMG" ]]; then
-                grype "$IMG" -o sarif > artifacts/scan/grype-image.sarif || true
-              else
-                warn "No scanner available — creating placeholder"
-                echo "{}" > artifacts/scan/SCAN_PLACEHOLDER.sarif
-              fi
-            fi
-          else
-            warn "Vuln scan disabled — creating placeholder"
-            echo "{}" > artifacts/scan/SCAN_DISABLED.sarif
-          fi
-          logf "Scan step done"
-
-      - name: Echo: code snapshot (tree + selective contents + tar)
-        env: { OPT_STEP_NAME: "echo-code-snapshot" }
+      - name: Optional Docker build + save
+        if: ${{ inputs.build_docker == true }}
         shell: bash
         run: |
           set -Eeuo pipefail
           P="${{ inputs.package_name }}"
           ROOT="workspace/${P}"
-          mkdir -p artifacts/echo_code
-          # 트리 출력
-          tree -a "$ROOT" || find "$ROOT" -print | sed 's|^|TREE |' | tee -a "$LOG_DIR/tree.txt"
-          # 주요 코드/설정 본문 에코 저장
-          echo_file "PYPROJECT" "$ROOT/pyproject.toml"
-          echo_file "README" "$ROOT/README.md"
-          echo_file "Dockerfile" "$ROOT/Dockerfile"
-          echo_file "__init__.py" "$ROOT/src/${P}/__init__.py"
-          echo_file "test_hello.py" "$ROOT/tests/test_hello.py"
-          echo_file "INSTALL_DEPLOY" "$ROOT/server/install_deploy.sh"
-          # 전체 스냅샷 tar
-          tar -C "workspace" -czf "artifacts/echo_code/${P}-code-snapshot.tgz" "${P}"
-          logf "Code snapshot archived at artifacts/echo_code/${P}-code-snapshot.tgz"
-
-      - name: Prepare ISO staging & info injection (includes copied data + server scripts + echo code)
-        env: { OPT_STEP_NAME: "iso-stage" }
+          IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
+          logf "Building Docker image: $IMG"
+          docker build -t "$IMG" "$ROOT"
+          mkdir -p artifacts
+          docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
+          logf "Saved image tar.gz under artifacts/"
+      - name: Prepare ISO staging & info injection (includes copied data + server scripts)
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"; ROOT="workspace/${P}"; STAGE="iso_stage/${P}"
-          mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs" "$STAGE/extra" "$STAGE/server" "$STAGE/reports" "$STAGE/echo"
+          P="${{ inputs.package_name }}"
+          ROOT="workspace/${P}"
+          STAGE="iso_stage/${P}"
+          mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs" "$STAGE/extra" "$STAGE/server"
           echo "${{ github.repository }},${{ github.run_id }},${{ github.ref_name }}" > "$STAGE/build_info.csv"
-          printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json" || printf '%s' '${{ inputs.inject_info_json }}' > "$STAGE/config/inject.json"
-          cp -a "$ROOT/dist" "$STAGE/pkg/" || true
+          printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
+          cp -a "$ROOT/dist" "$STAGE/pkg/"
           cp -a .github/echo_logs "$STAGE/docs/" || true
-          cp -a .github/echo_marks "$STAGE/docs/" || true
           cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || true
           [[ -d "$ROOT/extra_manifests" ]] && cp -a "$ROOT/extra_manifests" "$STAGE/docs/" || true
-          cp -a "$ROOT/server" "$STAGE/" || true
-          # SBOM/Scan 포함
-          cp -a artifacts/sbom artifacts/scan "$STAGE/reports/" || true
-          # 코드 에코 스냅샷 포함
-          cp -a artifacts/echo_code "$STAGE/echo/" || true
-          # copy_plan include 마킹
+          cp -a "$ROOT/server" "$STAGE/"
+          # include_in_iso=true 마커 대상만 ISO 반영 (STAGE/extra/)
           if [[ -d "$ROOT" ]]; then
             while IFS= read -r -d '' marker; do
-              d="$(dirname "$marker")"; rel="${d#"$ROOT/"}"
-              mkdir -p "$STAGE/extra/$rel"; rsync -a "$d/" "$STAGE/extra/$rel/" || true
+              d="$(dirname "$marker")"
+              rel="${d#"$ROOT/"}"
+              mkdir -p "$STAGE/extra/$rel"
+              rsync -a "$d/" "$STAGE/extra/$rel/"
             done < <(find "$ROOT" -type f -name ".iso.include" -print0 | xargs -0 grep -l "include_in_iso=true" || true)
           fi
           cat > "$STAGE/README.txt" <<'TXT'
           Echo ISO — includes:
-          - pkg/dist: wheels/sdists or conda env pack
+          - pkg/dist: built wheels/sdists or conda env pack
           - config/inject.json: injected metadata
-          - docs/echo_logs, docs/echo_marks: run logs & step markers
+          - docs/echo_logs: run logs
           - docs/perm_apply.sh: permission script
           - docs/extra_manifests: copy-plan manifest & checksums
-          - extra/*: copy_plan(include_in_iso=true) 결과
-          - server/*: install_deploy.sh & systemd unit template
-          - reports/sbom, reports/scan: SBOM & 취약점 리포트
-          - echo/*: code snapshot (tree, selected file echoes, tarball)
+          - extra/*: directories copied per copy_plan (include_in_iso=true)
+          - server/*: install_deploy.sh & systemd unit template (generated)
           TXT
           logf "ISO staging prepared at $STAGE"
-
       - name: Build ISO (xorriso / genisoimage fallback)
-        env: { OPT_STEP_NAME: "iso-build", OPT_TRACE: "1" }
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -684,46 +492,16 @@ jobs:
           mkdir -p artifacts
           if command -v xorriso >/dev/null 2>&1; then
             logf "Using xorriso"
-            xorriso -as mkisofs -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE" || { warn "xorriso failed; trying genisoimage"; genisoimage -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"; }
+            xorriso -as mkisofs -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
           else
             logf "Using genisoimage"
-            genisoimage -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE" || { fail "ISO build failed"; exit 1; }
+            genisoimage -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
           fi
-          (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" ) || true
+          (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
           logf "ISO built: artifacts/${ISO_NAME}"
-
-      - name: "Sign/Attest (instructions or best-effort)"
-        env: { OPT_STEP_NAME: "sign-attest" }
-        shell: bash
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-        run: |
-          set -Eeuo pipefail
-          mkdir -p artifacts/sign
-          ENABLE="${{ steps.parse.outputs.sign_enable }}"
-          ATTEST="${{ steps.parse.outputs.attest_enable }}"
-          IMG="${{ steps.buildimage.outputs.image }}"
-          if [[ "$ENABLE" == "true" && -n "$IMG" && -n "$COSIGN_PRIVATE_KEY" && -n "$COSIGN_PASSWORD" && $(command -v cosign) ]]; then
-            echo "$COSIGN_PRIVATE_KEY" > artifacts/sign/cosign.key
-            COSIGN_EXPERIMENTAL=1 cosign sign --key artifacts/sign/cosign.key "$IMG" || warn "cosign sign failed"
-            if [[ "$ATTEST" == "true" ]]; then
-              COSIGN_EXPERIMENTAL=1 cosign attest --key artifacts/sign/cosign.key --predicate artifacts/sbom/sbom-image-cdx.json --type cyclonedx "$IMG" || warn "cosign attest failed"
-            fi
-            logf "cosign step attempted."
-          else
-            warn "Signing disabled or prerequisites missing — creating instructions"
-            cat > artifacts/sign/SIGNING_INSTRUCTIONS.txt <<EOT
-To sign later (example with cosign key file):
-  export COSIGN_PASSWORD="<PASSWORD>"
-  cosign sign --key cosign.key ${IMG:-<image-ref>}
-To attest SBOM (if pushed to registry):
-  cosign attest --key cosign.key --predicate sbom.json --type cyclonedx ${IMG:-<image-ref>}
-EOT
-          fi
-
-      - name: Push image to GHCR (no-skip fallback)
-        env: { OPT_STEP_NAME: "push-ghcr" }
+      # === (옵션) GHCR / Docker Hub 푸시 ===
+      - name: Push image to GHCR
+        if: ${{ inputs.build_docker && steps.parse.outputs.ghcr_enable == 'true' }}
         shell: bash
         env:
           CR_PAT: ${{ secrets.GITHUB_TOKEN }}
@@ -732,29 +510,14 @@ EOT
           SRC_IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
           DEST_REPO="${{ steps.parse.outputs.ghcr_repo }}"
           DEST_TAG="${{ steps.parse.outputs.ghcr_tag }}"
-          IMAGE_NAME="${{ steps.parse.outputs.image_name }}"
-          IMAGE_TAG="${{ steps.parse.outputs.image_tag }}"
-          mkdir -p artifacts/push
-          if [[ "${{ steps.parse.outputs.ghcr_enable }}" == "true" && -n "$DEST_REPO" ]]; then
-            [[ -z "$DEST_TAG" ]] && DEST_TAG="${IMAGE_TAG}"
-            if docker login ghcr.io -u ${{ github.actor }} -p "$CR_PAT"; then
-              docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG" && docker push "$DEST_REPO:$DEST_TAG" && logf "Pushed to GHCR: $DEST_REPO:$DEST_TAG" || warn "GHCR push failed; creating push-instructions"
-            else
-              warn "GHCR login failed; creating push-instructions"
-            fi
-          else
-            warn "GHCR disabled or repo empty; creating push-instructions"
-          fi
-          cat > artifacts/push/GHCR_PUSH_INSTRUCTIONS.txt <<EOT
-To push manually:
-  docker load -i artifacts/${IMAGE_NAME}-${IMAGE_TAG}.tar.gz
-  docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${DEST_REPO:-ghcr.io/OWNER/NAME}:${DEST_TAG:-${IMAGE_TAG}}
-  echo "<TOKEN>" | docker login ghcr.io -u <USER> --password-stdin
-  docker push ${DEST_REPO:-ghcr.io/OWNER/NAME}:${DEST_TAG:-${IMAGE_TAG}}
-EOT
-
-      - name: Push image to Docker Hub (no-skip fallback)
-        env: { OPT_STEP_NAME: "push-dockerhub" }
+          [[ -z "$DEST_REPO" ]] && { warn "ghcr.repo empty, skip"; exit 0; }
+          [[ -z "$DEST_TAG"  ]] && DEST_TAG="${{ steps.parse.outputs.image_tag }}"
+          docker login ghcr.io -u ${{ github.actor }} -p "$CR_PAT"
+          docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
+          docker push "$DEST_REPO:$DEST_TAG"
+          logf "Pushed to GHCR: $DEST_REPO:$DEST_TAG"
+      - name: Push image to Docker Hub
+        if: ${{ inputs.build_docker && steps.parse.outputs.dh_enable == 'true' }}
         shell: bash
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -764,47 +527,31 @@ EOT
           SRC_IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
           DEST_REPO="${{ steps.parse.outputs.dh_repo }}"
           DEST_TAG="${{ steps.parse.outputs.dh_tag }}"
-          IMAGE_NAME="${{ steps.parse.outputs.image_name }}"
-          IMAGE_TAG="${{ steps.parse.outputs.image_tag }}"
-          mkdir -p artifacts/push
-          if [[ "${{ steps.parse.outputs.dh_enable }}" == "true" && -n "$DEST_REPO" && -n "$DOCKERHUB_USERNAME" && -n "$DOCKERHUB_TOKEN" ]]; then
-            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || warn "Docker Hub login failed"
-            docker tag "$SRC_IMG" "$DEST_REPO:${DEST_TAG:-${IMAGE_TAG}}" && docker push "$DEST_REPO:${DEST_TAG:-${IMAGE_TAG}}" || warn "Docker Hub push failed"
-          else
-            warn "Docker Hub disabled or creds missing; creating push-instructions"
-          fi
-          cat > artifacts/push/DOCKERHUB_PUSH_INSTRUCTIONS.txt <<EOT
-To push manually:
-  docker load -i artifacts/${IMAGE_NAME}-${IMAGE_TAG}.tar.gz
-  docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${DEST_REPO:-user/name}:${DEST_TAG:-${IMAGE_TAG}}
-  echo "<TOKEN>" | docker login -u ${DOCKERHUB_USERNAME:-user} --password-stdin
-  docker push ${DEST_REPO:-user/name}:${DEST_TAG:-${IMAGE_TAG}}
-EOT
-
-      - name: Release or Pseudo-Release (no-skip)
-        env: { OPT_STEP_NAME: "release" }
-        shell: bash
+          [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]] && { fail "Docker Hub creds missing"; exit 1; }
+          [[ -z "$DEST_REPO" ]] && { warn "dockerhub.repo empty, skip"; exit 0; }
+          [[ -z "$DEST_TAG"  ]] && DEST_TAG="${{ steps.parse.outputs.image_tag }}"
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+          docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
+          docker push "$DEST_REPO:$DEST_TAG"
+          logf "Pushed to Docker Hub: $DEST_REPO:$DEST_TAG"
+      # === (옵션) GitHub Release 생성 + ISO/이미지 아티팩트 첨부 ===
+      - name: Create GitHub Release
+        if: ${{ steps.parse.outputs.rel_enable == 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.parse.outputs.rel_tag }}
+          draft: ${{ steps.parse.outputs.rel_draft }}
+          prerelease: ${{ steps.parse.outputs.rel_prerelease }}
+          files: |
+            artifacts/*.iso
+            artifacts/*.sha256
+            artifacts/*.tar.gz
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          mkdir -p artifacts/release
-          if [[ "${{ steps.parse.outputs.rel_enable }}" == "true" && -n "${{ steps.parse.outputs.rel_tag }}" ]]; then
-            OWNER_REPO="${GITHUB_REPOSITORY}"
-            TAG="${{ steps.parse.outputs.rel_tag }}"
-            API="https://api.github.com/repos/${OWNER_REPO}/releases"
-            DATA=$(jq -n --arg tag "$TAG" --argjson draft ${{ steps.parse.outputs.rel_draft }} --argjson prerelease ${{ steps.parse.outputs.rel_prerelease }} '{tag_name:$tag,draft:$draft,prerelease:$prerelease}')
-            RESP=$(curl -sS -X POST -H "Authorization: token ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$API" -d "$DATA" || true)
-            echo "$RESP" > artifacts/release/release_api_response.json
-            logf "Release API attempted. See artifacts/release/release_api_response.json"
-          else
-            warn "Release disabled or no tag — creating pseudo-release folder"
-          fi
-          cp -a artifacts/*.iso artifacts/*.sha256 artifacts/*.tar.gz artifacts/sbom artifacts/scan artifacts/sign artifacts/push artifacts/echo_code artifacts/release/ 2>/dev/null || true
-          echo "Release assets staged under artifacts/release" | tee artifacts/release/README.txt
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: "Deploy or Bundle (no-skip)"
-        env: { OPT_STEP_NAME: "deploy-or-bundle" }
+      # === (옵션) 서버 배포 (SSH) ===
+      - name: Deploy to server via SSH (optional)
+        if: ${{ steps.parse.outputs.dep_enable == 'true' }}
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
@@ -819,73 +566,20 @@ EOT
           SVC="${{ steps.parse.outputs.dep_svc }}"
           CMD="${{ steps.parse.outputs.dep_cmd }}"
           USE_SUDO="${{ steps.parse.outputs.dep_sudo }}"
-          mkdir -p artifacts/deploy_bundle
-          if [[ "${{ steps.parse.outputs.dep_enable }}" == "true" && -n "$HOST" && -n "$SSH_PRIVATE_KEY" ]]; then
-            echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
-            ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "mkdir -p $DEST" || warn "SSH mkdir failed"
-            rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=no" "$ROOT/" "$USER@$HOST:$DEST/" || warn "rsync to server failed"
-            SUDO_FLAG=""; [[ "$USE_SUDO" == "true" ]] && SUDO_FLAG="SUDO=sudo"
-            ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
-              "cd $DEST && $SUDO_FLAG APP_NAME=${P} DEPLOY_PATH=$DEST START_CMD='$CMD' bash ./server/install_deploy.sh" || warn "remote deploy script failed"
-            logf "Deploy step finished (with best effort)."
-          else
-            warn "Server deploy disabled or creds missing — creating local deploy bundle"
-            tar -C "$ROOT" -czf "artifacts/deploy_bundle/${P}-deploy-bundle.tgz" .
-            cat > artifacts/deploy_bundle/DEPLOY_MANUAL_STEPS.txt <<'EOT'
-Manual deploy:
-  scp -P <PORT> artifacts/deploy_bundle/<PKG>-deploy-bundle.tgz <USER>@<HOST>:/tmp/
-  ssh -p <PORT> <USER>@<HOST> "mkdir -p <DEPLOY_PATH> && tar -C <DEPLOY_PATH> -xzf /tmp/<PKG>-deploy-bundle.tgz && cd <DEPLOY_PATH> && SUDO=sudo APP_NAME=<PKG> DEPLOY_PATH=<DEPLOY_PATH> START_CMD='<START_CMD>' bash ./server/install_deploy.sh"
-Notes:
-  - Replace <PKG>, <HOST>, <USER>, <PORT>, <DEPLOY_PATH>, <START_CMD> accordingly.
-  - Systemd unit is created as <PKG>.service and restarted.
-EOT
-          fi
-          logf "Deploy or bundle step completed."
-
-      - name: Echo: job summary & indexes
-        env: { OPT_STEP_NAME: "echo-summary" }
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p artifacts/echo
-          {
-            echo "# Echo Artifacts Index"
-            echo "- Log dir:  \`$LOG_DIR\`"
-            echo "- Mark dir: \`.github/echo_marks\`"
-            echo "- Dist:     \`workspace/${{ inputs.package_name }}/dist\`"
-            echo "- ISO:      \`artifacts/${{ inputs.package_name }}-${{ inputs.package_version }}.iso\` (sha256 동봉)"
-            echo "- Image:    \`artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz\`"
-            echo "- Reports:  \`artifacts/sbom\`, \`artifacts/scan\`"
-            echo "- Push guides: \`artifacts/push\`"
-            echo "- Sign guides: \`artifacts/sign\`"
-            echo "- Code echo: \`artifacts/echo_code\`"
-            echo "- Deploy bundle: \`artifacts/deploy_bundle\`"
-          } | tee artifacts/echo/ECHO_INDEX.md
-
-          {
-            echo "## ✅ Echo Summary"
-            echo ""
-            echo "- Package: **${{ inputs.package_name }}** \`${{ inputs.package_version }}\`"
-            echo "- Image: **${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}\`"
-            echo "- Packaging: \`${{ steps.parse.outputs.pkg_mode }}\`  •  Docker build: \`${{ inputs.build_docker }}\`"
-            echo "- GHCR: enable=\`${{ steps.parse.outputs.ghcr_enable }}\` repo=\`${{ steps.parse.outputs.ghcr_repo }}\`"
-            echo "- DockerHub: enable=\`${{ steps.parse.outputs.dh_enable }}\` repo=\`${{ steps.parse.outputs.dh_repo }}\`"
-            echo "- Release: enable=\`${{ steps.parse.outputs.rel_enable }}\` tag=\`${{ steps.parse.outputs.rel_tag }}\`"
-            echo "- Server: enable=\`${{ steps.parse.outputs.dep_enable }}\` host=\`${{ steps.parse.outputs.dep_host }}\`"
-            echo "- SBOM/Scan/Sign: sbom=\`${{ steps.parse.outputs.sbom_enable }}\` scan=\`${{ steps.parse.outputs.scan_enable }}\` sign=\`${{ steps.parse.outputs.sign_enable }}\`"
-            echo ""
-            echo "### Files"
-            echo "- Logs: \`.github/echo_logs\`"
-            echo "- Marks: \`.github/echo_marks\`"
-            echo "- ISO: \`artifacts/${{ inputs.package_name }}-${{ inputs.package_version }}.iso\`"
-            echo "- Image tar: \`artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz\`"
-            echo "- SBOM: \`artifacts/sbom\` • Scan: \`artifacts/scan\` • Sign: \`artifacts/sign\` • Push: \`artifacts/push\` • Code: \`artifacts/echo_code\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          mkdir -p "iso_stage/${{ inputs.package_name }}/docs"
-          cp -a artifacts/echo/ECHO_INDEX.md "iso_stage/${{ inputs.package_name }}/docs/" || true
-
-      - name: Upload artifacts (always)
+          [[ -z "$SSH_PRIVATE_KEY" ]] && { fail "SERVER_SSH_KEY secret missing"; exit 1; }
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "mkdir -p $DEST"
+          # rsync 코드 전송
+          rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=no" "$ROOT/" "$USER@$HOST:$DEST/"
+          # 원격 설치 실행
+          SUDO_FLAG=""
+          [[ "$USE_SUDO" == "true" ]] && SUDO_FLAG="SUDO=sudo"
+          ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
+            "cd $DEST && $SUDO_FLAG APP_NAME=${P} DEPLOY_PATH=$DEST START_CMD='$CMD' bash ./server/install_deploy.sh"
+          logf "Deployed to $USER@$HOST:$DEST"
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: echo-image-iso-${{ github.run_id }}
@@ -893,5 +587,4 @@ EOT
             artifacts/**
             workspace/**/dist/**
             .github/echo_logs/**
-            .github/echo_marks/**
           if-no-files-found: warn
