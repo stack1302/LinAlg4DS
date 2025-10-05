@@ -57,7 +57,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 모든 bash step에서 자동 로드될 전역 echo 헬퍼 설정
+      # ★ 수정: 현재 스텝 즉시 + 다음 스텝 자동 로드 (BASH_ENV 이중 적용)
       - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
@@ -74,7 +74,13 @@ jobs:
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           logf(){  printf '%s\n' "$*" | tee -a "$SAFE_LOG"; }
           SH
-          echo "BASH_ENV=$GITHUB_WORKSPACE/.bashenv" >> "$GITHUB_ENV"
+
+          # 1) 현재 스텝에 즉시 적용
+          export BASH_ENV="$GITHUB_WORKSPACE/.bashenv"
+          # 2) 다음 스텝에도 자동 적용
+          echo "BASH_ENV=$BASH_ENV" >> "$GITHUB_ENV"
+
+          # 스모크 테스트 (이 스텝에서도 바로 동작해야 함)
           bash -lc 'echoe "helpers loaded"; logf "helpers ready"'
 
       - name: Install toolchain (Python, build tools, ISO tools)
