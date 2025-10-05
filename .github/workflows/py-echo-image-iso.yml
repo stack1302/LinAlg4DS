@@ -28,7 +28,7 @@ on:
         required: false
         default: "{\"author_name\":\"Your Name\",\"author_email\":\"you@example.com\",\"license_name\":\"MIT\"}"
       image_ref:
-        description: "Docker 이미지 참조(이름:태그) 예: mypkg-app:latest"
+        description: "Docker 이미지 참조(이름:태그), 예: mypkg-app:latest"
         required: true
         default: "mypkg-app:latest"
       build_docker:
@@ -47,6 +47,7 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
+  DOCKER_BUILDKIT: "1"
 
 jobs:
   all-in-one:
@@ -56,18 +57,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare echo logging
+      # 모든 bash step에서 자동 로드될 전역 echo 헬퍼 설정
+      - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
           set -Eeuo pipefail
+          cat > "$GITHUB_WORKSPACE/.bashenv" <<'SH'
+          ECHO_OK="${ECHO_OK:-✅}"
+          ECHO_WARN="${ECHO_WARN:-⚠️}"
+          ECHO_FAIL="${ECHO_FAIL:-❌}"
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"
           mkdir -p "$LOG_DIR"
-          SAFE_LOG="${LOG_DIR}/run-$(date +%Y%m%d%H%M%S).log"
+          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d%H%M%S).log}"
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           logf(){  printf '%s\n' "$*" | tee -a "$SAFE_LOG"; }
-          export -f echoe warn fail logf
-          echoe "Echo logger ready → $SAFE_LOG"
+          SH
+          echo "BASH_ENV=$GITHUB_WORKSPACE/.bashenv" >> "$GITHUB_ENV"
+          bash -lc 'echoe "helpers loaded"; logf "helpers ready"'
 
       - name: Install toolchain (Python, build tools, ISO tools)
         shell: bash
@@ -92,7 +100,6 @@ jobs:
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
 
           IMG='${{ inputs.image_ref }}'
-          # image:tag 분리 (태그 없으면 latest 가정)
           if [[ "$IMG" == *:* ]]; then
             IMG_NAME="${IMG%%:*}"
             IMG_TAG="${IMG##*:}"
@@ -213,6 +220,7 @@ jobs:
           COUNT="${{ inputs.dirs_count }}"
           BASE="workspace/${P}/echo_mass"
           mkdir -p "$BASE"
+
           # echo-style script that grants perms and writes logs per dir
           cat > "$BASE/perm_apply.sh" <<'SH'
           #!/usr/bin/env bash
@@ -258,15 +266,20 @@ jobs:
           ROOT="workspace/${P}"
           STAGE="iso_stage/${P}"
           mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs"
+
           # Inject build metadata
           echo "${{ github.repository }},${{ github.run_id }},${{ github.ref_name }}" > "$STAGE/build_info.csv"
+
           # Inject user JSON info
           printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
+
           # Include built distributions
           cp -a "$ROOT/dist" "$STAGE/pkg/"
+
           # Include echo logs & permission script
           cp -a .github/echo_logs "$STAGE/docs/" || true
           cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || true
+
           # README
           cat > "$STAGE/README.txt" <<'TXT'
           Echo ISO — contains:
@@ -275,6 +288,7 @@ jobs:
           - docs/echo_logs: run logs
           - docs/perm_apply.sh: permission script
           TXT
+
           logf "ISO staging prepared at $STAGE"
 
       - name: Build ISO (xorriso / genisoimage fallback)
