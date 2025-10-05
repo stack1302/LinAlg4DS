@@ -359,7 +359,7 @@ jobs:
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
           logf "Generated $COUNT directories with permission echoes."
 
-      - name: Copy directories by copy_plan_json (no-skip: auto-create src if missing)
+      - name: "Copy directories by copy_plan_json (no-skip: auto-create src if missing)"
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -558,7 +558,6 @@ jobs:
           set -Eeuo pipefail
           mkdir -p artifacts/release
           if [[ "${{ steps.parse.outputs.rel_enable }}" == "true" && -n "${{ steps.parse.outputs.rel_tag }}" ]]; then
-            # Try to create release via API (no external action)
             OWNER_REPO="${GITHUB_REPOSITORY}"
             TAG="${{ steps.parse.outputs.rel_tag }}"
             API="https://api.github.com/repos/${OWNER_REPO}/releases"
@@ -569,7 +568,6 @@ jobs:
           else
             warn "Release disabled or no tag — creating pseudo-release folder"
           fi
-          # collect assets regardless
           cp -a artifacts/*.iso artifacts/*.sha256 artifacts/*.tar.gz artifacts/release/ 2>/dev/null || true
           echo "Release assets staged under artifacts/release" | tee artifacts/release/README.txt
 
