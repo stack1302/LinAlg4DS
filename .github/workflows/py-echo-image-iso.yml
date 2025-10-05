@@ -1,0 +1,283 @@
+name: "🐍 PyPkg + Echo Dirs + Perm/Echo Files + Docker Image + ISO (All-in-One)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: "파이썬 패키지 이름 (PEP 8 소문자, 하이픈/점 금지)"
+        required: true
+        default: "mypkg"
+      package_version:
+        description: "패키지 버전"
+        required: true
+        default: "0.1.0"
+      author_name:
+        description: "작성자"
+        required: true
+        default: "Your Name"
+      author_email:
+        description: "작성자 이메일"
+        required: true
+        default: "you@example.com"
+      license_name:
+        description: "라이선스 표기"
+        required: true
+        default: "MIT"
+      dirs_count:
+        description: "대량 생성 디렉토리 개수 (예: 2000)"
+        required: true
+        default: "500"
+      image_name:
+        description: "Docker 이미지명 (태그는 자동)"
+        required: true
+        default: "mypkg-app"
+      image_tag:
+        description: "Docker 태그"
+        required: true
+        default: "latest"
+      iso_label:
+        description: "ISO 볼륨 라벨(영문/숫자/언더스코어)"
+        required: true
+        default: "ECHO_ISO"
+      inject_info_json:
+        description: "ISO에 주입할 JSON(예: {\"env\":\"prod\",\"team\":\"devops\"})"
+        required: false
+        default: "{\"env\":\"dev\",\"team\":\"finops\"}"
+      build_docker:
+        description: "Docker 이미지 빌드/저장 수행"
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_logs
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
+
+jobs:
+  all-in-one:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare echo logging
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$LOG_DIR"
+          SAFE_LOG="${LOG_DIR}/run-$(date +%Y%m%d%H%M%S).log"
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "$SAFE_LOG"; }
+          export -f echoe warn fail logf
+          echoe "Echo logger ready → $SAFE_LOG"
+
+      - name: Install toolchain (Python, build tools, ISO tools)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          logf "Installing build tools"
+          sudo apt-get update -y
+          sudo apt-get install -y python3 python3-venv python3-pip python3-setuptools python3-wheel \
+              git jq xorriso genisoimage dosfstools
+          python3 --version | tee -a "$LOG_DIR/python.txt"
+          pip3 --version | tee -a "$LOG_DIR/pip.txt"
+          logf "Installed: xorriso/genisoimage for ISO, jq for JSON"
+
+      - name: Create Python package skeleton (PEP 621 / pyproject.toml)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          P="${{ inputs.package_name }}"
+          V="${{ inputs.package_version }}"
+          A="${{ inputs.author_name }}"
+          E="${{ inputs.author_email }}"
+          L="${{ inputs.license_name }}"
+          ROOT="workspace/${P}"
+          PKG_DIR="$ROOT/src/${P}"
+          TEST_DIR="$ROOT/tests"
+          DOC_DIR="$ROOT/docs"
+          mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
+          # core files
+          cat > "$ROOT/pyproject.toml" <<'PYT'
+          [build-system]
+          requires = ["setuptools>=68", "wheel"]
+          build-backend = "setuptools.build_meta"
+
+          [project]
+          name = "__PKG_NAME__"
+          version = "__PKG_VER__"
+          description = "Auto-generated package with EchoOps"
+          authors = [{ name="__AUTHOR__", email="__EMAIL__"}]
+          license = { text="__LICENSE__" }
+          readme = "README.md"
+          requires-python = ">=3.9"
+          classifiers = [
+            "Programming Language :: Python :: 3",
+            "License :: OSI Approved :: MIT License"
+          ]
+
+          [project.urls]
+          Homepage = "https://example.com"
+
+          [tool.setuptools.packages.find]
+          where = ["src"]
+          PYT
+          sed -i "s/__PKG_NAME__/${P}/g" "$ROOT/pyproject.toml"
+          sed -i "s/__PKG_VER__/${V}/g" "$ROOT/pyproject.toml"
+          sed -i "s/__AUTHOR__/${A}/g" "$ROOT/pyproject.toml"
+          sed -i "s/__EMAIL__/${E}/g" "$ROOT/pyproject.toml"
+          sed -i "s/__LICENSE__/${L}/g" "$ROOT/pyproject.toml"
+
+          cat > "$ROOT/README.md" <<'MD'
+          # Auto Generated Python Package
+          - EchoOps generated.
+          - Includes Dockerfile and ISO injection artifacts.
+          MD
+
+          cat > "$PKG_DIR/__init__.py" <<'PY'
+          __all__ = ["hello"]
+          __version__ = "__VER__"
+          def hello(name: str = "World") -> str:
+              return f"Hello, {name}!"
+          PY
+          sed -i "s/__VER__/${V}/g" "$PKG_DIR/__init__.py"
+
+          cat > "$TEST_DIR/test_hello.py" <<'PY'
+          from __future__ import annotations
+          from __pkg__.__init__ import hello
+          def test_hello():
+              assert hello("Echo") == "Hello, Echo!"
+          PY
+          sed -i "s/__pkg__/${P}/g" "$TEST_DIR/test_hello.py"
+
+          # minimal Dockerfile
+          cat > "$ROOT/Dockerfile" <<'DOCKER'
+          FROM python:3.11-slim
+          WORKDIR /app
+          COPY . /app
+          RUN pip install --no-cache-dir .
+          CMD ["python","-c","import __PKG__; print(__PKG__.hello('Docker'))"]
+          DOCKER
+          sed -i "s/__PKG__/${P}/g" "$ROOT/Dockerfile"
+
+          logf "Python skeleton created at $ROOT"
+
+      - name: Build wheel / sdist
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          P="${{ inputs.package_name }}"
+          ROOT="workspace/${P}"
+          python3 -m pip install --upgrade pip build
+          python3 -m build "$ROOT"
+          ls -al "$ROOT/dist" | tee -a "$LOG_DIR/dist.txt"
+
+      - name: Massive directory generation (+ echo-style permission files)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          P="${{ inputs.package_name }}"
+          COUNT="${{ inputs.dirs_count }}"
+          BASE="workspace/${P}/echo_mass"
+          mkdir -p "$BASE"
+          # echo-style script that grants perms and writes logs per dir
+          cat > "$BASE/perm_apply.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"
+          mkdir -p "$LOG_DIR"
+          OUT="$LOG_DIR/perm-$(date +%Y%m%d%H%M%S).log"
+          echo "perm started: $(date)" | tee -a "$OUT"
+          for d in "$@"; do
+            mkdir -p "$d"
+            chmod 755 "$d"
+            printf 'ECHO %s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$d" | tee -a "$OUT"
+            echo "ok" > "$d/.echo.ok"
+          done
+          echo "done: $(date)" | tee -a "$OUT"
+          SH
+          chmod +x "$BASE/perm_apply.sh"
+
+          # generate N dirs and apply
+          mapfile -t DLIST < <(seq -w 1 "$COUNT" | xargs -I{} echo "$BASE/dir_{}")
+          "${BASE}/perm_apply.sh" "${DLIST[@]}"
+          logf "Generated $COUNT directories with permission echoes."
+
+      - name: Optional Docker build + save
+        if: ${{ inputs.build_docker == true }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          P="${{ inputs.package_name }}"
+          ROOT="workspace/${P}"
+          IMG="${{ inputs.image_name }}:${{ inputs.image_tag }}"
+          logf "Building Docker image: $IMG"
+          docker build -t "$IMG" "$ROOT"
+          mkdir -p artifacts
+          docker save "$IMG" | gzip -c > "artifacts/${{ inputs.image_name }}-${{ inputs.image_tag }}.tar.gz"
+          logf "Saved image tar.gz under artifacts/"
+
+      - name: Prepare ISO staging & info injection
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          P="${{ inputs.package_name }}"
+          ROOT="workspace/${P}"
+          STAGE="iso_stage/${P}"
+          mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs"
+          # Inject build metadata
+          echo "${{ github.repository }},${{ github.run_id }},${{ github.ref_name }}" > "$STAGE/build_info.csv"
+          # Inject user JSON info
+          printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
+          # Include built distributions
+          cp -a "$ROOT/dist" "$STAGE/pkg/"
+          # Include echo logs & permission script
+          cp -a .github/echo_logs "$STAGE/docs/" || true
+          cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || true
+          # README
+          cat > "$STAGE/README.txt" <<'TXT'
+          Echo ISO — contains:
+          - pkg/dist: built wheels/sdists
+          - config/inject.json: injected metadata
+          - docs/echo_logs: run logs
+          - docs/perm_apply.sh: permission script
+          TXT
+          logf "ISO staging prepared at $STAGE"
+
+      - name: Build ISO (xorriso / genisoimage fallback)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ISO_NAME="${{ inputs.package_name }}-${{ inputs.package_version }}.iso"
+          LABEL="${{ inputs.iso_label }}"
+          STAGE="iso_stage/${{ inputs.package_name }}"
+          mkdir -p artifacts
+          if command -v xorriso >/dev/null 2>&1; then
+            logf "Using xorriso"
+            xorriso -as mkisofs -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
+          else
+            logf "Using genisoimage"
+            genisoimage -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
+          fi
+          (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
+          logf "ISO built: artifacts/${ISO_NAME}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: echo-image-iso-${{ github.run_id }}
+          path: |
+            artifacts/**
+            workspace/**/dist/**
+            .github/echo_logs/**
+          if-no-files-found: warn
