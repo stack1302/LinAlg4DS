@@ -130,11 +130,7 @@ jobs:
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
 
           IMG='${{ inputs.image_ref }}'
-          if [[ "$IMG" == *:* ]]; then
-            IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"
-          else
-            IMG_NAME="$IMG"; IMG_TAG="latest"
-          fi
+          if [[ "$IMG" == *:* ]]; then IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"; else IMG_NAME="$IMG"; IMG_TAG="latest"; fi
 
           CP='${{ inputs.copy_plan_json }}'
           printf '%s' "$CP"  | jq . >/dev/null  || { echo "copy_plan_json invalid JSON"; exit 1; }
@@ -216,12 +212,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Pip cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml') }}
-
+      # 🔧 패키지 스켈레톤을 먼저 만든 뒤 캐시 키 계산
       - name: Create Python package skeleton (PEP 621 / pyproject.toml + server scripts)
         shell: bash
         run: |
@@ -332,13 +323,18 @@ jobs:
           chmod +x "$ROOT/server/install_deploy.sh"
           logf "Python skeleton + server scripts created at $ROOT"
 
+      - name: Pip cache (after skeleton so key is stable)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('workspace/**/pyproject.toml') }}
+
       - name: Install test deps
         shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install build pytest
 
-      # ✅ src 레이아웃 인식되도록 PYTHONPATH=src 설정
       - name: Run unit tests (pytest)
         shell: bash
         working-directory: workspace/${{ inputs.package_name }}
@@ -414,12 +410,19 @@ jobs:
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
           logf "Generated $COUNT directories with permission echoes."
 
+      # ✅ jq 포맷 안전화 + 폴백
       - name: Copy plan dry-run summary
         shell: bash
         run: |
           set -Eeuo pipefail
           if [[ -f copy_plan.json ]]; then
-            jq -r '.plans[] | "\(.src) -> \(.dest_rel) include:\(.include_globs|join(\"|\")) exclude:\(.exclude_globs|join(\"|\")) max:\(.max_mb)MB"' copy_plan.json || true
+            # 따옴표 이스케이프 문제를 피하기 위해 @tsv로 출력 후 printf로 정리
+            if ! jq -r '.plans[] | [.src, .dest_rel, (.include_globs|join("|")), (.exclude_globs|join("|")), (.max_mb|tostring)] | @tsv' copy_plan.json > /tmp/cp.tsv; then
+              echo "⚠️ jq pretty format failed; printing compact JSON"
+              jq -c '.plans[]' copy_plan.json || true
+            else
+              awk -F'\t' '{printf "SRC=%s -> DEST=%s | include:[%s] exclude:[%s] max:%sMB\n",$1,$2,$3,$4,$5}' /tmp/cp.tsv
+            fi
           else
             echo "no copy_plan.json"
           fi
@@ -535,14 +538,14 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p security
-          syft packages dir:workspace/${{ inputs.package_name }} -o spdx-json > security/pkg-sbom.spdx.json
+          syft scan dir:workspace/${{ inputs.package_name }} -o spdx-json -q > security/pkg-sbom.spdx.json
 
       - name: Generate SBOM for image (if built)
         if: ${{ inputs.build_docker == true }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          syft ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json > security/image-sbom.spdx.json
+          syft scan ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json -q > security/image-sbom.spdx.json
 
       - name: Vulnerability scan (Trivy; image)
         if: ${{ inputs.build_docker == true }}
