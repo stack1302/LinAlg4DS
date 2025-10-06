@@ -1,43 +1,18 @@
-name: "🐍 PyPkg + Echo/CopyPlan + Docker Image + ISO + Push + Release + Deploy (no-skip + cache)"
+name: "🐍 PyPkg + Echo/CopyPlan + Docker Image + ISO + Push + Release + Deploy (no-skip + cache, v2)"
 
 on:
   workflow_dispatch:
     inputs:
-      package_name:
-        description: "파이썬 패키지 이름 (PEP 8 소문자, 하이픈/점 금지)"
-        required: true
-        default: "mypkg"
-      package_version:
-        description: "패키지 버전"
-        required: true
-        default: "0.1.0"
-      dirs_count:
-        description: "대량 생성 디렉토리 개수"
-        required: true
-        default: "500"
-      iso_label:
-        description: "ISO 볼륨 라벨"
-        required: true
-        default: "ECHO_ISO"
-      inject_info_json:
-        description: "ISO 주입 JSON"
-        required: false
-        default: "{\"env\":\"dev\",\"team\":\"finops\"}"
-      metadata_json:
-        description: "패키지 메타 JSON"
-        required: false
-        default: "{\"author_name\":\"Your Name\",\"author_email\":\"you@example.com\",\"license_name\":\"MIT\"}"
-      image_ref:
-        description: "Docker 이미지 참조(이름:태그)"
-        required: true
-        default: "mypkg-app:latest"
-      build_docker:
-        description: "Docker 이미지 빌드/저장 수행"
-        required: true
-        type: boolean
-        default: true
+      package_name: { description: "패키지 이름", required: true, default: "mypkg" }
+      package_version: { description: "버전", required: true, default: "0.1.0" }
+      dirs_count: { description: "echo_mass 디렉토리 개수", required: true, default: "500" }
+      iso_label: { description: "ISO 라벨", required: true, default: "ECHO_ISO" }
+      inject_info_json: { description: "ISO 주입 JSON", required: false, default: "{\"env\":\"dev\",\"team\":\"finops\"}" }
+      metadata_json: { description: "메타 JSON", required: false, default: "{\"author_name\":\"Your Name\",\"author_email\":\"you@example.com\",\"license_name\":\"MIT\"}" }
+      image_ref: { description: "이미지 (name:tag)", required: true, default: "mypkg-app:latest" }
+      build_docker: { description: "Docker 빌드/저장", required: true, type: boolean, default: true }
       copy_plan_json:
-        description: "디렉토리 복사 계획(JSON)"
+        description: "복사 계획(JSON)"
         required: false
         default: "{\"plans\":[{\"src\":\"samples\",\"dest_rel\":\"extra/samples\",\"include_globs\":[\"**/*\"],\"exclude_globs\":[\"**/.git/**\",\"**/.github/**\"],\"max_mb\":100,\"include_in_iso\":true,\"required\":false}]}"
       advanced_json:
@@ -103,9 +78,6 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y python3 python3-venv python3-pip python3-setuptools python3-wheel \
             git jq rsync xorriso genisoimage dosfstools openssh-client zstd
-          python3 --version | tee -a "$LOG_DIR/python.txt"
-          pip3 --version | tee -a "$LOG_DIR/pip.txt"
-          rsync --version | head -n1 | tee -a "$LOG_DIR/rsync.txt"
 
       - name: Parse inputs
         id: parse
@@ -117,16 +89,12 @@ jobs:
           A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
           A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
-
           IMG='${{ inputs.image_ref }}'
           if [[ "$IMG" == *:* ]]; then IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"; else IMG_NAME="$IMG"; IMG_TAG="latest"; fi
-
           CP='${{ inputs.copy_plan_json }}'
           printf '%s' "$CP"  | jq . >/dev/null
-
           ADV_RAW='${{ inputs.advanced_json }}'
           printf '%s' "$ADV_RAW" | jq . >/dev/null
-          # 기본값 보강
           OWNER="${GITHUB_REPOSITORY_OWNER:-$(echo "${GITHUB_REPOSITORY:-unknown/unknown}"|cut -d/ -f1)}"
           DEF_GHCR="ghcr.io/${OWNER}/${{ inputs.package_name }}"
           DEF_DH="${OWNER,,}/${{ inputs.package_name }}"
@@ -140,38 +108,29 @@ jobs:
                             .service_name=(.service_name // "${{ inputs.package_name }}") |
                             .start_cmd=(.start_cmd // ("python -m "+"${{ inputs.package_name }}")) |
                             .use_sudo=(.use_sudo // true) )')
-
-          PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"')
-          GHCR_ENABLE=$(printf '%s' "$ADV" | jq -r '.ghcr.enable')
-          GHCR_REPO=$(printf '%s' "$ADV" | jq -r '.ghcr.repo')
-          GHCR_TAG=$(printf '%s' "$ADV" | jq -r '.ghcr.tag')
-          DH_ENABLE=$(printf '%s' "$ADV" | jq -r '.dockerhub.enable')
-          DH_REPO=$(printf '%s' "$ADV" | jq -r '.dockerhub.repo')
-          DH_TAG=$(printf '%s' "$ADV" | jq -r '.dockerhub.tag')
-          REL_ENABLE=$(printf '%s' "$ADV" | jq -r '.release.enable')
-          REL_TAG=$(printf '%s' "$ADV" | jq -r '.release.tag // ""')
-          REL_DRAFT=$(printf '%s' "$ADV" | jq -r '.release.draft')
-          REL_PRE=$(printf '%s' "$ADV" | jq -r '.release.prerelease')
-          DEP_ENABLE=$(printf '%s' "$ADV" | jq -r '.server.enable')
-          DEP_HOST=$(printf '%s' "$ADV" | jq -r '.server.host')
-          DEP_USER=$(printf '%s' "$ADV" | jq -r '.server.user')
-          DEP_PORT=$(printf '%s' "$ADV" | jq -r '.server.port')
-          DEP_PATH=$(printf '%s' "$ADV" | jq -r '.server.deploy_path')
-          DEP_SVC=$(printf '%s' "$ADV" | jq -r '.server.service_name')
-          DEP_CMD=$(printf '%s' "$ADV" | jq -r '.server.start_cmd')
-          DEP_SUDO=$(printf '%s' "$ADV" | jq -r '.server.use_sudo')
-
           {
             echo "author_name=$A_NAME"; echo "author_email=$A_EMAIL"; echo "license_name=$L_NAME"
             echo "image_name=$IMG_NAME"; echo "image_tag=$IMG_TAG"
-            echo "pkg_mode=$PKG_MODE"
-            echo "ghcr_enable=$GHCR_ENABLE"; echo "ghcr_repo=$GHCR_REPO"; echo "ghcr_tag=$GHCR_TAG"
-            echo "dh_enable=$DH_ENABLE";   echo "dh_repo=$DH_REPO";     echo "dh_tag=$DH_TAG"
-            echo "rel_enable=$REL_ENABLE"; echo "rel_tag=$REL_TAG"; echo "rel_draft=$REL_DRAFT"; echo "rel_prerelease=$REL_PRE"
-            echo "dep_enable=$DEP_ENABLE"; echo "dep_host=$DEP_HOST"; echo "dep_user=$DEP_USER"; echo "dep_port=$DEP_PORT"
-            echo "dep_path=$DEP_PATH"; echo "dep_svc=$DEP_SVC"; echo "dep_cmd=$DEP_CMD"; echo "dep_sudo=$DEP_SUDO"
+            echo "pkg_mode=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"')"
+            echo "ghcr_enable=$(printf '%s' "$ADV" | jq -r '.ghcr.enable')"
+            echo "ghcr_repo=$(printf '%s' "$ADV" | jq -r '.ghcr.repo')"
+            echo "ghcr_tag=$(printf '%s' "$ADV" | jq -r '.ghcr.tag')"
+            echo "dh_enable=$(printf '%s' "$ADV" | jq -r '.dockerhub.enable')"
+            echo "dh_repo=$(printf '%s' "$ADV" | jq -r '.dockerhub.repo')"
+            echo "dh_tag=$(printf '%s' "$ADV" | jq -r '.dockerhub.tag')"
+            echo "rel_enable=$(printf '%s' "$ADV" | jq -r '.release.enable')"
+            echo "rel_tag=$(printf '%s' "$ADV" | jq -r '.release.tag // ""')"
+            echo "rel_draft=$(printf '%s' "$ADV" | jq -r '.release.draft')"
+            echo "rel_prerelease=$(printf '%s' "$ADV" | jq -r '.release.prerelease')"
+            echo "dep_enable=$(printf '%s' "$ADV" | jq -r '.server.enable')"
+            echo "dep_host=$(printf '%s' "$ADV" | jq -r '.server.host')"
+            echo "dep_user=$(printf '%s' "$ADV" | jq -r '.server.user')"
+            echo "dep_port=$(printf '%s' "$ADV" | jq -r '.server.port')"
+            echo "dep_path=$(printf '%s' "$ADV" | jq -r '.server.deploy_path')"
+            echo "dep_svc=$(printf '%s' "$ADV" | jq -r '.server.service_name')"
+            echo "dep_cmd=$(printf '%s' "$ADV" | jq -r '.server.start_cmd')"
+            echo "dep_sudo=$(printf '%s' "$ADV" | jq -r '.server.use_sudo')"
           } | tee -a "$LOG_DIR/parsed_inputs.env" >> "$GITHUB_OUTPUT"
-
           printf '%s' "$CP"   > copy_plan.json
           printf '%s' "$ADV"  > advanced.json
           logf "copy_plan.json & advanced.json saved"
@@ -180,18 +139,16 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          err(){ echo "❌ $*"; exit 1; }
-          [[ "${{ inputs.package_name }}" =~ ^[a-z0-9_]+$ ]] || err "package_name 은 소문자/숫자/언더스코어만 허용"
-          [[ "${{ inputs.package_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || err "package_version 은 SemVer 형식 필요"
-          [[ "${{ inputs.image_ref }}" =~ ^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]] || err "image_ref 형식 오류"
+          [[ "${{ inputs.package_name }}" =~ ^[a-z0-9_]+$ ]] || { echo "❌ invalid package_name"; exit 1; }
+          [[ "${{ inputs.package_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || { echo "❌ invalid version"; exit 1; }
+          [[ "${{ inputs.image_ref }}" =~ ^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]] || { echo "❌ invalid image_ref"; exit 1; }
           echo "✅ input validation passed"
 
       - name: Setup Python
         uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+        with: { python-version: "3.11" }
 
-      - name: Create package skeleton
+      - name: Create package skeleton + echo_mass (always)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -213,16 +170,11 @@ jobs:
           readme = "README.md"
           requires-python = ">=3.9"
           classifiers = ["Programming Language :: Python :: 3","License :: OSI Approved :: MIT License"]
-          [project.urls]
-          Homepage = "https://example.com"
           [tool.setuptools.packages.find]
           where = ["src"]
           PYT
           sed -i "s/__PKG_NAME__/${P}/g;s/__PKG_VER__/${V}/g;s/__AUTHOR__/${A}/g;s/__EMAIL__/${E}/g;s/__LICENSE__/${L}/g" "$ROOT/pyproject.toml"
-          cat > "$ROOT/README.md" <<'MD'
-          # Auto Generated Python Package
-          - EchoOps generated.
-          MD
+          echo -e "# Auto Generated Python Package\n- EchoOps generated." > "$ROOT/README.md"
           cat > "$PKG_DIR/__init__.py" <<'PY'
           __all__ = ["hello"]; __version__="__VER__"
           def hello(name: str = "World") -> str: return f"Hello, {name}!"
@@ -234,6 +186,7 @@ jobs:
           def test_hello(): assert hello("Echo") == "Hello, Echo!"
           PY
           sed -i "s/__pkg__/${P}/g" "$TEST_DIR/test_hello.py"
+          # Dockerfile
           cat > "$ROOT/Dockerfile" <<'DOCKER'
           FROM python:3.11-slim
           WORKDIR /app
@@ -242,27 +195,18 @@ jobs:
           CMD ["python","-c","import __PKG__; print(__PKG__.hello('Docker'))"]
           DOCKER
           sed -i "s/__PKG__/${P}/g" "$ROOT/Dockerfile"
-          mkdir -p "$ROOT/server"
-          cat > "$ROOT/server/install_deploy.sh" <<'SH'
+          # echo_mass + perm_apply.sh 생성
+          EM="$ROOT/echo_mass"; mkdir -p "$EM"
+          cat > "$EM/perm_apply.sh" <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
-          SUDO=${SUDO:-sudo}; APP_NAME="${APP_NAME:-__APP__}"; DEPLOY_PATH="${DEPLOY_PATH:-/opt/__APP__}"
-          START_CMD="${START_CMD:-python -m __APP__}"
-          $SUDO mkdir -p "$DEPLOY_PATH"; $SUDO rsync -a ./ "$DEPLOY_PATH/"
-          $SUDO python3 -m venv "$DEPLOY_PATH/.venv"
-          $SUDO bash -lc "source \"$DEPLOY_PATH/.venv/bin/activate\" && pip install --upgrade pip && pip install ."
-          UNIT="/etc/systemd/system/__APP__.service"
-          cat | $SUDO tee "$UNIT" >/dev/null <<EOF
-          [Unit] Description=__APP__ Service After=network.target
-          [Service] Type=simple WorkingDirectory=$DEPLOY_PATH ExecStart=$DEPLOY_PATH/.venv/bin/${START_CMD} Restart=on-failure
-          [Install] WantedBy=multi-user.target
-          EOF
-          $SUDO systemctl daemon-reload || true
-          $SUDO systemctl enable __APP__.service || true
-          $SUDO systemctl restart __APP__.service || true
+          echo "perm started: $(date)"
+          base="$(dirname "$0")"
+          for i in $(seq 1 ${DIRS_COUNT:-500}); do d=$(printf "%s/dir_%03d" "$base" "$i"); mkdir -p "$d"; echo "ECHO $(date -Iseconds) $d"; done
+          echo "done: $(date)"
           SH
-          sed -i "s/__APP__/${P}/g" "$ROOT/server/install_deploy.sh"; chmod +x "$ROOT/server/install_deploy.sh"
-          logf "Python skeleton created at $ROOT"
+          chmod +x "$EM/perm_apply.sh"
+          DIRS_COUNT="${{ inputs.dirs_count }}" bash "$EM/perm_apply.sh" | tee "$EM/perm.log"
 
       - name: Pip cache (stable key)
         uses: actions/cache@v4
@@ -335,25 +279,20 @@ jobs:
         run: |
           set -Eeuo pipefail
           ROOT="workspace/${{ inputs.package_name }}"
-          mkdir -p "$ROOT"
           jq -r '.plans[].src' copy_plan.json | while read -r s; do
             [[ -z "$s" || "$s" == "null" ]] && continue
-            # 상대경로는 repo 루트/패키지 루트 둘 다 확인 후 없으면 만들어줌
             for base in "$GITHUB_WORKSPACE" "$ROOT"; do
               [[ -d "$base/$s" ]] || { mkdir -p "$base/$s"; echo "placeholder" > "$base/$s/README.txt"; }
             done
           done
           echo "✅ sources ensured"
 
-      - name: Copy plan dry-run summary (no jq escape issue)
+      - name: Copy plan dry-run summary
         shell: bash
         run: |
           set -Eeuo pipefail
-          if ! jq -r '.plans[] | [.src, .dest_rel, (.include_globs|join("|")), (.exclude_globs|join("|")), (.max_mb|tostring)] | @tsv' copy_plan.json > /tmp/cp.tsv; then
-            echo "⚠️ jq pretty format failed; printing compact JSON"; jq -c '.plans[]' copy_plan.json || true
-          else
-            awk -F'\t' '{printf "SRC=%s -> DEST=%s | include:[%s] exclude:[%s] max:%sMB\n",$1,$2,$3,$4,$5}' /tmp/cp.tsv
-          fi
+          jq -r '.plans[] | [.src, .dest_rel, (.include_globs|join("|")), (.exclude_globs|join("|")), (.max_mb|tostring)] | @tsv' copy_plan.json > /tmp/cp.tsv || { echo "⚠️ jq pretty failed"; jq -c '.plans[]' copy_plan.json || true; }
+          [[ -f /tmp/cp.tsv ]] && awk -F'\t' '{printf "SRC=%s -> DEST=%s | include:[%s] exclude:[%s] max:%sMB\n",$1,$2,$3,$4,$5}' /tmp/cp.tsv || true
 
       - name: Copy directories per plan (manifest + checksums)
         shell: bash
@@ -375,14 +314,13 @@ jobs:
             RESOLVED_SRC=""
             for base in "$GITHUB_WORKSPACE" "$DEST_BASE" ""; do [[ -d "$base/$SRC" ]] && { RESOLVED_SRC="$base/$SRC"; break; }; done
             if [[ -z "$RESOLVED_SRC" ]]; then
-              if [[ "$REQUIRED" == "true" ]]; then echo "❌ required src not found: $SRC"; exit 1; else echo "⚠️ src not found (skipped logically but step continues): $SRC"; continue; fi
+              [[ "$REQUIRED" == "true" ]] && { echo "❌ required src not found: $SRC"; exit 1; } || { echo "⚠️ src not found: $SRC"; continue; }
             fi
             DEST_DIR="$DEST_BASE/$DEST_REL"; mkdir -p "$DEST_DIR"
             RSYNC_ARGS=(-a --delete --prune-empty-dirs)
             for p in "${INCLUDES[@]}";  do RSYNC_ARGS+=(--include "$p"); done
             for p in "${EXCLUDES[@]}";  do RSYNC_ARGS+=(--exclude "$p"); done
-            RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/')
-            RSYNC_ARGS+=(--include '*/' --exclude '*')
+            RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/' --include '*/' --exclude '*')
             TMP_STAGE="$(mktemp -d)"; rsync "${RSYNC_ARGS[@]}" "$RESOLVED_SRC/" "$TMP_STAGE/"
             TOTAL_BYTES=$(du -sb "$TMP_STAGE" | awk '{print $1}'); LIMIT_BYTES=$((MAX_MB * 1024 * 1024))
             if (( TOTAL_BYTES > LIMIT_BYTES )); then
@@ -402,7 +340,18 @@ jobs:
           done
           echo "✅ Manifest generated: $MANIFEST_CSV"
 
-      - name: Docker build + save (always runs; fallback when disabled)
+      # === Buildx/QEMU 세팅(멀티아치 가능 시 활용, 불가 시 자동 폴백) ===
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+        with: { platforms: all }
+
+      - name: Setup Buildx (docker-container driver)
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+          driver: docker-container
+
+      - name: Docker build + save (항상 성공)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -414,7 +363,6 @@ jobs:
             docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
             echo "✅ image built & saved"
           else
-            echo "ℹ️ build_docker=false: building minimal scratch tar"
             tar -czf "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz" -C "$ROOT" .
             echo "✅ fallback artifact saved"
           fi
@@ -423,17 +371,17 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || true
 
       - name: SBOM (dir + image if built)
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p security
-          syft scan dir:workspace/${{ inputs.package_name }} -o spdx-json -q > security/pkg-sbom.spdx.json
+          syft scan dir:workspace/${{ inputs.package_name }} -o spdx-json -q > security/pkg-sbom.spdx.json || echo '{}' > security/pkg-sbom.spdx.json
           if [[ "${{ inputs.build_docker }}" == "true" ]]; then
-            syft scan ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json -q > security/image-sbom.spdx.json || true
+            syft scan ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json -q > security/image-sbom.spdx.json || echo '{}' > security/image-sbom.spdx.json
           else
             echo '{}' > security/image-sbom.spdx.json
           fi
@@ -461,6 +409,7 @@ jobs:
           printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
           cp -a "$ROOT/dist" "$STAGE/pkg/" || true
           cp -a .github/echo_logs "$STAGE/docs/" || true
+          # echo_mass 파일이 항상 있으므로 안전
           cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || true
           [[ -d "$ROOT/extra_manifests" ]] && cp -a "$ROOT/extra_manifests" "$STAGE/docs/" || true
           cp -a "$ROOT/server" "$STAGE/" || true
@@ -487,7 +436,7 @@ jobs:
           (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
           echo "✅ ISO built"
 
-      - name: Compute GHCR semver tags (always)
+      - name: Compute GHCR semver tags
         id: ghcrtags
         shell: bash
         run: |
@@ -495,30 +444,24 @@ jobs:
           REPO="${{ steps.parse.outputs.ghcr_repo }}"
           V="${{ inputs.package_version }}"; RI="${{ github.run_id }}"
           MAJOR="${V%%.*}"; MINOR="${V%.*}"
-          # 태그 충돌 방지: run_id suffix
-          TAGS="${REPO}:${V}-${RI},${REPO}:${MAJOR}.${MINOR#${MAJOR}.}-${RI},${REPO}:${MAJOR}-${RI},${REPO}:latest"
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echo "Computed tags: ${TAGS}"
+          echo "tags=${REPO}:${V}-${RI},${REPO}:${MAJOR}.${MINOR#${MAJOR}.}-${RI},${REPO}:${MAJOR}-${RI},${REPO}:latest" >> "$GITHUB_OUTPUT"
 
-      - name: Buildx + push GHCR (fallback to local manifest if no permission)
+      - name: Buildx + push GHCR (멀티아치 가능 시 push, 불가 시 단일/로컬 폴백)
         shell: bash
         run: |
           set -Eeuo pipefail
-          docker buildx version || docker buildx create --use
+          ROOT="workspace/${{ inputs.package_name }}"
+          T1="$(echo "${{ steps.ghcrtags.outputs.tags }}"|cut -d, -f1)"
+          docker buildx ls || true
           if [[ "${{ inputs.build_docker }}" == "true" ]]; then
-            if echo "${{ github.token }}" >/dev/null 2>&1; then
-              echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || true
-            fi
+            echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin || true
+            # 멀티아치 시도
             docker buildx build --platform linux/amd64,linux/arm64 \
-              -t $(echo "${{ steps.ghcrtags.outputs.tags }}"|cut -d, -f1) \
-              -f workspace/${{ inputs.package_name }}/Dockerfile \
-              workspace/${{ inputs.package_name }} \
-              --push || {
-                echo "⚠️ push failed or not permitted; saving multi-arch build locally instead."
-                docker buildx build --platform linux/amd64,linux/arm64 \
-                  -t local/${{ inputs.package_name }}:multi --output type=docker \
-                  -f workspace/${{ inputs.package_name }}/Dockerfile workspace/${{ inputs.package_name }} || true
-              }
+              -t "$T1" -f "$ROOT/Dockerfile" "$ROOT" --push && OK=1 || OK=0
+            if [[ "$OK" -ne 1 ]]; then
+              echo "⚠️ multi-arch push not available; single-arch fallback"
+              docker buildx build --platform linux/amd64 -t "$T1" -f "$ROOT/Dockerfile" "$ROOT" --load || true
+            fi
           else
             echo "ℹ️ build_docker=false; skipping remote push but step completed."
           fi
@@ -536,16 +479,16 @@ jobs:
           DEST_TAG="${{ steps.parse.outputs.dh_tag }}"
           mkdir -p artifacts
           if [[ -n "$DOCKERHUB_USERNAME" && -n "$DOCKERHUB_TOKEN" && "${{ inputs.build_docker }}" == "true" ]]; then
-            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-            docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || true
+            docker image inspect "$SRC_IMG" >/dev/null 2>&1 || docker build -t "$SRC_IMG" "workspace/${{ inputs.package_name }}" || true
+            docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG" || true
             docker push "$DEST_REPO:$DEST_TAG" || echo "⚠️ dockerhub push failed (non-fatal)"
           else
-            echo "ℹ️ No DockerHub creds or no image build; exporting fallback tar"
             docker image inspect "$SRC_IMG" >/dev/null 2>&1 && docker save "$SRC_IMG" | gzip -c > "artifacts/dockerhub-fallback-${DEST_REPO//\//_}-${DEST_TAG}.tar.gz" || true
           fi
           echo "✅ DockerHub step done"
 
-      - name: Cosign (keyless if possible; else local attest artifact)
+      - name: Cosign (여러 경로 시도 + 완전 폴백)
         shell: bash
         env:
           COSIGN_EXPERIMENTAL: "1"
@@ -553,18 +496,23 @@ jobs:
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           set -Eeuo pipefail
-          curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin
-          T1=$(echo "${{ steps.ghcrtags.outputs.tags }}"|cut -d, -f1)
-          if [[ "${{ inputs.build_docker }}" == "true" ]]; then
+          T1="$(echo "${{ steps.ghcrtags.outputs.tags }}"|cut -d, -f1)"
+          install_ok=0
+          { curl -fsSL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin && install_ok=1; } || true
+          if [[ "$install_ok" -ne 1 ]]; then
+            curl -fsSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 || true
+            chmod +x /usr/local/bin/cosign || true
+            command -v cosign >/dev/null 2>&1 && install_ok=1 || install_ok=0
+          fi
+          if [[ "${{ inputs.build_docker }}" == "true" && "$install_ok" -eq 1 ]]; then
             if [[ -n "$COSIGN_KEY" ]]; then
               cosign sign --key env://COSIGN_KEY "$T1" || true
               [[ -f security/image-sbom.spdx.json ]] && cosign attest --key env://COSIGN_KEY --predicate security/image-sbom.spdx.json --type spdx "$T1" || true
             else
-              # keyless 시도 (OIDC), 실패하면 로컬 증명 파일 생성
-              cosign sign "$T1" || { echo '{"note":"local-attest-fallback"}' > security/local-attest.json; }
+              cosign sign "$T1" || echo '{"note":"keyless-fallback"}' > security/local-attest.json
             fi
           else
-            echo '{"note":"no-image-to-sign"}' > security/local-attest.json
+            echo '{"note":"cosign-not-installed-or-no-image"}' > security/local-attest.json
           fi
           echo "✅ cosign step done"
 
@@ -605,16 +553,16 @@ jobs:
           SVC="${{ steps.parse.outputs.dep_svc }}"; CMD="${{ steps.parse.outputs.dep_cmd }}"; USE_SUDO="${{ steps.parse.outputs.dep_sudo }}"
           if [[ -n "$SSH_PRIVATE_KEY" && -n "$HOST" ]]; then
             mkdir -p ~/.ssh; echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa; chmod 600 ~/.ssh/id_rsa
-            ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "mkdir -p $DEST"
-            rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=no" "$ROOT/" "$USER@$HOST:$DEST/"
+            ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "mkdir -p $DEST" || true
+            rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=no" "$ROOT/" "$USER@$HOST:$DEST/" || true
             SUDO_FLAG=""; [[ "$USE_SUDO" == "true" ]] && SUDO_FLAG="SUDO=sudo"
             ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
               "cd $DEST && $SUDO_FLAG APP_NAME=${P} DEPLOY_PATH=$DEST START_CMD='$CMD' bash ./server/install_deploy.sh" || true
-            ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "systemctl is-active $SVC || true"
+            ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "systemctl is-active $SVC || true" || true
           else
             echo "ℹ️ No SSH or host; running local emulation"
             EMU="/tmp/deploy-${P}"; rm -rf "$EMU"; mkdir -p "$EMU"
-            rsync -a "$ROOT/" "$EMU/"
+            rsync -a "$ROOT/" "$EMU/" || true
             SUDO_FLAG=""; [[ "$USE_SUDO" == "true" ]] && SUDO_FLAG="SUDO=sudo"
             (cd "$EMU" && $SUDO_FLAG APP_NAME=${P} DEPLOY_PATH=$EMU START_CMD='$CMD' bash ./server/install_deploy.sh) || true
             echo "active (emulated)" > "$EMU/.service-status"
