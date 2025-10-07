@@ -1,0 +1,254 @@
+name: "🧱 Apache Install + Configure + Start + Verify (ALL-ECHO, Ubuntu)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_name:
+        description: "가상호스트 ServerName (기본: localhost)"
+        required: true
+        default: "localhost"
+      index_title:
+        description: "index.html 타이틀"
+        required: true
+        default: "Apache ALL-ECHO"
+      index_message:
+        description: "index.html 본문 메시지"
+        required: true
+        default: "Apache is up on GitHub Actions runner 🚀"
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_apache
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
+
+jobs:
+  apache:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: ♻️ Prepare echo helpers & trap
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}"
+          HELPER="${LOG_DIR}/echo_helpers.sh"
+          cat > "${HELPER}" <<'SH'
+          set -Eeuo pipefail
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "${LOG_DIR}/run.log"; }
+          run_cmd(){
+            logf "▶ $*"
+            # shellcheck disable=SC2086
+            eval $* 2>&1 | tee -a "${LOG_DIR}/run.log"
+            local rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then echoe "DONE($rc): $*"; else warn "RC=$rc ← $*"; fi
+            return $rc
+          }
+          SH
+          # shellcheck disable=SC1090
+          source "${HELPER}"
+
+          cleanup(){
+            warn "CLEANUP: collecting diagnostics…"
+            {
+              echo "=== APACHE PROCESSES ==="
+              ps -eo pid,ppid,user,cmd | grep -E 'apache2|httpd' | grep -v grep || true
+              echo
+              echo "=== LISTEN PORTS (80/443) ==="
+              ss -lntp || true
+              echo
+              echo "=== APACHE CONFIGTEST ==="
+              sudo apache2ctl configtest || true
+              echo
+              echo "=== APACHE ERROR LOG (tail) ==="
+              sudo tail -n 200 /var/log/apache2/error.log || true
+            } | tee -a "${LOG_DIR}/diagnostics.txt"
+          }
+          trap 'rc=$?; [ $rc -eq 0 ] || cleanup; exit $rc' EXIT
+
+          echoe "Echo helpers ready at ${HELPER}"
+
+      - name: 🧩 System info (echo)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+          logf "Runner: $(uname -a)"
+          logf "User: $(id)"
+          logf "TZ: ${TZ}"
+          logf "Date: $(date -Iseconds)"
+          logf "Disk: $(df -h)"
+          logf "Mem: $(free -h || true)"
+
+      - name: 🧰 Install Apache (apt) + enable common modules
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+          run_cmd sudo apt-get update -y
+          run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apache2
+          # 모듈 활성화 (필요시 확장 가능)
+          run_cmd sudo a2enmod rewrite
+          run_cmd sudo a2enmod headers
+          run_cmd sudo a2enmod mime
+          run_cmd sudo a2enmod env
+          run_cmd sudo a2enmod dir
+          run_cmd sudo a2enmod deflate
+
+      - name: 🏗️ Configure vhost + document root
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+
+          SITE_NAME="${{ inputs.site_name }}"
+          DOCROOT="/var/www/html"
+          VHOST="/etc/apache2/sites-available/000-default.conf"
+
+          run_cmd sudo mkdir -p "${DOCROOT}"
+          run_cmd sudo chown -R $USER:$USER "${DOCROOT}"
+
+          # 기본 사이트 설정 강화 (ServerName, AllowOverride, Headers)
+          TMP_CONF="$(mktemp)"
+          cat > "${TMP_CONF}" <<CONF
+          <VirtualHost *:80>
+              ServerName ${SITE_NAME}
+              ServerAdmin webmaster@localhost
+              DocumentRoot ${DOCROOT}
+
+              <Directory ${DOCROOT}>
+                  Options Indexes FollowSymLinks
+                  AllowOverride All
+                  Require all granted
+              </Directory>
+
+              # 보안/편의 헤더 (필요시 조정)
+              Header always set X-Content-Type-Options "nosniff"
+              Header always set X-Frame-Options "SAMEORIGIN"
+              Header always set X-XSS-Protection "1; mode=block"
+
+              ErrorLog \${APACHE_LOG_DIR}/error.log
+              CustomLog \${APACHE_LOG_DIR}/access.log combined
+          </VirtualHost>
+          CONF
+
+          run_cmd sudo cp "${TMP_CONF}" "${VHOST}"
+          run_cmd sudo sed -n '1,200p' "${VHOST}"
+
+          # ServerName 전역 지정(경고 방지)
+          SRV="/etc/apache2/conf-available/servername.conf"
+          echo "ServerName ${SITE_NAME}" | sudo tee "${SRV}" >/dev/null
+          run_cmd sudo a2enconf servername
+
+      - name: 🧾 Write index.html (echo content)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+          TITLE="${{ inputs.index_title }}"
+          MSG="${{ inputs.index_message }}"
+          INDEX="/var/www/html/index.html"
+          cat > /tmp/index.html <<HTML
+          <!doctype html>
+          <html lang="ko">
+          <head>
+            <meta charset="utf-8">
+            <title>${TITLE}</title>
+          </head>
+          <body>
+            <h1>${TITLE}</h1>
+            <p>${MSG}</p>
+            <hr/>
+            <pre>Host: $(hostname) | Date: $(date -Iseconds)</pre>
+          </body>
+          </html>
+          HTML
+          run_cmd sudo mv /tmp/index.html "${INDEX}"
+          run_cmd sudo ls -al /var/www/html
+
+      - name: ✅ apache2 configtest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+          run_cmd sudo apache2ctl configtest
+
+      - name: 🚀 Start Apache (service → fallback apache2ctl)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+
+          # systemd가 없는 환경 고려: service 실패 시 apache2ctl -k start 백그라운드
+          if run_cmd sudo service apache2 start; then
+            echoe "service apache2 start OK"
+          else
+            warn "service start failed → fallback to apache2ctl"
+            # PID 파일 디렉터리 보장
+            sudo mkdir -p /var/run/apache2
+            # 중복 기동 방지
+            pgrep -fa apache2 && warn "apache2 already running" || true
+            run_cmd sudo apache2ctl -k start
+          fi
+
+          sleep 2
+          ps -eo pid,ppid,user,cmd | grep -E 'apache2|httpd' | grep -v grep | tee -a "${LOG_DIR}/process.txt" || true
+          ss -lntp | tee -a "${LOG_DIR}/ports.txt" || true
+
+      - name: 🔎 Verify HTTP 200 on localhost
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+
+          # 로컬 접근 검증(여러 엔드포인트 시도)
+          for URL in "http://127.0.0.1" "http://localhost"; do
+            if curl -fsS -o "${LOG_DIR}/curl_$(echo "$URL" | sed 's#[:/\.]#_#g').html" -D "${LOG_DIR}/curl_$(echo "$URL" | sed 's#[:/\.]#_#g').hdr" "$URL"; then
+              echoe "CURL OK → $URL"
+              grep -iE '^HTTP/' "${LOG_DIR}/curl_$(echo "$URL" | sed 's#[:/\.]#_#g').hdr" || true
+              break
+            else
+              warn "CURL FAIL → $URL"
+            fi
+          done
+
+          # 간단 본문 검사
+          if ! grep -q "${{ inputs.index_title }}" "${LOG_DIR}"/curl_*_html 2>/dev/null; then
+            fail "Index title not found in response"
+            exit 1
+          fi
+
+      - name: 📦 Collect configs & logs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "${LOG_DIR}/echo_helpers.sh"
+          OUTDIR="apache-collect"
+          run_cmd mkdir -p "${OUTDIR}/etc-apache2" "${OUTDIR}/var-log-apache2" "${OUTDIR}/echo"
+          run_cmd sudo cp -a /etc/apache2/* "${OUTDIR}/etc-apache2/" || true
+          run_cmd sudo cp -a /var/log/apache2/* "${OUTDIR}/var-log-apache2/" || true
+          run_cmd cp -a "${LOG_DIR}"/* "${OUTDIR}/echo/" || true
+          tar -czf apache-artifacts.tgz -C "${OUTDIR}" .
+          echo "Created: $(pwd)/apache-artifacts.tgz"
+
+      - name: ⬆️ Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apache-artifacts
+          path: |
+            apache-artifacts.tgz
+            ${{ env.LOG_DIR }}/run.log
+            ${{
+              env.LOG_DIR
+            }}/diagnostics.txt
+          if-no-files-found: warn
