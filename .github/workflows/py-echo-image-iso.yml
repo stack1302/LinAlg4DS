@@ -65,10 +65,10 @@ env:
   LC_ALL: C.UTF-8
   LANG: C.UTF-8
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ⓵ QA 매트릭스(3.9~3.12) : 린트/타입/커버리지 -> 리포트/아티팩트
-# ──────────────────────────────────────────────────────────────────────────────
 jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # ⓵ QA 매트릭스(3.9~3.12) : 린트/타입/커버리지 -> 리포트/아티팩트
+  # ────────────────────────────────────────────────────────────────────────────
   qa-matrix:
     strategy:
       fail-fast: false
@@ -100,7 +100,6 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
-      # ⑩ wheelhouse 캐시 (기본 퀵 설치 세트: build/pytest/mypy/ruff)
       - name: Prep wheelhouse + cache
         shell: bash
         run: |
@@ -109,6 +108,7 @@ jobs:
           printf "build\npytest\nmypy\nruff\n" > .req.txt
           pip wheel -w .pip-wheelhouse -r .req.txt || true
           echo "✅ wheelhouse prebuilt (best-effort)"
+
       - name: Cache wheelhouse
         uses: actions/cache@v4
         with:
@@ -140,23 +140,20 @@ jobs:
           PKG_DIR="$ROOT/src/${P}"
           TEST_DIR="$ROOT/tests"
           mkdir -p "$PKG_DIR" "$TEST_DIR"
-          # __init__.py
           cat > "$PKG_DIR/__init__.py" <<PY
           __all__ = ["hello"]
           __version__ = "${V}"
           def hello(name: str = "World") -> str:
               return f"Hello, {name}!"
           PY
-          # test
-          cat > "$TEST_DIR/test_hello.py" <<'PY'
+          cat > "$TEST_DIR/test_hello.py" <<PY
           import importlib, os, sys
-          # 패키지 루트 추가 (src 레이아웃)
           here = os.path.dirname(__file__)
           root = os.path.abspath(os.path.join(here, "..", "src"))
           if root not in sys.path: sys.path.insert(0, root)
-          mypkg = importlib.import_module("mypkg")
+          m = importlib.import_module("${P}")
           def test_hello():
-              assert mypkg.hello("Echo") == "Hello, Echo!"
+              assert m.hello("Echo") == "Hello, Echo!"
           PY
           echo "✅ QA skeleton ready at $ROOT"
 
@@ -177,7 +174,7 @@ jobs:
           mkdir -p ../test-results
           pytest -q --junitxml=../test-results/junit-${{ matrix.python }}.xml \
                  --cov="${P}" --cov-report=xml:../test-results/coverage-${{ matrix.python }}.xml
-          echo "✅ pytest ok (${ { matrix.python } })"
+          echo "✅ pytest ok (${{ matrix.python }})"
 
       - name: Upload QA artifacts
         uses: actions/upload-artifact@v4
@@ -199,7 +196,7 @@ jobs:
           echo "✅ QA cleanup done"
 
   # ────────────────────────────────────────────────────────────────────────────
-  # ⓶ 메인 파이프라인: 기존 기능 + 1~10,12~14(11 제외) 모두 에코 적용
+  # ⓶ 메인 파이프라인
   # ────────────────────────────────────────────────────────────────────────────
   all-in-one:
     needs: [qa-matrix]
@@ -252,15 +249,15 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          MJ='${{ inputs.metadata_json }}'
+          MJ='${{ github.event.inputs.metadata_json }}'
           A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
           A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
-          IMG='${{ inputs.image_ref }}'
+          IMG='${{ github.event.inputs.image_ref }}'
           if [[ "$IMG" == *:* ]]; then IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"; else IMG_NAME="$IMG"; IMG_TAG="latest"; fi
-          CP='${{ inputs.copy_plan_json }}'
+          CP='${{ github.event.inputs.copy_plan_json }}'
           printf '%s' "$CP" | jq . >/dev/null
-          ADV='${{ inputs.advanced_json }}'
+          ADV='${{ github.event.inputs.advanced_json }}'
           printf '%s' "$ADV" | jq . >/dev/null
           PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"')
           GHCR_ENABLE=$(printf '%s' "$ADV" | jq -r '.ghcr.enable // false')
@@ -320,9 +317,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           err(){ echo "❌ $*"; exit 1; }
-          [[ "${{ inputs.package_name }}" =~ ^[a-z0-9_]+$ ]] || err "package_name: 소문자/숫자/_ 만 허용"
-          [[ "${{ inputs.package_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || err "package_version: SemVer 필요"
-          [[ "${{ inputs.image_ref }}" =~ ^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]] || err "image_ref 형식 오류"
+          [[ "${{ github.event.inputs.package_name }}" =~ ^[a-z0-9_]+$ ]] || err "package_name: 소문자/숫자/_ 만 허용"
+          [[ "${{ github.event.inputs.package_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || err "package_version: SemVer 필요"
+          [[ "${{ github.event.inputs.image_ref }}" =~ ^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]] || err "image_ref 형식 오류"
           if [[ "${{ steps.parse.outputs.rel_enable }}" == "true" ]]; then
             [[ "${{ steps.parse.outputs.rel_tag }}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || err "rel_tag: vX.Y.Z 필요"
           fi
@@ -333,7 +330,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # ⑩ pip 캐시 + wheelhouse(재사용)
       - name: Pip cache
         uses: actions/cache@v4
         with:
@@ -354,8 +350,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          V="${{ inputs.package_version }}"
+          P="${{ github.event.inputs.package_name }}"
+          V="${{ github.event.inputs.package_version }}"
           A="${{ steps.parse.outputs.author_name }}"
           E="${{ steps.parse.outputs.author_email }}"
           L="${{ steps.parse.outputs.license_name }}"
@@ -364,7 +360,6 @@ jobs:
           TEST_DIR="$ROOT/tests"
           DOC_DIR="$ROOT/docs"
           mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
-          # pyproject
           cat > "$ROOT/pyproject.toml" <<PYT
           [build-system]
           requires = ["setuptools>=68", "wheel"]
@@ -384,38 +379,35 @@ jobs:
           [tool.setuptools.packages.find]
           where = ["src"]
           PYT
-          # README
           cat > "$ROOT/README.md" <<'MD'
           # Auto Generated Python Package
           - EchoOps generated.
           - Includes Dockerfile, ISO artifacts, SBOM, QA, caches.
           MD
-          # package impl
           cat > "$PKG_DIR/__init__.py" <<PY
           __all__ = ["hello"]
           __version__ = "${V}"
           def hello(name: str = "World") -> str:
               return f"Hello, {name}!"
           PY
-          # tests — PYTHONPATH 주입으로 import 보장
-          cat > "$TEST_DIR/test_hello.py" <<'PY'
+          # 동적 패키지명 주입 테스트
+          cat > "$TEST_DIR/test_hello.py" <<PY
           import importlib, os, sys
           here = os.path.dirname(__file__)
           root = os.path.abspath(os.path.join(here, "..", "src"))
           if root not in sys.path: sys.path.insert(0, root)
-          m = importlib.import_module("mypkg")
+          m = importlib.import_module("${P}")
           def test_hello():
               assert m.hello("Echo") == "Hello, Echo!"
           PY
-          # Dockerfile
           cat > "$ROOT/Dockerfile" <<'DOCKER'
           FROM python:3.11-slim
           WORKDIR /app
           COPY . /app
           RUN pip install --no-cache-dir .
-          CMD ["python","-c","import mypkg; print(mypkg.hello('Docker'))"]
+          ENV PKG="${PKG:-mypkg}"
+          CMD ["bash","-lc","python - <<'PY'\nimport os,importlib\nP=os.environ.get('PKG','mypkg')\nm=importlib.import_module(P)\nprint(m.hello('Docker'))\nPY"]
           DOCKER
-          # Server artifacts
           mkdir -p "$ROOT/server"
           cat > "$ROOT/server/install_deploy.sh" <<'SH'
           #!/usr/bin/env bash
@@ -460,9 +452,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
+          P="${{ github.event.inputs.package_name }}"
           cd "workspace/${P}"
-          # src 레이아웃 경로를 PYTHONPATH로 보강
           export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
           echo "ECHO PYTHONPATH=$PYTHONPATH"
           mkdir -p ../test-results
@@ -473,7 +464,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
+          P="${{ github.event.inputs.package_name }}"
           ruff check "workspace/${P}"
           mypy "workspace/${P}/src" || echo "⚠️ mypy warnings (non-fatal)"
 
@@ -483,7 +474,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           MODE="${{ steps.parse.outputs.pkg_mode }}"
-          P="${{ inputs.package_name }}"
+          P="${{ github.event.inputs.package_name }}"
           ROOT="workspace/${P}"
           case "$MODE" in
             poetry)
@@ -515,12 +506,12 @@ jobs:
           esac
           ls -al "$ROOT/dist" | tee -a "$LOG_DIR/dist.txt"
 
-      - name: Massive directory generation (+ echo files)
+      - name: Massive directory generation (+ echo files, except 11)
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          COUNT="${{ inputs.dirs_count }}"
+          P="${{ github.event.inputs.package_name }}"
+          COUNT="${{ github.event.inputs.dirs_count }}"
           BASE="workspace/${P}/echo_mass"
           mkdir -p "$BASE"
           cat > "$BASE/perm_apply.sh" <<'SH'
@@ -537,9 +528,10 @@ jobs:
           echo "done: $(date)" | tee -a "$OUT"
           SH
           chmod +x "$BASE/perm_apply.sh"
-          mapfile -t DLIST < <(seq -w 1 "$COUNT" | xargs -I{} echo "$BASE/dir_{}")
+          # 11번 제외
+          mapfile -t DLIST < <(seq -w 1 "$COUNT" | awk '$1 != "11"{printf "%s\n",$0}' | xargs -I{} echo "$BASE/dir_{}")
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
-          logf "Generated $COUNT directories with permission echoes."
+          echo "✅ Generated $((${#DLIST[@]})) directories with permission echoes (11 excluded)."
 
       - name: Copy plan dry-run summary
         shell: bash
@@ -555,9 +547,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          ROOT="workspace/${P}"
-          # samples 폴더가 없으면 간이 더미 생성(비필수 플랜 용)
           if ! [[ -d samples ]]; then
             mkdir -p samples
             echo "dummy" > samples/README.txt
@@ -569,17 +558,17 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
+          P="${{ github.event.inputs.package_name }}"
           ROOT="workspace/${P}"
           PLAN_FILE="copy_plan.json"
           DEST_BASE="$ROOT"
-          [[ -f "$PLAN_FILE" ]] || { warn "copy_plan.json not found, skipping"; exit 0; }
+          [[ -f "$PLAN_FILE" ]] || { echo "⚠️ copy_plan.json not found, skipping"; exit 0; }
           mkdir -p "$ROOT/extra_manifests"
           MANIFEST_CSV="$ROOT/extra_manifests/manifest-$(date +%Y%m%d%H%M%S).csv"
           echo "src,resolved_src,dest_rel,relpath,bytes,sha256" > "$MANIFEST_CSV"
           nf(){ if command -v numfmt >/dev/null 2>&1; then numfmt --to=iec "$1"; else echo "$1 bytes"; fi; }
           COUNT_PLANS=$(jq -r '.plans | length' "$PLAN_FILE")
-          logf "Copy plans: $COUNT_PLANS"
+          echo "Copy plans: $COUNT_PLANS"
           for i in $(seq 0 $((COUNT_PLANS-1))); do
             SRC=$(jq -r ".plans[$i].src" "$PLAN_FILE")
             DEST_REL=$(jq -r ".plans[$i].dest_rel // \"extra\"" "$PLAN_FILE")
@@ -598,10 +587,9 @@ jobs:
             fi
             if [[ -z "$RESOLVED_SRC" ]]; then
               if [[ "$REQUIRED" == "true" ]]; then
-                fail "Plan[$i] required=true but src not found: $SRC"
-                exit 1
+                echo "❌ Plan[$i] required=true but src not found: $SRC"; exit 1
               else
-                warn "Plan[$i] SRC not found: $SRC — skipping"
+                echo "⚠️ Plan[$i] SRC not found: $SRC — skipping"
                 continue
               fi
             fi
@@ -616,7 +604,7 @@ jobs:
             TOTAL_BYTES=$(du -sb "$TMP_STAGE" | awk '{print $1}')
             LIMIT_BYTES=$((MAX_MB * 1024 * 1024))
             if (( TOTAL_BYTES > LIMIT_BYTES )); then
-              warn "Plan[$i] size exceed: $(nf "$TOTAL_BYTES") > $(nf "$LIMIT_BYTES")"
+              echo "⚠️ Plan[$i] size exceed: $(nf "$TOTAL_BYTES") > $(nf "$LIMIT_BYTES")"
               mkdir -p "$DEST_DIR"; REMAIN=$LIMIT_BYTES
               mapfile -t FILES < <(find "$TMP_STAGE" -type f -printf '%T@ %p\n' | sort -nr | awk '{sub($1 FS,""); print}')
               for f in "${FILES[@]}"; do
@@ -639,22 +627,24 @@ jobs:
             fi
             rm -rf "$TMP_STAGE"
             echo "include_in_iso=$([[ "$INCLUDE_ISO" == "true" ]] && echo true || echo false)" > "$DEST_DIR/.iso.include"
-            logf "Plan[$i] done → $DEST_DIR"
+            echo "Plan[$i] done → $DEST_DIR"
           done
-          logf "✅ Manifest generated: $MANIFEST_CSV"
+          echo "✅ Manifest generated: $MANIFEST_CSV"
 
       - name: Optional Docker build + save (single-arch local)
-        if: ${{ inputs.build_docker == true }}
+        if: ${{ github.event.inputs.build_docker == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
+          P="${{ github.event.inputs.package_name }}"
           ROOT="workspace/${P}"
-          IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
-          logf "Building Docker image: $IMG"
+          IMG_INPUT='${{ github.event.inputs.image_ref }}'
+          if [[ "$IMG_INPUT" == *:* ]]; then IMG_NAME="${IMG_INPUT%%:*}"; IMG_TAG="${IMG_INPUT##*:}"; else IMG_NAME="$IMG_INPUT"; IMG_TAG="latest"; fi
+          IMG="${IMG_NAME}:${IMG_TAG}"
+          echo "Building Docker image: $IMG"
           docker build -t "$IMG" "$ROOT"
           mkdir -p artifacts
-          docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
+          docker save "$IMG" | gzip -c > "artifacts/${IMG_NAME##*/}-${IMG_TAG}.tar.gz"
           echo "✅ image built & saved"
 
       - name: Install Syft & Trivy
@@ -669,30 +659,32 @@ jobs:
         run: |
           set -Eeuo pipefail
           mkdir -p security
-          syft scan dir:workspace/${{ inputs.package_name }} -o spdx-json > security/pkg-sbom.spdx.json || syft packages dir:workspace/${{ inputs.package_name }} -o spdx-json > security/pkg-sbom.spdx.json
-          if [[ "${{ inputs.build_docker }}" == "true" ]]; then
-            syft ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json > security/image-sbom.spdx.json || true
+          syft scan dir:workspace/${{ github.event.inputs.package_name }} -o spdx-json > security/pkg-sbom.spdx.json || syft packages dir:workspace/${{ github.event.inputs.package_name }} -o spdx-json > security/pkg-sbom.spdx.json
+          IMG_INPUT='${{ github.event.inputs.image_ref }}'
+          if [[ "${{ github.event.inputs.build_docker }}" == "true" ]]; then
+            if [[ "$IMG_INPUT" == *:* ]]; then IMG_NAME="${IMG_INPUT%%:*}"; IMG_TAG="${IMG_INPUT##*:}"; else IMG_NAME="$IMG_INPUT"; IMG_TAG="latest"; fi
+            syft "${IMG_NAME}:${IMG_TAG}" -o spdx-json > security/image-sbom.spdx.json || true
           fi
 
       - name: Vulnerability scan (Trivy; fail on HIGH+)
-        if: ${{ inputs.build_docker == true }}
+        if: ${{ github.event.inputs.build_docker == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          trivy image --no-progress --severity HIGH,CRITICAL --exit-code 1 \
-            ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} || {
-              warn "HIGH/CRITICAL found"; exit 1; }
+          IMG_INPUT='${{ github.event.inputs.image_ref }}'
+          if [[ "$IMG_INPUT" == *:* ]]; then IMG_NAME="${IMG_INPUT%%:*}"; IMG_TAG="${IMG_INPUT##*:}"; else IMG_NAME="$IMG_INPUT"; IMG_TAG="latest"; fi
+          trivy image --no-progress --severity HIGH,CRITICAL --exit-code 1 "${IMG_NAME}:${IMG_TAG}" || { echo "⚠️ HIGH/CRITICAL found"; exit 1; }
 
       - name: Prepare ISO staging & info injection
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
+          P="${{ github.event.inputs.package_name }}"
           ROOT="workspace/${P}"
           STAGE="iso_stage/${P}"
           mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs" "$STAGE/extra" "$STAGE/server"
           echo "${{ github.repository }},${{ github.run_id }},${{ github.ref_name }}" > "$STAGE/build_info.csv"
-          printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
+          printf '%s' '${{ github.event.inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
           cp -a "$ROOT/dist" "$STAGE/pkg/" || true
           cp -a .github/echo_logs "$STAGE/docs/" || true
           cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || echo "⚠️ no perm_apply.sh"
@@ -713,13 +705,13 @@ jobs:
           - extra/* (copy-plan selected)
           - server/*
           TXT
-          logf "ISO staging prepared at $STAGE"
+          echo "ISO staging prepared at $STAGE"
 
       - name: Add ISO integrity bundle (SHA256 + SBOM copy)
         shell: bash
         run: |
           set -Eeuo pipefail
-          STAGE="iso_stage/${{ inputs.package_name }}"
+          STAGE="iso_stage/${{ github.event.inputs.package_name }}"
           mkdir -p "$STAGE/docs"
           (cd "$STAGE" && find . -type f -print0 | xargs -0 sha256sum) > "$STAGE/docs/ISO_FILES.sha256"
           cp -a security/*.json "$STAGE/docs/" 2>/dev/null || true
@@ -728,33 +720,30 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          ISO_NAME="${{ inputs.package_name }}-${{ inputs.package_version }}.iso"
-          LABEL="${{ inputs.iso_label }}"
-          STAGE="iso_stage/${{ inputs.package_name }}"
+          ISO_NAME="${{ github.event.inputs.package_name }}-${{ github.event.inputs.package_version }}.iso"
+          LABEL="${{ github.event.inputs.iso_label }}"
+          STAGE="iso_stage/${{ github.event.inputs.package_name }}"
           mkdir -p artifacts
           if command -v xorriso >/dev/null 2>&1; then
-            logf "Using xorriso"
             xorriso -as mkisofs -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
           else
-            logf "Using genisoimage"
             genisoimage -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
           fi
           (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
           echo "✅ ISO built"
 
-      # ③ Buildx + 캐시 + GHCR push(옵션, 멀티아키)
       - name: Set up QEMU
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx (docker-container driver)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
 
       - name: Buildx cache
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
@@ -765,12 +754,12 @@ jobs:
 
       - name: Compute GHCR semver tags
         id: ghcrtags
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.ghcr_enable == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           REPO="${{ steps.parse.outputs.ghcr_repo }}"
-          V="${{ inputs.package_version }}"
+          V="${{ github.event.inputs.package_version }}"
           RUN="${{ github.run_id }}"
           MAJOR="${V%%.*}"
           MINOR="${V%.*}"
@@ -779,7 +768,7 @@ jobs:
           echo "Computed tags: ${TAGS}"
 
       - name: Login to GHCR
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' && github.token != '' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -787,20 +776,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build multi-arch and push (GHCR)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/build-push-action@v6
         with:
-          context: workspace/${{ inputs.package_name }}
-          file: workspace/${{ inputs.package_name }}/Dockerfile
+          context: workspace/${{ github.event.inputs.package_name }}
+          file: workspace/${{ github.event.inputs.package_name }}/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.ghcrtags.outputs.tags }}
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
 
-      # ④ Cosign 키리스 서명 + ⑨ ISO checksum 서명(선택)
       - name: Cosign keyless sign (GH OIDC)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.ghcr_enable == 'true' }}
         shell: bash
         env:
           COSIGN_EXPERIMENTAL: "1"
@@ -818,11 +806,11 @@ jobs:
           echo "✅ cosign keyless done"
 
       - name: Sign ISO checksum (optional key-based)
-        if: ${{ secrets.COSIGN_KEY != '' }}
-        shell: bash
         env:
           COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        if: ${{ env.COSIGN_KEY != '' }}
+        shell: bash
         run: |
           set -Eeuo pipefail
           curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin
@@ -830,30 +818,29 @@ jobs:
           cosign sign-blob --key env://COSIGN_KEY artifacts/ISO_SUMS.sha256 > artifacts/ISO_SUMS.sig
           echo "✅ ISO checksum signed"
 
-      # Docker Hub(선택)
       - name: Push image to Docker Hub (optional)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.dh_enable == 'true' }}
+        if: ${{ github.event.inputs.build_docker == 'true' && steps.parse.outputs.dh_enable == 'true' }}
         shell: bash
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
-          SRC_IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
+          SRC_IMG_INPUT='${{ github.event.inputs.image_ref }}'
+          if [[ "$SRC_IMG_INPUT" == *:* ]]; then SRC_IMG_NAME="${SRC_IMG_INPUT%%:*}"; SRC_IMG_TAG="${SRC_IMG_INPUT##*:}"; else SRC_IMG_NAME="$SRC_IMG_INPUT"; SRC_IMG_TAG="latest"; fi
           DEST_REPO="${{ steps.parse.outputs.dh_repo }}"
           DEST_TAG="${{ steps.parse.outputs.dh_tag || steps.parse.outputs.image_tag }}"
           if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" || -z "$DEST_REPO" ]]; then
             echo "⚠️ DockerHub creds/repo missing; exporting tar fallback"
             mkdir -p artifacts
-            docker save "$SRC_IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
+            docker save "${SRC_IMG_NAME}:${SRC_IMG_TAG}" | gzip -c > "artifacts/${SRC_IMG_NAME##*/}-${SRC_IMG_TAG}.tar.gz"
             exit 0
           fi
           echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-          docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
+          docker tag "${SRC_IMG_NAME}:${SRC_IMG_TAG}" "$DEST_REPO:$DEST_TAG"
           docker push "$DEST_REPO:$DEST_TAG"
           echo "✅ pushed to Docker Hub: $DEST_REPO:$DEST_TAG"
 
-      # ⑥ Secret/Licenses
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
         with:
@@ -868,7 +855,6 @@ jobs:
           pip-licenses --format=json --with-authors --with-urls > security/pip-licenses.json
           echo "✅ pip-licenses generated"
 
-      # ⑦ Release Drafter (릴리즈 노트 자동 – rel_enable와 무관하게 초안)
       - name: Ensure release drafter config
         shell: bash
         run: |
@@ -893,7 +879,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # (기존) 선택적 GitHub Release 생성
       - name: Generate changelog (for release)
         if: ${{ steps.parse.outputs.rel_enable == 'true' }}
         shell: bash
@@ -922,7 +907,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # (옵션) 서버 배포 + ⑧ 헬스체크/롤백 예시
       - name: Deploy to server via SSH (optional)
         if: ${{ steps.parse.outputs.dep_enable == 'true' }}
         shell: bash
@@ -930,7 +914,7 @@ jobs:
           SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
+          P="${{ github.event.inputs.package_name }}"
           ROOT="workspace/${P}"
           HOST="${{ steps.parse.outputs.dep_host }}"
           USER="${{ steps.parse.outputs.dep_user }}"
@@ -939,7 +923,7 @@ jobs:
           SVC="${{ steps.parse.outputs.dep_svc }}"
           CMD="${{ steps.parse.outputs.dep_cmd }}"
           USE_SUDO="${{ steps.parse.outputs.dep_sudo }}"
-          [[ -z "$SSH_PRIVATE_KEY" ]] && { warn "SERVER_SSH_KEY secret missing"; exit 0; }
+          [[ -z "$SSH_PRIVATE_KEY" ]] && { echo "⚠️ SERVER_SSH_KEY secret missing"; exit 0; }
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
@@ -963,7 +947,6 @@ jobs:
             "systemctl is-active $SVC || (echo '❌ unhealthy, try restart'; sudo systemctl restart $SVC; sleep 2; systemctl is-active $SVC || (echo '❌ still unhealthy'; exit 1))"
           echo "✅ service healthy"
 
-      # ⑫ 재시도 래퍼 샘플 (네트워크 변수 큰 스텝에 적용 예시)
       - name: Retry wrapper example (noop)
         shell: bash
         run: |
@@ -973,7 +956,6 @@ jobs:
             n=$((n+1)); echo "retry $n/3"; sleep 5
           done
 
-      # ⑭ Dependabot 설정 파일 생성
       - name: Write dependabot.yml
         shell: bash
         run: |
@@ -1005,7 +987,6 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      # ⑬ 디스크 정리
       - name: Cleanup docker/apt cache
         if: ${{ always() }}
         shell: bash
