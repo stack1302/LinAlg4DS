@@ -1,10 +1,10 @@
-name: "🧱 Apache Install + Configure + Start + Verify + Copy-to-Workflows (ALL-ECHO, v3)"
+name: "🧱 Apache Install + Verify + Fixed Copy-to-.github/workflows + Upgrade (ALL-ECHO v4)"
 
 on:
   workflow_dispatch:
     inputs:
       site_name:
-        description: "가상호스트 ServerName (기본: localhost)"
+        description: "가상호스트 ServerName"
         required: true
         default: "localhost"
       index_title:
@@ -15,23 +15,42 @@ on:
         description: "index.html 본문 메시지"
         required: true
         default: "Apache is up on GitHub Actions runner 🚀"
+      # ---- 파일 복사 관련 (경로 고정: .github/workflows) ----
       copy_sources:
-        description: "복사할 파일/글롭(쉼표/공백/줄바꿈 구분). 예: workflows/*.yml, extra.yml"
+        description: "복사할 파일/글롭(쉼표·공백·줄바꿈 구분) — 대상 경로는 고정: .github/workflows/"
         required: false
         default: ""
-      copy_dest_subdir:
-        description: ".github/workflows 하위 폴더명 (예: apache-added)"
-        required: false
-        default: "apache-added"
+      overwrite_mode:
+        description: "기존 파일 있을 때 동작"
+        type: choice
+        options: ["backup", "overwrite", "skip"]
+        required: true
+        default: "backup"
       create_pr:
-        description: "복사한 파일을 PR로 올릴까요?"
+        description: "복사/정규화 결과를 PR로 올리기"
         type: boolean
         required: true
         default: true
       pr_title:
         description: "PR 제목"
         required: false
-        default: "chore: add copied workflow files (auto)"
+        default: "chore: copy workflows + normalize actions (auto)"
+      # ---- 업그레이드 옵션 ----
+      upgrade_os:
+        description: "러너 OS 패키지 업그레이드(apt-get upgrade 등)"
+        type: boolean
+        required: true
+        default: true
+      upgrade_apache:
+        description: "apache2 패키지만 재설치/업그레이드 시도(--only-upgrade)"
+        type: boolean
+        required: true
+        default: true
+      normalize_actions:
+        description: "복사한 워크플로우 파일의 주요 액션 버전 정규화(v4/v6)"
+        type: boolean
+        required: true
+        default: true
 
 permissions:
   contents: write
@@ -47,7 +66,7 @@ env:
 jobs:
   apache:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
@@ -73,118 +92,248 @@ jobs:
           }
           SH
           source "${HELPER}"
-
           cleanup(){
             warn "CLEANUP: collecting diagnostics…"
             {
               echo "=== APACHE PROCESSES ==="
               ps -eo pid,ppid,user,cmd | grep -E 'apache2|httpd' | grep -v grep || true
-              echo
-              echo "=== LISTEN PORTS (80/443) ==="
-              ss -lntp || true
-              echo
-              echo "=== ports.conf ==="
-              sudo sed -n '1,160p' /etc/apache2/ports.conf 2>/dev/null || true
-              echo
-              echo "=== sites-available/000-default.conf ==="
-              sudo sed -n '1,200p' /etc/apache2/sites-available/000-default.conf 2>/dev/null || true
-              echo
-              echo "=== apache2ctl -S ==="
-              sudo apache2ctl -S || true
-              echo
-              echo "=== apache2ctl -M ==="
-              sudo apache2ctl -M || true
-              echo
-              echo "=== APACHE ERROR LOG (tail) ==="
-              sudo tail -n 200 /var/log/apache2/error.log || true
-              echo
-              echo "=== SAVED HEADERS ==="
-              sed -n '1,200p' "${LOG_DIR}"/curl_*.hdr 2>/dev/null || true
-              echo
-              echo "=== SAVED HTML (first 80 lines) ==="
-              for f in "${LOG_DIR}"/curl_*.html; do
-                [ -f "$f" ] || continue
-                echo "--- $f ---"
-                sed -n '1,80p' "$f"
-              done
+              echo; echo "=== LISTEN PORTS ==="; ss -lntp || true
+              echo; echo "=== ports.conf ==="; sudo sed -n '1,160p' /etc/apache2/ports.conf 2>/dev/null || true
+              echo; echo "=== 000-default.conf ==="; sudo sed -n '1,200p' /etc/apache2/sites-available/000-default.conf 2>/dev/null || true
+              echo; echo "=== apache2ctl -S ==="; sudo apache2ctl -S || true
+              echo; echo "=== apache2ctl -M ==="; sudo apache2ctl -M || true
+              echo; echo "=== ERROR LOG (tail) ==="; sudo tail -n 200 /var/log/apache2/error.log || true
+              echo; echo "=== COPIED FILES MAP ==="; sed -n '1,200p' "${LOG_DIR}/copy_map.txt" 2>/dev/null || true
             } | tee -a "${LOG_DIR}/diagnostics.txt"
           }
           trap 'rc=$?; [ $rc -eq 0 ] || cleanup; exit $rc' EXIT
           echoe "Echo helpers ready at ${HELPER}"
 
-      # (중략) — 아파치 설치/설정/기동/검증 스텝은 이전 v2와 동일
-      # == 설치/설정/검증 스텝은 그대로 유지하세요 ==
-      # 필요 시 제가 드린 Ultra-Robust v2 본문을 여기에 그대로 둡니다.
-
-      - name: 📦 Collect configs & logs
+      - name: 🧩 System info (echo)
         shell: bash
         run: |
           set -Eeuo pipefail
           source "${LOG_DIR}/echo_helpers.sh"
-          OUTDIR="apache-collect"
-          run_cmd mkdir -p "${OUTDIR}/etc-apache2" "${OUTDIR}/var-log-apache2" "${OUTDIR}/echo"
-          run_cmd sudo cp -a /etc/apache2/* "${OUTDIR}/etc-apache2/" || true
-          run_cmd sudo cp -a /var/log/apache2/* "${OUTDIR}/var-log-apache2/" || true
-          run_cmd cp -a "${LOG_DIR}"/* "${OUTDIR}/echo/" || true
-          tar -czf apache-artifacts.tgz -C "${OUTDIR}" .
-          echo "Created: $(pwd)/apache-artifacts.tgz"
+          logf "Runner: $(uname -a)"
+          logf "User: $(id)"
+          logf "Date: $(date -Iseconds)"
+          logf "Ports(before): $(ss -lntp || true)"
 
-      - name: 🗂️ Copy files into .github/workflows (by pattern)
+      - name: 🧰 Install Apache + modules
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          run_cmd sudo apt-get update -y
+          run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apache2
+          run_cmd apache2 -v
+          for m in rewrite headers mime env dir deflate; do run_cmd sudo a2enmod "$m"; done
+
+      - name: 🛠️ Optional OS/Apache upgrade
+        if: ${{ inputs.upgrade_os || inputs.upgrade_apache }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          if [ "${{ inputs.upgrade_os }}" = "true" ]; then
+            run_cmd sudo apt-get update -y
+            run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+            run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge
+            run_cmd sudo apt-get -y clean
+          fi
+          if [ "${{ inputs.upgrade_apache }}" = "true" ]; then
+            run_cmd sudo apt-get update -y
+            run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade apache2
+          fi
+
+      - name: 🏗️ Configure ports/env/vhost
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          SITE="${{ inputs.site_name }}"
+          DOCROOT="/var/www/html"
+          VHOST="/etc/apache2/sites-available/000-default.conf"
+          PORTS="/etc/apache2/ports.conf"
+
+          run_cmd sudo install -d -m0755 /etc/apache2/conf-available
+          run_cmd sudo mkdir -p /var/run/apache2 /var/lock/apache2 /var/log/apache2
+          run_cmd sudo chown -R www-data:www-data /var/log/apache2 || true
+
+          cat <<'ENV' | sudo tee /etc/apache2/envvars >/dev/null
+          export APACHE_RUN_USER=www-data
+          export APACHE_RUN_GROUP=www-data
+          export APACHE_PID_FILE=/var/run/apache2/apache2.pid
+          export APACHE_RUN_DIR=/var/run/apache2
+          export APACHE_LOCK_DIR=/var/lock/apache2
+          export APACHE_LOG_DIR=/var/log/apache2
+          ENV
+
+          # 포트 고정
+          sudo bash -c "cat > '${PORTS}'" <<'CONF'
+          Listen 0.0.0.0:80
+          <IfModule ssl_module>Listen 0.0.0.0:443</IfModule>
+          <IfModule mod_gnutls.c>Listen 0.0.0.0:443</IfModule>
+          CONF
+          run_cmd sudo sed -n '1,120p' "${PORTS}"
+
+          echo "ServerName ${SITE}" | sudo tee /etc/apache2/conf-available/servername.conf >/dev/null
+          run_cmd sudo a2enconf servername
+
+          run_cmd sudo mkdir -p "${DOCROOT}"
+          run_cmd sudo chown -R $USER:$USER "${DOCROOT}"
+
+          TMP="$(mktemp)"
+          cat > "${TMP}" <<CONF
+          <VirtualHost *:80>
+            ServerName ${SITE}
+            ServerAdmin webmaster@localhost
+            DocumentRoot ${DOCROOT}
+            <Directory ${DOCROOT}>
+              Options Indexes FollowSymLinks
+              AllowOverride All
+              Require all granted
+            </Directory>
+            Header always set Cache-Control "no-store"
+            Header always set X-Content-Type-Options "nosniff"
+            Header always set X-Frame-Options "SAMEORIGIN"
+            Header always set X-XSS-Protection "1; mode=block"
+            ErrorLog \${APACHE_LOG_DIR}/error.log
+            CustomLog \${APACHE_LOG_DIR}/access.log combined
+          </VirtualHost>
+          CONF
+          run_cmd sudo cp "${TMP}" "${VHOST}"
+
+      - name: 🧾 Write index.html (remove nginx sample)
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          TITLE="${{ inputs.index_title }}"; MSG="${{ inputs.index_message }}"
+          cat > /tmp/index.html <<HTML
+          <!doctype html><html lang="ko"><head>
+            <meta charset="utf-8"><meta http-equiv="Cache-Control" content="no-store" />
+            <title>${TITLE}</title></head>
+          <body><h1>${TITLE}</h1><p id="msg">${MSG}</p>
+          <hr/><pre>Host: $(hostname) | Date: $(date -Iseconds)</pre></body></html>
+          HTML
+          run_cmd sudo mv /tmp/index.html /var/www/html/index.html
+          [ -f /var/www/html/index.nginx-debian.html ] && run_cmd sudo rm -f /var/www/html/index.nginx-debian.html || true
+          run_cmd sudo sed -n '1,60p' /var/www/html/index.html
+
+      - name: ✅ apache2 configtest
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          run_cmd sudo apache2ctl configtest
+
+      - name: 🚀 Start Apache (multi-fallback + bind check)
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          show_state(){ echo "----state----"; ps -eo pid,ppid,user,cmd|grep -E 'apache2|httpd'|grep -v grep||true; ss -lntp||true; sudo tail -n 50 /var/log/apache2/error.log||true; echo "--------------"; }
+          ok=0
+          warn "Phase0 graceful"; run_cmd sudo apache2ctl -k graceful || true; sleep 1; show_state; ss -lntp|grep -q ':80 ' && ok=1
+          if [ $ok -ne 1 ]; then warn "Phase1 service"; run_cmd sudo service apache2 stop||true; run_cmd sudo service apache2 start||true; sleep 1; show_state; ss -lntp|grep -q ':80 ' && ok=1; fi
+          if [ $ok -ne 1 ]; then warn "Phase2 apache2ctl"; run_cmd sudo apache2ctl -k stop||true; run_cmd sudo apache2ctl -k start||true; sleep 1; show_state; ss -lntp|grep -q ':80 ' && ok=1; fi
+          if [ $ok -ne 1 ]; then warn "Phase3 NO_DETACH"; sudo bash -c 'apache2ctl -DNO_DETACH -k start >/var/log/apache2/fg.log 2>&1 &'||true; sleep 2; show_state; ss -lntp|grep -q ':80 ' && ok=1; fi
+          if [ $ok -ne 1 ]; then warn "Phase4 FOREGROUND"; sudo bash -c 'export APACHE_RUN_USER=www-data; export APACHE_RUN_GROUP=www-data; export APACHE_PID_FILE=/var/run/apache2/apache2.pid; export APACHE_RUN_DIR=/var/run/apache2; export APACHE_LOCK_DIR=/var/lock/apache2; export APACHE_LOG_DIR=/var/log/apache2; /usr/sbin/apache2 -DFOREGROUND >/var/log/apache2/fg2.log 2>&1 &'||true; sleep 2; show_state; ss -lntp|grep -q ':80 ' && ok=1; fi
+          [ $ok -eq 1 ] || { fail "Apache failed to bind :80"; exit 1; }
+          echoe "Apache is listening on :80"
+
+      - name: 🔎 Verify HTTP 200 + Body (robust)
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          TITLE='${{ inputs.index_title }}'; MSG='${{ inputs.index_message }}'; SITE='${{ inputs.site_name }}'
+          urls=("http://127.0.0.1" "http://localhost"); pass=0
+          for url in "${urls[@]}"; do
+            for try in $(seq 1 15); do
+              H="${LOG_DIR}/curl_$(echo "$url"|sed 's#[:/\.]#_#g')_${try}.hdr"
+              B="${LOG_DIR}/curl_$(echo "$url"|sed 's#[:/\.]#_#g')_${try}.html"
+              if curl --retry 5 --retry-connrefused --retry-delay 1 -fsS -o "$B" -D "$H" "$url"; then
+                code=$(awk 'BEGIN{c=0} /^HTTP\//{c=$2} END{print c}' "$H"); [ "$code" = "200" ] || { sleep 1; continue; }
+                if grep -qi -- "$TITLE" "$B" || grep -qi -- "$MSG" "$B"; then pass=1; break; fi
+              fi; sleep 1
+            done
+            [ $pass -eq 1 ] && break
+            for try in $(seq 1 8); do
+              H="${LOG_DIR}/curl_host_${try}.hdr"; B="${LOG_DIR}/curl_host_${try}.html"
+              if curl --retry 5 --retry-connrefused --retry-delay 1 -fsS -H "Host: $SITE" -o "$B" -D "$H" "http://127.0.0.1"; then
+                code=$(awk 'BEGIN{c=0} /^HTTP\//{c=$2} END{print c}' "$H"); [ "$code" = "200" ] || { sleep 1; continue; }
+                if grep -qi -- "$TITLE" "$B" || grep -qi -- "$MSG" "$B"; then pass=1; break; fi
+              fi; sleep 1
+            done
+            [ $pass -eq 1 ] && break
+          done
+          [ $pass -eq 1 ] || { fail "Response body check failed"; exit 1; }
+
+      # =========================
+      # 고정 경로 복사 + 정규화 + PR
+      # =========================
+      - name: 🗂️ Copy files into .github/workflows (FIXED PATH)
         if: ${{ inputs.copy_sources != '' }}
         shell: bash
         run: |
-          set -Eeuo pipefail
-          source "${LOG_DIR}/echo_helpers.sh"
-
-          DEST_BASE=".github/workflows"
-          SUBDIR="${{ inputs.copy_dest_subdir }}"
-          DEST="${DEST_BASE}/${SUBDIR}"
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          DEST=".github/workflows"
           RAW="${{ inputs.copy_sources }}"
-
+          MODE="${{ inputs.overwrite_mode }}"
           run_cmd mkdir -p "${DEST}"
-          echo "Copy dest: ${DEST}" | tee -a "${LOG_DIR}/run.log"
-
-          # 패턴 목록 분리(쉼표/공백/줄바꿈)
           printf '%s\n' "$RAW" | tr ', ' '\n' | sed '/^$/d' > /tmp/copy_list.txt
-          echo "Patterns:"; cat /tmp/copy_list.txt || true
-
+          echo "Patterns:"; sed -n '1,200p' /tmp/copy_list.txt || true
           shopt -s nullglob globstar
           : > "${LOG_DIR}/copy_map.txt"
-
+          TS="$(date +%Y%m%d%H%M%S)"
+          BAK="${DEST}/.backup/${TS}"
+          [ "$MODE" = "backup" ] && run_cmd mkdir -p "$BAK"
           while IFS= read -r pattern; do
-            # 패턴을 그대로 글롭 확장
-            found=0
+            hit=0
             for f in $pattern; do
-              # 디렉토리는 스킵, 파일만
               [ -f "$f" ] || continue
               base="$(basename "$f")"
-              # 상위 경로 역참조 방지(파일은 워킹트리에 있다고 가정)
+              if [ -e "${DEST}/${base}" ]; then
+                case "$MODE" in
+                  backup)  run_cmd install -m0644 -D "${DEST}/${base}" "${BAK}/${base}";;
+                  skip)    warn "Skip existing: ${DEST}/${base}"; echo "SKIP $f -> ${DEST}/${base}" >> "${LOG_DIR}/copy_map.txt"; hit=$((hit+1)); continue;;
+                  overwrite) : ;;
+                esac
+              fi
               run_cmd install -m0644 -D "$f" "${DEST}/${base}"
-              echo "$f -> ${DEST}/${base}" | tee -a "${LOG_DIR}/copy_map.txt"
-              found=$((found+1))
+              echo "$f -> ${DEST}/${base}" >> "${LOG_DIR}/copy_map.txt"
+              hit=$((hit+1))
             done
-            if [ $found -eq 0 ]; then
-              warn "No match for pattern: $pattern"
-            else
-              echoe "Copied $found file(s) for pattern: $pattern"
-            fi
+            [ $hit -gt 0 ] && echoe "Copied $hit file(s) for: $pattern" || warn "No match: $pattern"
           done < /tmp/copy_list.txt
+          echo "==== COPY SUMMARY ===="; sed -n '1,200p' "${LOG_DIR}/copy_map.txt" || true
+          [ -d "$BAK" ] && { echo "Backup dir: $BAK"; ls -al "$BAK" || true; }
 
-          echo "==== COPY SUMMARY ===="
-          sed -n '1,200p' "${LOG_DIR}/copy_map.txt" || true
+      - name: 🧼 Normalize action versions in copied files
+        if: ${{ inputs.copy_sources != '' && inputs.normalize_actions }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
+          # copy_map.txt 에 기록된 대상만 정규화(보수적)
+          awk '{print $NF}' "${LOG_DIR}/copy_map.txt" | sort -u > /tmp/targets.txt || true
+          [ -s /tmp/targets.txt ] || { warn "No copied files to normalize"; exit 0; }
+          while IFS= read -r y; do
+            [ -f "$y" ] || continue
+            run_cmd sed -i \
+              -e 's#actions/checkout@v[0-9]\+#actions/checkout@v4#g' \
+              -e 's#actions/upload-artifact@v[0-9]\+#actions/upload-artifact@v4#g' \
+              -e 's#actions/setup-java@v[0-9]\+#actions/setup-java@v4#g' \
+              -e 's#peter-evans/create-pull-request@v[0-9]\+#peter-evans/create-pull-request@v6#g' \
+              "$y"
+            echoe "Normalized: $y"
+          done < /tmp/targets.txt
 
-      - name: ⬆️ Upload artifact (logs + copy map)
+      - name: 📦 Upload artifact (logs + copy map)
         uses: actions/upload-artifact@v4
         with:
           name: apache-artifacts
           path: |
-            apache-artifacts.tgz
             ${{ env.LOG_DIR }}/run.log
             ${{ env.LOG_DIR }}/diagnostics.txt
             ${{ env.LOG_DIR }}/copy_map.txt
           if-no-files-found: warn
 
-      - name: 🔀 Create Pull Request with copied files
+      - name: 🔀 Create Pull Request
         if: ${{ inputs.copy_sources != '' && inputs.create_pr }}
         uses: peter-evans/create-pull-request@v6
         with:
@@ -192,18 +341,25 @@ jobs:
           add-paths: |
             .github/workflows/**
           commit-message: |
-            chore(workflows): add copied files under .github/workflows/${{ inputs.copy_dest_subdir }}
+            chore(workflows): copy to .github/workflows (fixed) + normalize actions
 
-            - Auto-copied via Apache workflow
-            - See .github/echo_apache/copy_map.txt for mapping
+            - Overwrite mode: ${{ inputs.overwrite_mode }}
+            - Normalized: ${{ inputs.normalize_actions }}
+            - See .github/echo_apache/copy_map.txt
           title: ${{ inputs.pr_title }}
           body: |
-            ## Summary
-            This PR adds files under `.github/workflows/${{ inputs.copy_dest_subdir }}`.
+            ## What
+            - Fixed-path copy to `.github/workflows/`
+            - Optional normalization of core action versions to stable:
+              - actions/checkout@v4
+              - actions/upload-artifact@v4
+              - actions/setup-java@v4
+              - peter-evans/create-pull-request@v6
 
-            - Source patterns: `${{ inputs.copy_sources }}`
-            - Mapping recorded in: `.github/echo_apache/copy_map.txt`
+            ## How
+            - Overwrite mode: `${{ inputs.overwrite_mode }}`
+            - Copied mapping recorded in `.github/echo_apache/copy_map.txt`.
 
-            _Automated by Apache ALL-ECHO workflow._
-          branch: "auto/workflows-copy-${{ inputs.copy_dest_subdir }}"
+            _Automated by ALL-ECHO v4._
+          branch: "auto/workflows-copy-fp"
           delete-branch: true
