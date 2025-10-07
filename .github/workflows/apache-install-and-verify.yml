@@ -55,7 +55,6 @@ jobs:
             return $rc
           }
           SH
-          # shellcheck disable=SC1090
           source "${HELPER}"
 
           cleanup(){
@@ -72,10 +71,19 @@ jobs:
               echo
               echo "=== APACHE ERROR LOG (tail) ==="
               sudo tail -n 200 /var/log/apache2/error.log || true
+              echo
+              echo "=== SAVED HEADERS ==="
+              sed -n '1,200p' "${LOG_DIR}"/curl_*.hdr 2>/dev/null || true
+              echo
+              echo "=== SAVED HTML (first 80 lines) ==="
+              for f in "${LOG_DIR}"/curl_*.html; do
+                [ -f "$f" ] || continue
+                echo "--- $f ---"
+                sed -n '1,80p' "$f"
+              done
             } | tee -a "${LOG_DIR}/diagnostics.txt"
           }
           trap 'rc=$?; [ $rc -eq 0 ] || cleanup; exit $rc' EXIT
-
           echoe "Echo helpers ready at ${HELPER}"
 
       - name: 🧩 System info (echo)
@@ -97,7 +105,6 @@ jobs:
           source "${LOG_DIR}/echo_helpers.sh"
           run_cmd sudo apt-get update -y
           run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get install -y apache2
-          # 모듈 활성화 (필요시 확장 가능)
           run_cmd sudo a2enmod rewrite
           run_cmd sudo a2enmod headers
           run_cmd sudo a2enmod mime
@@ -118,7 +125,6 @@ jobs:
           run_cmd sudo mkdir -p "${DOCROOT}"
           run_cmd sudo chown -R $USER:$USER "${DOCROOT}"
 
-          # 기본 사이트 설정 강화 (ServerName, AllowOverride, Headers)
           TMP_CONF="$(mktemp)"
           cat > "${TMP_CONF}" <<CONF
           <VirtualHost *:80>
@@ -132,7 +138,7 @@ jobs:
                   Require all granted
               </Directory>
 
-              # 보안/편의 헤더 (필요시 조정)
+              Header always set Cache-Control "no-store"
               Header always set X-Content-Type-Options "nosniff"
               Header always set X-Frame-Options "SAMEORIGIN"
               Header always set X-XSS-Protection "1; mode=block"
@@ -143,11 +149,8 @@ jobs:
           CONF
 
           run_cmd sudo cp "${TMP_CONF}" "${VHOST}"
-          run_cmd sudo sed -n '1,200p' "${VHOST}"
-
-          # ServerName 전역 지정(경고 방지)
-          SRV="/etc/apache2/conf-available/servername.conf"
-          echo "ServerName ${SITE_NAME}" | sudo tee "${SRV}" >/dev/null
+          run_cmd sudo a2enconf servername || true
+          echo "ServerName ${SITE_NAME}" | sudo tee /etc/apache2/conf-available/servername.conf >/dev/null
           run_cmd sudo a2enconf servername
 
       - name: 🧾 Write index.html (echo content)
@@ -163,11 +166,12 @@ jobs:
           <html lang="ko">
           <head>
             <meta charset="utf-8">
+            <meta http-equiv="Cache-Control" content="no-store" />
             <title>${TITLE}</title>
           </head>
           <body>
             <h1>${TITLE}</h1>
-            <p>${MSG}</p>
+            <p id="msg">${MSG}</p>
             <hr/>
             <pre>Host: $(hostname) | Date: $(date -Iseconds)</pre>
           </body>
@@ -175,56 +179,103 @@ jobs:
           HTML
           run_cmd sudo mv /tmp/index.html "${INDEX}"
           run_cmd sudo ls -al /var/www/html
+          run_cmd sudo sed -n '1,60p' "${INDEX}"
 
-      - name: ✅ apache2 configtest
+      - name: ✅ apache2 configtest + graceful
         shell: bash
         run: |
           set -Eeuo pipefail
           source "${LOG_DIR}/echo_helpers.sh"
           run_cmd sudo apache2ctl configtest
+          # 아직 실행 전이라도 변경 내용 적용을 위해 graceful(실행 중이면 reload, 아니면 무해)
+          run_cmd sudo apache2ctl -k graceful || true
 
       - name: 🚀 Start Apache (service → fallback apache2ctl)
         shell: bash
         run: |
           set -Eeuo pipefail
           source "${LOG_DIR}/echo_helpers.sh"
-
-          # systemd가 없는 환경 고려: service 실패 시 apache2ctl -k start 백그라운드
           if run_cmd sudo service apache2 start; then
             echoe "service apache2 start OK"
           else
             warn "service start failed → fallback to apache2ctl"
-            # PID 파일 디렉터리 보장
             sudo mkdir -p /var/run/apache2
-            # 중복 기동 방지
             pgrep -fa apache2 && warn "apache2 already running" || true
             run_cmd sudo apache2ctl -k start
           fi
-
-          sleep 2
+          sleep 1
           ps -eo pid,ppid,user,cmd | grep -E 'apache2|httpd' | grep -v grep | tee -a "${LOG_DIR}/process.txt" || true
           ss -lntp | tee -a "${LOG_DIR}/ports.txt" || true
 
-      - name: 🔎 Verify HTTP 200 on localhost
+      - name: 🔎 Verify HTTP 200 + Body (robust, with retries)
         shell: bash
         run: |
           set -Eeuo pipefail
           source "${LOG_DIR}/echo_helpers.sh"
 
-          # 로컬 접근 검증(여러 엔드포인트 시도)
-          for URL in "http://127.0.0.1" "http://localhost"; do
-            if curl -fsS -o "${LOG_DIR}/curl_$(echo "$URL" | sed 's#[:/\.]#_#g').html" -D "${LOG_DIR}/curl_$(echo "$URL" | sed 's#[:/\.]#_#g').hdr" "$URL"; then
-              echoe "CURL OK → $URL"
-              grep -iE '^HTTP/' "${LOG_DIR}/curl_$(echo "$URL" | sed 's#[:/\.]#_#g').hdr" || true
-              break
-            else
-              warn "CURL FAIL → $URL"
-            fi
+          TITLE_RE='${{ inputs.index_title }}'
+          MSG_RE='${{ inputs.index_message }}'
+          SITE='${{ inputs.site_name }}'
+
+          urls=("http://127.0.0.1" "http://localhost")
+          i=0
+          for url in "${urls[@]}"; do
+            for try in $(seq 1 10); do
+              out_html="${LOG_DIR}/curl_$(echo "$url" | sed 's#[:/\.]#_#g')_${try}.html"
+              out_hdr="${LOG_DIR}/curl_$(echo "$url" | sed 's#[:/\.]#_#g')_${try}.hdr"
+              if curl -fsS -o "$out_html" -D "$out_hdr" "$url"; then
+                echoe "CURL OK → $url (try=$try)"
+                grep -iE '^HTTP/' "$out_hdr" || true
+                code=$(awk 'BEGIN{c=0} /^HTTP\//{c=$2} END{print c}' "$out_hdr")
+                if [ "$code" != "200" ]; then
+                  warn "HTTP code=$code (expect 200)"
+                  sleep 1; continue
+                fi
+                # 본문 검사: title, h1, msg 중 하나라도 매치되면 통과
+                if grep -qi -- "$TITLE_RE" "$out_html" || \
+                   grep -qi -- "<h1>.*$TITLE_RE.*</h1>" "$out_html" || \
+                   grep -qi -- "$MSG_RE" "$out_html"; then
+                  echoe "Body contains expected text (title/h1/msg)"
+                  i=1; break
+                else
+                  warn "Body check failed (try=$try); showing snippet:"
+                  sed -n '1,80p' "$out_html" || true
+                fi
+              else
+                warn "CURL FAIL → $url (try=$try)"
+              fi
+              sleep 1
+            done
+            [ $i -eq 1 ] && break
+            # Host 헤더로도 재시도(가상호스트 매칭)
+            for try in $(seq 1 5); do
+              out_html="${LOG_DIR}/curl_host_${try}.html"
+              out_hdr="${LOG_DIR}/curl_host_${try}.hdr"
+              if curl -fsS -H "Host: $SITE" -o "$out_html" -D "$out_hdr" "http://127.0.0.1"; then
+                echoe "CURL OK (Host: $SITE) → http://127.0.0.1 (try=$try)"
+                code=$(awk 'BEGIN{c=0} /^HTTP\//{c=$2} END{print c}' "$out_hdr")
+                if [ "$code" = "200" ] && ( grep -qi -- "$TITLE_RE" "$out_html" || grep -qi -- "$MSG_RE" "$out_html" ); then
+                  echoe "Body contains expected text with Host header"
+                  i=1; break
+                fi
+              else
+                warn "CURL FAIL (Host header) (try=$try)"
+              fi
+              sleep 1
+            done
+            [ $i -eq 1 ] && break
           done
 
-          # 간단 본문 검사
-          if ! grep -q "${{ inputs.index_title }}" "${LOG_DIR}"/curl_*_html 2>/dev/null; then
-            fail "Index title not found in response"
+          if [ $i -ne 1 ]; then
+            fail "Index title/message not found in any response"
+            echo "=== Headers ==="
+            sed -n '1,200p' "${LOG_DIR}"/curl_*.hdr 2>/dev/null || true
+            echo "=== HTML (first 80 lines) ==="
+            for f in "${LOG_DIR}"/curl_*.html; do
+              [ -f "$f" ] || continue
+              echo "--- $f ---"
+              sed -n '1,80p' "$f"
+            done
             exit 1
           fi
 
@@ -248,7 +299,5 @@ jobs:
           path: |
             apache-artifacts.tgz
             ${{ env.LOG_DIR }}/run.log
-            ${{
-              env.LOG_DIR
-            }}/diagnostics.txt
+            ${{ env.LOG_DIR }}/diagnostics.txt
           if-no-files-found: warn
