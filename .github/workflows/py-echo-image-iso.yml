@@ -41,30 +41,9 @@ on:
         required: false
         default: "{\"plans\":[{\"src\":\"samples\",\"dest_rel\":\"extra/samples\",\"include_globs\":[\"**/*\"],\"exclude_globs\":[\"**/.git/**\",\"**/.github/**\"],\"max_mb\":100,\"include_in_iso\":true,\"required\":false}]}"
       advanced_json:
-        description: "확장 설정(JSON)"
+        description: "확장 설정(JSON) — packaging/ghcr/dockerhub/release/server/upgrade/docker.base_image 포함"
         required: false
-        default: "{\"packaging\":{\"mode\":\"pip\"},\"ghcr\":{\"enable\":false},\"dockerhub\":{\"enable\":false},\"release\":{\"enable\":false},\"server\":{\"enable\":false}}"
-
-      # 🔼 업그레이드/베이스 이미지 옵션 (추가)
-      upgrade_all:
-        description: "핵심 툴/보안도구/파이썬 의존성/빌드툴 전부 업그레이드"
-        required: true
-        type: boolean
-        default: false
-      upgrade_pip_tools:
-        description: "pip/build/pytest/mypy/ruff 등 파이썬 툴 업그레이드"
-        required: true
-        type: boolean
-        default: true
-      upgrade_sbom_sec:
-        description: "Syft/Trivy 등 SBOM/보안 도구 업그레이드"
-        required: true
-        type: boolean
-        default: true
-      base_image:
-        description: "Docker 베이스 이미지(업그레이드 시 사용)"
-        required: true
-        default: "python:3.11-slim"
+        default: "{\"packaging\":{\"mode\":\"pip\"},\"ghcr\":{\"enable\":false},\"dockerhub\":{\"enable\":false},\"release\":{\"enable\":false},\"server\":{\"enable\":false},\"upgrade\":{\"all\":false,\"pip_tools\":true,\"sbom_sec\":true},\"docker\":{\"base_image\":\"python:3.11-slim\"}}"
 
 permissions:
   contents: write
@@ -87,16 +66,12 @@ env:
   LANG: C.UTF-8
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────────
-  # ⓵ QA 매트릭스 (3.9~3.12)
-  # ─────────────────────────────────────────────────────────────────────────────
   qa-matrix:
     strategy:
       fail-fast: false
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12"]
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -174,7 +149,6 @@ jobs:
           def hello(name: str = "World") -> str:
               return f"Hello, {name}!"
           PY
-          # ruff 규칙을 지키는 테스트 (한 줄 한 임포트/구문)
           cat > "$TEST_DIR/test_hello.py" <<'PY'
           import importlib
           import os
@@ -211,7 +185,7 @@ jobs:
           mkdir -p ../test-results
           pytest -q --junitxml=../test-results/junit-${{ matrix.python }}.xml \
                  --cov="${P}" --cov-report=xml:../test-results/coverage-${{ matrix.python }}.xml
-          echo "✅ pytest ok (${ { matrix.python } })"
+          echo "✅ pytest ok (${{ matrix.python }})"
 
       - name: Upload QA artifacts
         uses: actions/upload-artifact@v4
@@ -232,9 +206,6 @@ jobs:
           sudo rm -rf /var/lib/apt/lists/* || true
           echo "✅ QA cleanup done"
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # ⓶ 메인 파이프라인
-  # ─────────────────────────────────────────────────────────────────────────────
   all-in-one:
     needs: [qa-matrix]
     runs-on: ubuntu-latest
@@ -275,7 +246,7 @@ jobs:
           echo "✅ trap ready"
 
       - name: (Optional) Upgrade toolchain (apt/pip)
-        if: ${{ inputs.upgrade_all || inputs.upgrade_pip_tools }}
+        if: ${{ steps.parse.outputs.up_all == 'true' || steps.parse.outputs.up_pip == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -298,12 +269,16 @@ jobs:
           A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
           A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
+
           IMG='${{ inputs.image_ref }}'
           if [[ "$IMG" == *:* ]]; then IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"; else IMG_NAME="$IMG"; IMG_TAG="latest"; fi
+
           CP='${{ inputs.copy_plan_json }}'
           printf '%s' "$CP" | jq . >/dev/null
+
           ADV='${{ inputs.advanced_json }}'
           printf '%s' "$ADV" | jq . >/dev/null
+
           PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"')
           GHCR_ENABLE=$(printf '%s' "$ADV" | jq -r '.ghcr.enable // false')
           GHCR_REPO=$(printf '%s' "$ADV" | jq -r '.ghcr.repo // ""')
@@ -323,6 +298,13 @@ jobs:
           DEP_SVC=$(printf '%s' "$ADV" | jq -r '.server.service_name // "mypkg"')
           DEP_CMD=$(printf '%s' "$ADV" | jq -r '.server.start_cmd // "python -m mypkg"')
           DEP_SUDO=$(printf '%s' "$ADV" | jq -r '.server.use_sudo // true')
+
+          # 🔽 새로 추가: upgrade/base_image 파싱
+          UP_ALL=$(printf '%s' "$ADV" | jq -r '.upgrade.all // false')
+          UP_PIP=$(printf '%s' "$ADV" | jq -r '.upgrade.pip_tools // false')
+          UP_SEC=$(printf '%s' "$ADV" | jq -r '.upgrade.sbom_sec // false')
+          BASE_IMAGE=$(printf '%s' "$ADV" | jq -r '.docker.base_image // "python:3.11-slim"')
+
           {
             echo "author_name=$A_NAME"
             echo "author_email=$A_EMAIL"
@@ -348,11 +330,18 @@ jobs:
             echo "dep_svc=$DEP_SVC"
             echo "dep_cmd=$DEP_CMD"
             echo "dep_sudo=$DEP_SUDO"
+            echo "up_all=$UP_ALL"
+            echo "up_pip=$UP_PIP"
+            echo "up_sec=$UP_SEC"
+            echo "base_image=$BASE_IMAGE"
           } | tee -a "$LOG_DIR/parsed_inputs.env"
-          for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh_enable dh_repo dh_tag rel_enable rel_tag rel_draft rel_prerelease dep_enable dep_host dep_user dep_port dep_path dep_svc dep_cmd dep_sudo; do
+
+          # GITHUB_OUTPUT로 내보내기
+          for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh_enable dh_repo dh_tag rel_enable rel_tag rel_draft rel_prerelease dep_enable dep_host dep_user dep_port dep_path dep_svc dep_cmd dep_sudo up_all up_pip up_sec base_image; do
             v=$(grep "^$k=" "$LOG_DIR/parsed_inputs.env" | cut -d= -f2-)
             echo "$k=$v" >> "$GITHUB_OUTPUT"
           done
+
           printf '%s' "$CP" > copy_plan.json
           printf '%s' "$ADV" > advanced.json
           logf "copy_plan.json & advanced.json saved"
@@ -439,7 +428,6 @@ jobs:
               return f"Hello, {name}!"
           PY
 
-          # ruff 친화형 테스트
           cat > "$TEST_DIR/test_hello.py" <<'PY'
           import importlib
           import os
@@ -457,9 +445,9 @@ jobs:
               assert m.hello("Echo") == "Hello, Echo!"
           PY
 
-          # Dockerfile (base_image 반영)
+          # ✅ base_image는 parse 출력 사용
           cat > "$ROOT/Dockerfile" <<DOCKER
-          FROM ${{ inputs.base_image }}
+          FROM ${{ steps.parse.outputs.base_image }}
           WORKDIR /app
           COPY . /app
           RUN pip install --no-cache-dir .
@@ -602,8 +590,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          ROOT="workspace/${P}"
           if ! [[ -d samples ]]; then
             mkdir -p samples
             echo "dummy" > samples/README.txt
@@ -678,7 +664,7 @@ jobs:
           echo "✅ Manifest generated: $MANIFEST_CSV"
 
       - name: (Optional) Final upgrade before Docker build
-        if: ${{ inputs.build_docker == true && (inputs.upgrade_all || inputs.upgrade_pip_tools) }}
+        if: ${{ steps.parse.outputs.up_all == 'true' || steps.parse.outputs.up_pip == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -701,7 +687,7 @@ jobs:
           echo "✅ image built & saved"
 
       - name: Install/Upgrade Syft & Trivy (SBOM/Sec)
-        if: ${{ inputs.upgrade_all || inputs.upgrade_sbom_sec || inputs.build_docker == true }}
+        if: ${{ steps.parse.outputs.up_all == 'true' || steps.parse.outputs.up_sec == 'true' || inputs.build_docker == true }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -787,7 +773,6 @@ jobs:
           (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
           echo "✅ ISO built"
 
-      # (옵션) GHCR 멀티아키 빌드/푸시
       - name: Set up QEMU
         if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/setup-qemu-action@v3
@@ -843,7 +828,6 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
 
-      # Cosign keyless/키기반: secrets 표현식 if 사용 대신 런타임 체크
       - name: Cosign sign artifacts (keyless if available)
         shell: bash
         env:
