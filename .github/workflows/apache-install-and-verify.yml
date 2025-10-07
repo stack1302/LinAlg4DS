@@ -1,4 +1,4 @@
-name: "🧱 Apache Install + Verify + Fixed Copy-to-.github/workflows + Upgrade (ALL-ECHO v5)"
+name: "🧱 Apache Install + Verify + Fixed Copy-to-.github/workflows + Upgrade (ALL-ECHO v5.2)"
 
 on:
   workflow_dispatch:
@@ -15,8 +15,6 @@ on:
         description: "index.html 본문 메시지"
         required: true
         default: "Apache is up on GitHub Actions runner 🚀"
-
-      # ---- 파일 복사(경로 고정) ----
       copy_sources:
         description: "복사할 파일/글롭(쉼표·공백·줄바꿈 구분) — 대상 경로는 고정: .github/workflows/"
         required: false
@@ -40,18 +38,12 @@ on:
         description: "PR 제목"
         required: false
         default: "chore: copy workflows + normalize actions (auto)"
-
-      # ---- 업그레이드/정규화 옵션 ----
-      upgrade_os:
-        description: "러너 OS 패키지 업그레이드(apt-get upgrade 등)"
-        type: boolean
+      upgrade_level:
+        description: "업그레이드 강도: none(미실행) / minimal(apache만) / full(OS+apache)"
+        type: choice
+        options: ["none", "minimal", "full"]
         required: true
-        default: true
-      upgrade_apache:
-        description: "apache2 패키지 업그레이드(--only-upgrade)"
-        type: boolean
-        required: true
-        default: true
+        default: "full"
       normalize_actions:
         description: "복사한 워크플로우 파일의 주요 액션 버전 정규화"
         type: boolean
@@ -133,21 +125,21 @@ jobs:
           run_cmd apache2 -v
           for m in rewrite headers mime env dir deflate; do run_cmd sudo a2enmod "$m"; done
 
-      - name: 🛠️ Optional OS/Apache upgrade
-        if: ${{ inputs.upgrade_os || inputs.upgrade_apache }}
+      - name: 🛠️ Optional upgrade by level
+        if: ${{ inputs.upgrade_level != 'none' }}
         shell: bash
         run: |
           set -Eeuo pipefail; source "${LOG_DIR}/echo_helpers.sh"
-          if [ "${{ inputs.upgrade_os }}" = "true" ]; then
+          LV="${{ inputs.upgrade_level }}"
+          if [ "$LV" = "full" ]; then
             run_cmd sudo apt-get update -y
             run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
             run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge
             run_cmd sudo apt-get -y clean
           fi
-          if [ "${{ inputs.upgrade_apache }}" = "true" ]; then
-            run_cmd sudo apt-get update -y
-            run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade apache2
-          fi
+          # minimal, full 둘 다 apache만 업그레이드 보장
+          run_cmd sudo apt-get update -y
+          run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade apache2
 
       - name: 🏗️ Configure ports/env/vhost (robust IfModule blocks)
         shell: bash
@@ -162,7 +154,6 @@ jobs:
           run_cmd sudo mkdir -p /var/run/apache2 /var/lock/apache2 /var/log/apache2
           run_cmd sudo chown -R www-data:www-data /var/log/apache2 || true
 
-          # envvars 보장
           cat <<'ENV' | sudo tee /etc/apache2/envvars >/dev/null
           export APACHE_RUN_USER=www-data
           export APACHE_RUN_GROUP=www-data
@@ -172,7 +163,6 @@ jobs:
           export APACHE_LOG_DIR=/var/log/apache2
           ENV
 
-          # ✅ 멀티라인 IfModule 블록으로 포트 설정(구문 오류 방지)
           sudo bash -c "cat > '${PORTS}'" <<'CONF'
           Listen 0.0.0.0:80
 
@@ -184,14 +174,11 @@ jobs:
               Listen 0.0.0.0:443
           </IfModule>
           CONF
-
           run_cmd sudo sed -n '1,200p' "${PORTS}"
 
-          # servername.conf → a2enconf (한 번만)
           echo "ServerName ${SITE}" | sudo tee /etc/apache2/conf-available/servername.conf >/dev/null
           run_cmd sudo a2enconf servername
 
-          # vhost + docroot
           run_cmd sudo mkdir -p "${DOCROOT}"
           run_cmd sudo chown -R $USER:$USER "${DOCROOT}"
 
@@ -308,15 +295,15 @@ jobs:
           RETAIN="${{ inputs.backup_retention_days }}"
           run_cmd mkdir -p "${DEST}"
 
-          # 보관주기 적용(오래된 백업 삭제)
+          # 오래된 백업 정리
           if [ -d "${DEST}/.backup" ]; then
             warn "Pruning backups older than ${RETAIN} days in ${DEST}/.backup"
-            # -mindepth 1 로 최상위 디렉토리 보존, 시맨틱: 디렉토리 기준 삭제
             find "${DEST}/.backup" -mindepth 1 -type d -mtime +"${RETAIN}" -print -exec rm -rf {} +
           fi
 
           printf '%s\n' "$RAW" | tr ', ' '\n' | sed '/^$/d' > /tmp/copy_list.txt
           echo "Patterns:"; sed -n '1,200p' /tmp/copy_list.txt || true
+
           shopt -s nullglob globstar
           : > "${LOG_DIR}/copy_map.txt"
           TS="$(date +%Y%m%d%H%M%S)"
@@ -354,7 +341,6 @@ jobs:
           [ -s /tmp/targets.txt ] || { warn "No copied files to normalize"; exit 0; }
           while IFS= read -r y; do
             [ -f "$y" ] || continue
-            # 안정 릴리스로 정규화(보수적)
             run_cmd sed -i \
               -e 's#actions/checkout@v[0-9]\+#actions/checkout@v4#g' \
               -e 's#actions/upload-artifact@v[0-9]\+#actions/upload-artifact@v4#g' \
@@ -385,7 +371,6 @@ jobs:
             .github/workflows/**
           commit-message: |
             chore(workflows): copy to .github/workflows (fixed) + normalize actions
-
             - Overwrite mode: ${{ inputs.overwrite_mode }}
             - Backup retention(days): ${{ inputs.backup_retention_days }}
             - Normalized core actions (v4/v5/v6)
@@ -394,17 +379,15 @@ jobs:
           body: |
             ## What
             - Fixed-path copy to `.github/workflows/`
-            - Optional normalization of core action versions to stable:
+            - Normalized action versions to stable:
               - actions/checkout@v4
               - actions/upload-artifact@v4
               - actions/setup-java@v4
               - actions/setup-python@v5
               - actions/cache@v4
               - peter-evans/create-pull-request@v6
-
             ## Backups
             - Old backups under `.github/workflows/.backup/` older than **${{ inputs.backup_retention_days }} days** are pruned.
-
-            _Automated by ALL-ECHO v5._
+            _Automated by ALL-ECHO v5.2._
           branch: "auto/workflows-copy-fp"
           delete-branch: true
