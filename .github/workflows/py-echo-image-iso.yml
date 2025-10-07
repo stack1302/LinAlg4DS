@@ -45,11 +45,32 @@ on:
         required: false
         default: "{\"packaging\":{\"mode\":\"pip\"},\"ghcr\":{\"enable\":false},\"dockerhub\":{\"enable\":false},\"release\":{\"enable\":false},\"server\":{\"enable\":false}}"
 
+      # 🔼 업그레이드/베이스 이미지 옵션 (추가)
+      upgrade_all:
+        description: "핵심 툴/보안도구/파이썬 의존성/빌드툴 전부 업그레이드"
+        required: true
+        type: boolean
+        default: false
+      upgrade_pip_tools:
+        description: "pip/build/pytest/mypy/ruff 등 파이썬 툴 업그레이드"
+        required: true
+        type: boolean
+        default: true
+      upgrade_sbom_sec:
+        description: "Syft/Trivy 등 SBOM/보안 도구 업그레이드"
+        required: true
+        type: boolean
+        default: true
+      base_image:
+        description: "Docker 베이스 이미지(업그레이드 시 사용)"
+        required: true
+        default: "python:3.11-slim"
+
 permissions:
   contents: write
   packages: write
   actions: read
-  id-token: write
+  id-token: write   # cosign keyless 대비
 
 concurrency:
   group: pypkg-echo-${{ github.ref }}
@@ -58,54 +79,49 @@ concurrency:
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
   DOCKER_BUILDKIT: "1"
   LC_ALL: C.UTF-8
   LANG: C.UTF-8
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────
-  # ⓵ QA 매트릭스: 3.9~3.12
-  # ─────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
+  # ⓵ QA 매트릭스 (3.9~3.12)
+  # ─────────────────────────────────────────────────────────────────────────────
   qa-matrix:
     strategy:
       fail-fast: false
       matrix:
         python: ["3.9", "3.10", "3.11", "3.12"]
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      # ★ 전역 에코 헬퍼: /usr/local/bin 설치 (BASH_ENV 의존 제거)
-      - name: Install echo CLI helpers (global)
+      - name: Global echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo tee /usr/local/bin/echoe >/dev/null <<'SH'
-          #!/usr/bin/env bash
+          mkdir -p "$LOG_DIR"
+          cat > "$GITHUB_WORKSPACE/.bashenv" <<'SH'
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          printf '✅ %s\n' "$*" | tee -a "$SAFE_LOG"
+          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/qa-$(date +%Y%m%d%H%M%S).log}"
+          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*"; }
+          warn(){  printf '%s %s\n' "$ECHO_WARN" "$*"; }
+          fail(){  printf '%s %s\n' "$ECHO_FAIL" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "$SAFE_LOG"; }
           SH
-          sudo tee /usr/local/bin/warn >/dev/null <<'SH'
-          #!/usr/bin/env bash
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          printf '⚠️ %s\n' "$*" | tee -a "$SAFE_LOG"
-          SH
-          sudo tee /usr/local/bin/fail >/dev/null <<'SH'
-          #!/usr/bin/env bash
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          printf '❌ %s\n' "$*" | tee -a "$SAFE_LOG"
-          SH
-          sudo tee /usr/local/bin/logf >/dev/null <<'SH'
-          #!/usr/bin/env bash
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          if [ -t 1 ]; then tee -a "$SAFE_LOG"; else cat >> "$SAFE_LOG"; fi
-          SH
-          sudo chmod +x /usr/local/bin/echoe /usr/local/bin/warn /usr/local/bin/fail /usr/local/bin/logf
-          echoe "[QA] echo helpers installed"
+          echo "BASH_ENV=$GITHUB_WORKSPACE/.bashenv" >> "$GITHUB_ENV"
+
+      - name: Source echo helpers (ensure)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$GITHUB_WORKSPACE/.bashenv"
+          echoe "[QA] helpers sourced"; logf "[QA] ready"
 
       - name: Setup Python (${{ matrix.python }})
         uses: actions/setup-python@v5
@@ -119,7 +135,7 @@ jobs:
           mkdir -p .pip-wheelhouse
           printf "build\npytest\nmypy\nruff\n" > .req.txt
           pip wheel -w .pip-wheelhouse -r .req.txt || true
-          echoe "wheelhouse prebuilt (best-effort)"
+          echo "✅ wheelhouse prebuilt (best-effort)"
 
       - name: Cache wheelhouse
         uses: actions/cache@v4
@@ -136,10 +152,10 @@ jobs:
           set -Eeuo pipefail
           if ls .pip-wheelhouse/*.whl >/dev/null 2>&1; then
             pip install --no-index --find-links .pip-wheelhouse build pytest mypy ruff
-            echoe "installed from wheelhouse"
+            echo "✅ installed from wheelhouse"
           else
             pip install build pytest mypy ruff
-            warn "wheelhouse empty; installed online"
+            echo "⚠️ wheelhouse empty; installed online"
           fi
 
       - name: Generate minimal package skeleton for QA
@@ -158,24 +174,33 @@ jobs:
           def hello(name: str = "World") -> str:
               return f"Hello, {name}!"
           PY
+          # ruff 규칙을 지키는 테스트 (한 줄 한 임포트/구문)
           cat > "$TEST_DIR/test_hello.py" <<'PY'
-          import importlib, os, sys
+          import importlib
+          import os
+          import sys
+
           here = os.path.dirname(__file__)
           root = os.path.abspath(os.path.join(here, "..", "src"))
-          if root not in sys.path: sys.path.insert(0, root)
-          m = importlib.import_module("mypkg")
-          def test_hello():
-              assert m.hello("Echo") == "Hello, Echo!"
+          if root not in sys.path:
+              sys.path.insert(0, root)
+
+          pkg = importlib.import_module("mypkg")
+
+
+          def test_hello() -> None:
+              assert pkg.hello("Echo") == "Hello, Echo!"
           PY
-          echoe "QA skeleton ready at $ROOT"
+          echo "✅ QA skeleton ready at $ROOT"
 
       - name: Lint & Type check (ruff/mypy)
         shell: bash
         run: |
           set -Eeuo pipefail
           P="${{ github.event.inputs.package_name || 'mypkg' }}"
+          ruff check --fix "workspace/${P}"
           ruff check "workspace/${P}"
-          mypy "workspace/${P}/src" || warn "mypy warnings (not failing)"
+          mypy "workspace/${P}/src" || { echo "⚠️ mypy warnings (not failing)"; }
 
       - name: Test with coverage (matrix)
         shell: bash
@@ -186,7 +211,7 @@ jobs:
           mkdir -p ../test-results
           pytest -q --junitxml=../test-results/junit-${{ matrix.python }}.xml \
                  --cov="${P}" --cov-report=xml:../test-results/coverage-${{ matrix.python }}.xml
-          echoe "pytest ok (${ { matrix.python } })"  # harmless literal echo, not expression
+          echo "✅ pytest ok (${ { matrix.python } })"
 
       - name: Upload QA artifacts
         uses: actions/upload-artifact@v4
@@ -205,70 +230,64 @@ jobs:
           set -Eeuo pipefail
           docker system prune -af || true
           sudo rm -rf /var/lib/apt/lists/* || true
-          echoe "QA cleanup done"
+          echo "✅ QA cleanup done"
 
-  # ─────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
   # ⓶ 메인 파이프라인
-  # ─────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
   all-in-one:
     needs: [qa-matrix]
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ★ 전역 에코 헬퍼 설치
-      - name: Install echo CLI helpers (global)
+      - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
           set -Eeuo pipefail
-          sudo tee /usr/local/bin/echoe >/dev/null <<'SH'
-          #!/usr/bin/env bash
+          mkdir -p "$LOG_DIR"
+          cat > "$GITHUB_WORKSPACE/.bashenv" <<'SH'
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          printf '✅ %s\n' "$*" | tee -a "$SAFE_LOG"
+          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d%H%M%S).log}"
+          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*"; }
+          warn(){  printf '%s %s\n' "$ECHO_WARN" "$*"; }
+          fail(){  printf '%s %s\n' "$ECHO_FAIL" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "$SAFE_LOG"; }
           SH
-          sudo tee /usr/local/bin/warn >/dev/null <<'SH'
-          #!/usr/bin/env bash
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          printf '⚠️ %s\n' "$*" | tee -a "$SAFE_LOG"
-          SH
-          sudo tee /usr/local/bin/fail >/dev/null <<'SH'
-          #!/usr/bin/env bash
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          printf '❌ %s\n' "$*" | tee -a "$SAFE_LOG"
-          SH
-          sudo tee /usr/local/bin/logf >/dev/null <<'SH'
-          #!/usr/bin/env bash
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          SAFE_LOG="${SAFE_LOG:-${LOG_DIR}/run-$(date +%Y%m%d).log}"
-          if [ -t 1 ]; then tee -a "$SAFE_LOG"; else cat >> "$SAFE_LOG"; fi
-          SH
-          sudo chmod +x /usr/local/bin/echoe /usr/local/bin/warn /usr/local/bin/fail /usr/local/bin/logf
-          echoe "helpers installed"
+          echo "BASH_ENV=$GITHUB_WORKSPACE/.bashenv" >> "$GITHUB_ENV"
+
+      - name: Source echo helpers (ensure)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source "$GITHUB_WORKSPACE/.bashenv"
+          echoe "helpers sourced"; logf "helpers ready"
 
       - name: Better fail trap (tail last logs on error)
         shell: bash
         run: |
           set -Eeuo pipefail
           trap 'echo "❌ Failed at line $LINENO"; tail -n 200 ${LOG_DIR}/run-* 2>/dev/null || true' ERR
-          echoe "trap ready"
+          echo "✅ trap ready"
 
-      - name: Install toolchain (Python, ISO, copy, deploy)
+      - name: (Optional) Upgrade toolchain (apt/pip)
+        if: ${{ inputs.upgrade_all || inputs.upgrade_pip_tools }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          logf "Installing build/copy/deploy tools"
-          sudo apt-get update -y
-          sudo apt-get install -y python3 python3-venv python3-pip python3-setuptools python3-wheel \
-              git jq rsync xorriso genisoimage dosfstools openssh-client
-          python3 --version | logf
-          pip3 --version | logf
-          rsync --version | head -n1 | logf
-          echoe "toolchain installed"
+          if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+          $SUDO apt-get update -y
+          $SUDO apt-get install -y --no-install-recommends \
+               git jq rsync xorriso genisoimage dosfstools \
+               python3-venv python3-pip python3-setuptools python3-wheel
+          python3 -m pip install --upgrade pip
+          pip --version
+          python3 -m pip install --upgrade build pytest pytest-cov ruff mypy
+          echo "✅ core Python tools upgraded"
 
       - name: Parse inputs (metadata_json, image_ref, copy_plan_json, advanced_json)
         id: parse
@@ -330,26 +349,26 @@ jobs:
             echo "dep_cmd=$DEP_CMD"
             echo "dep_sudo=$DEP_SUDO"
           } | tee -a "$LOG_DIR/parsed_inputs.env"
-          # outputs 등록
-          while IFS='=' read -r k v; do
+          for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh_enable dh_repo dh_tag rel_enable rel_tag rel_draft rel_prerelease dep_enable dep_host dep_user dep_port dep_path dep_svc dep_cmd dep_sudo; do
+            v=$(grep "^$k=" "$LOG_DIR/parsed_inputs.env" | cut -d= -f2-)
             echo "$k=$v" >> "$GITHUB_OUTPUT"
-          done < "$LOG_DIR/parsed_inputs.env"
+          done
           printf '%s' "$CP" > copy_plan.json
           printf '%s' "$ADV" > advanced.json
-          echoe "inputs parsed"
+          logf "copy_plan.json & advanced.json saved"
 
       - name: Validate inputs
         shell: bash
         run: |
           set -Eeuo pipefail
-          err(){ fail "$*"; exit 1; }
+          err(){ echo "❌ $*"; exit 1; }
           [[ "${{ inputs.package_name }}" =~ ^[a-z0-9_]+$ ]] || err "package_name: 소문자/숫자/_ 만 허용"
           [[ "${{ inputs.package_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || err "package_version: SemVer 필요"
           [[ "${{ inputs.image_ref }}" =~ ^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]] || err "image_ref 형식 오류"
           if [[ "${{ steps.parse.outputs.rel_enable }}" == "true" ]]; then
             [[ "${{ steps.parse.outputs.rel_tag }}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || err "rel_tag: vX.Y.Z 필요"
           fi
-          echoe "input validation passed"
+          echo "✅ input validation passed"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -386,6 +405,7 @@ jobs:
           TEST_DIR="$ROOT/tests"
           DOC_DIR="$ROOT/docs"
           mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR"
+
           cat > "$ROOT/pyproject.toml" <<PYT
           [build-system]
           requires = ["setuptools>=68", "wheel"]
@@ -405,33 +425,47 @@ jobs:
           [tool.setuptools.packages.find]
           where = ["src"]
           PYT
+
           cat > "$ROOT/README.md" <<'MD'
           # Auto Generated Python Package
           - EchoOps generated.
           - Includes Dockerfile, ISO artifacts, SBOM, QA, caches.
           MD
+
           cat > "$PKG_DIR/__init__.py" <<PY
           __all__ = ["hello"]
           __version__ = "${V}"
           def hello(name: str = "World") -> str:
               return f"Hello, {name}!"
           PY
+
+          # ruff 친화형 테스트
           cat > "$TEST_DIR/test_hello.py" <<'PY'
-          import importlib, os, sys
+          import importlib
+          import os
+          import sys
+
           here = os.path.dirname(__file__)
           root = os.path.abspath(os.path.join(here, "..", "src"))
-          if root not in sys.path: sys.path.insert(0, root)
+          if root not in sys.path:
+              sys.path.insert(0, root)
+
           m = importlib.import_module("mypkg")
-          def test_hello():
+
+
+          def test_hello() -> None:
               assert m.hello("Echo") == "Hello, Echo!"
           PY
-          cat > "$ROOT/Dockerfile" <<'DOCKER'
-          FROM python:3.11-slim
+
+          # Dockerfile (base_image 반영)
+          cat > "$ROOT/Dockerfile" <<DOCKER
+          FROM ${{ inputs.base_image }}
           WORKDIR /app
           COPY . /app
           RUN pip install --no-cache-dir .
-          CMD ["python","-c","import mypkg; print(mypkg.hello('Docker'))"]
+          CMD ["python","-c","import importlib,sys,os,glob;root=os.path.abspath('src');sys.path.insert(0,root) if root not in sys.path else None;mods=[d for d in glob.glob(os.path.join(root,'*')) if os.path.isdir(d)];m=importlib.import_module(os.path.basename(mods[0])) if mods else None;print(m.hello('Docker')) if m and hasattr(m,'hello') else print('ok')"]
           DOCKER
+
           mkdir -p "$ROOT/server"
           cat > "$ROOT/server/install_deploy.sh" <<'SH'
           #!/usr/bin/env bash
@@ -463,7 +497,8 @@ jobs:
           SH
           sed -i "s/__APP__/${P}/g" "$ROOT/server/install_deploy.sh"
           chmod +x "$ROOT/server/install_deploy.sh"
-          echoe "Python skeleton + server scripts created at $ROOT"
+          chmod -R u+rwX,go+rX "$ROOT"
+          echo "✅ Python skeleton + server scripts created at $ROOT"
 
       - name: Install test deps
         shell: bash
@@ -482,15 +517,16 @@ jobs:
           echo "ECHO PYTHONPATH=$PYTHONPATH"
           mkdir -p ../test-results
           pytest -q --junitxml=../test-results/junit.xml --cov="${P}" --cov-report=xml:../test-results/coverage.xml
-          echoe "tests passed"
+          echo "✅ tests passed"
 
       - name: Lint (ruff) + Type check (mypy)
         shell: bash
         run: |
           set -Eeuo pipefail
           P="${{ inputs.package_name }}"
+          ruff check --fix "workspace/${P}"
           ruff check "workspace/${P}"
-          mypy "workspace/${P}/src" || warn "mypy warnings (non-fatal)"
+          mypy "workspace/${P}/src" || echo "⚠️ mypy warnings (non-fatal)"
 
       - name: Build (pip/poetry/conda)
         id: buildpkg
@@ -502,12 +538,10 @@ jobs:
           ROOT="workspace/${P}"
           case "$MODE" in
             poetry)
-              echoe "Packaging mode: poetry"
               python3 -m pip install --upgrade pip poetry build
               (cd "$ROOT" && poetry build)
               ;;
             conda)
-              echoe "Packaging mode: conda"
               sudo apt-get update -y && sudo apt-get install -y wget bzip2
               MINI="$HOME/miniconda"
               wget -qO ~/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
@@ -520,15 +554,13 @@ jobs:
               pip install conda-pack
               mkdir -p "$ROOT/dist"
               conda pack -n "${P}" -o "$ROOT/dist/${P}-env.tar.gz"
-              echoe "Conda env packed at dist/${P}-env.tar.gz"
               ;;
             *)
-              echoe "Packaging mode: pip (default)"
               python3 -m pip install --upgrade pip build
               python3 -m build "$ROOT"
               ;;
           esac
-          ls -al "$ROOT/dist" | logf
+          ls -al "$ROOT/dist" | tee -a "$LOG_DIR/dist.txt"
 
       - name: Massive directory generation (+ echo files)
         shell: bash
@@ -552,26 +584,32 @@ jobs:
           echo "done: $(date)" | tee -a "$OUT"
           SH
           chmod +x "$BASE/perm_apply.sh"
-          mapfile -t DLIST < <(seq -w 1 "$COUNT" | grep -v '^11$' | xargs -I{} echo "$BASE/dir_{}")
+          mapfile -t DLIST < <(seq -w 1 "$COUNT" | xargs -I{} echo "$BASE/dir_{}")
           "${BASE}/perm_apply.sh" "${DLIST[@]}"
-          echoe "Generated ${#DLIST[@]} directories with permission echoes (11 제외)."
+          logf "Generated $COUNT directories with permission echoes."
 
       - name: Copy plan dry-run summary
         shell: bash
         run: |
           set -Eeuo pipefail
-          [[ -f copy_plan.json ]] && jq -r '.plans[] | "\(.src) -> \(.dest_rel) | include:[\(.include_globs|join("|"))] exclude:[\(.exclude_globs|join("|"))] max:\(.max_mb)MB"' copy_plan.json || echo "no copy_plan.json"
+          if [[ -f copy_plan.json ]]; then
+            jq -r '.plans[] | "\(.src) -> \(.dest_rel) | include:[\(.include_globs|join("|"))] exclude:[\(.exclude_globs|join("|"))] max:\(.max_mb)MB"' copy_plan.json || true
+          else
+            echo "no copy_plan.json"
+          fi
 
-      - name: Ensure sources for copy plan
+      - name: Ensure sources for copy plan (non-fatal provisioning)
         shell: bash
         run: |
           set -Eeuo pipefail
+          P="${{ inputs.package_name }}"
+          ROOT="workspace/${P}"
           if ! [[ -d samples ]]; then
             mkdir -p samples
             echo "dummy" > samples/README.txt
-            warn "created temp samples/"
+            echo "⚠️ created temp samples/"
           fi
-          echoe "sources ensured"
+          echo "✅ sources ensured"
 
       - name: Copy directories by copy_plan_json (manifest + checksums)
         shell: bash
@@ -581,13 +619,12 @@ jobs:
           ROOT="workspace/${P}"
           PLAN_FILE="copy_plan.json"
           DEST_BASE="$ROOT"
-          [[ -f "$PLAN_FILE" ]] || { warn "copy_plan.json not found, skipping"; exit 0; }
+          [[ -f "$PLAN_FILE" ]] || { echo "⚠️ copy_plan.json not found, skipping"; exit 0; }
           mkdir -p "$ROOT/extra_manifests"
           MANIFEST_CSV="$ROOT/extra_manifests/manifest-$(date +%Y%m%d%H%M%S).csv"
           echo "src,resolved_src,dest_rel,relpath,bytes,sha256" > "$MANIFEST_CSV"
           nf(){ if command -v numfmt >/dev/null 2>&1; then numfmt --to=iec "$1"; else echo "$1 bytes"; fi; }
           COUNT_PLANS=$(jq -r '.plans | length' "$PLAN_FILE")
-          echoe "Copy plans: $COUNT_PLANS"
           for i in $(seq 0 $((COUNT_PLANS-1))); do
             SRC=$(jq -r ".plans[$i].src" "$PLAN_FILE")
             DEST_REL=$(jq -r ".plans[$i].dest_rel // \"extra\"" "$PLAN_FILE")
@@ -596,58 +633,58 @@ jobs:
             REQUIRED=$(jq -r ".plans[$i].required // false" "$PLAN_FILE")
             mapfile -t INCLUDES < <(jq -r ".plans[$i].include_globs[]?" "$PLAN_FILE")
             mapfile -t EXCLUDES < <(jq -r ".plans[$i].exclude_globs[]?" "$PLAN_FILE")
-            RESOLVED_SRC=""
-            if [[ "$SRC" == /* ]]; then
-              [[ -d "$SRC" ]] && RESOLVED_SRC="$SRC"
-            else
-              [[ -d "$GITHUB_WORKSPACE/$SRC" ]] && RESOLVED_SRC="$GITHUB_WORKSPACE/$SRC"
-              [[ -z "$RESOLVED_SRC" && -d "$DEST_BASE/$SRC" ]] && RESOLVED_SRC="$DEST_BASE/$SRC"
-              [[ -z "$RESOLVED_SRC" && -d "$SRC" ]] && RESOLVED_SRC="$SRC"
-            fi
-            if [[ -z "$RESOLVED_SRC" ]]; then
-              if [[ "$REQUIRED" == "true" ]]; then
-                fail "Plan[$i] required=true but src not found: $SRC"; exit 1
-              else
-                warn "Plan[$i] SRC not found: $SRC — skipping"; continue
-              fi
+            RES=""; [[ -d "$SRC" ]] && RES="$SRC"
+            [[ -z "$RES" && -d "$GITHUB_WORKSPACE/$SRC" ]] && RES="$GITHUB_WORKSPACE/$SRC"
+            [[ -z "$RES" && -d "$DEST_BASE/$SRC" ]] && RES="$DEST_BASE/$SRC"
+            if [[ -z "$RES" ]]; then
+              [[ "$REQUIRED" == "true" ]] && { echo "❌ required src missing: $SRC"; exit 1; }
+              echo "⚠️ skipped src missing: $SRC"; continue
             fi
             DEST_DIR="$DEST_BASE/$DEST_REL"; mkdir -p "$DEST_DIR"
             RSYNC_ARGS=(-a --delete --prune-empty-dirs)
             for p in "${INCLUDES[@]}";  do RSYNC_ARGS+=(--include "$p"); done
             for p in "${EXCLUDES[@]}";  do RSYNC_ARGS+=(--exclude "$p"); done
-            RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/')
-            RSYNC_ARGS+=(--include '*/' --exclude '*')
-            TMP_STAGE="$(mktemp -d)"
-            rsync "${RSYNC_ARGS[@]}" "$RESOLVED_SRC/" "$TMP_STAGE/"
-            TOTAL_BYTES=$(du -sb "$TMP_STAGE" | awk '{print $1}')
-            LIMIT_BYTES=$((MAX_MB * 1024 * 1024))
-            if (( TOTAL_BYTES > LIMIT_BYTES )); then
-              warn "Plan[$i] size exceed: $(nf "$TOTAL_BYTES") > $(nf "$LIMIT_BYTES")"
-              mkdir -p "$DEST_DIR"; REMAIN=$LIMIT_BYTES
-              mapfile -t FILES < <(find "$TMP_STAGE" -type f -printf '%T@ %p\n' | sort -nr | awk '{sub($1 FS,""); print}')
+            RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/' --include '*/' --exclude '*')
+            TMP="$(mktemp -d)"
+            rsync "${RSYNC_ARGS[@]}" "$RES/" "$TMP/"
+            TB=$(du -sb "$TMP" | awk '{print $1}')
+            LIM=$((MAX_MB * 1024 * 1024))
+            if (( TB > LIM )); then
+              echo "⚠️ size exceed: $(nf "$TB") > $(nf "$LIM")"
+              mkdir -p "$DEST_DIR"; REMAIN=$LIM
+              mapfile -t FILES < <(find "$TMP" -type f -printf '%T@ %p\n' | sort -nr | awk '{sub($1 FS,""); print}')
               for f in "${FILES[@]}"; do
                 sz=$(stat -c%s "$f"); (( sz <= REMAIN )) || continue
-                rel="${f#"$TMP_STAGE/"}"
+                rel="${f#"$TMP/"}"
                 mkdir -p "$DEST_DIR/$(dirname "$rel")"
                 cp -a "$f" "$DEST_DIR/$rel"
                 REMAIN=$((REMAIN - sz))
               done
             else
-              rsync -a --delete "$TMP_STAGE/" "$DEST_DIR/"
+              rsync -a --delete "$TMP/" "$DEST_DIR/"
             fi
             if [[ -d "$DEST_DIR" ]]; then
               while IFS= read -r -d '' f; do
                 rel="${f#"$DEST_BASE/"}"
                 bytes=$(stat -c%s "$f")
                 sha=$(sha256sum "$f" | awk '{print $1}')
-                printf '%s,%s,%s,%s,%s\n' "$SRC" "$RESOLVED_SRC" "$DEST_REL" "${rel#"$DEST_REL/"}" "$bytes" "$sha" >> "$MANIFEST_CSV"
+                printf '%s,%s,%s,%s,%s\n' "$SRC" "$RES" "$DEST_REL" "${rel#"$DEST_REL/"}" "$bytes" "$sha" >> "$MANIFEST_CSV"
               done < <(find "$DEST_DIR" -type f -print0)
             fi
-            rm -rf "$TMP_STAGE"
+            rm -rf "$TMP"
             echo "include_in_iso=$([[ "$INCLUDE_ISO" == "true" ]] && echo true || echo false)" > "$DEST_DIR/.iso.include"
-            echoe "Plan[$i] done → $DEST_DIR"
+            echo "plan $i done → $DEST_DIR"
           done
-          echoe "Manifest generated: $MANIFEST_CSV"
+          echo "✅ Manifest generated: $MANIFEST_CSV"
+
+      - name: (Optional) Final upgrade before Docker build
+        if: ${{ inputs.build_docker == true && (inputs.upgrade_all || inputs.upgrade_pip_tools) }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 -m pip install --upgrade pip
+          pip install --upgrade build setuptools wheel
+          echo "✅ final pip tool upgrade before docker build"
 
       - name: Optional Docker build + save (single-arch local)
         if: ${{ inputs.build_docker == true }}
@@ -657,18 +694,22 @@ jobs:
           P="${{ inputs.package_name }}"
           ROOT="workspace/${P}"
           IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
-          echoe "Building Docker image: $IMG"
+          logf "Building Docker image: $IMG"
           docker build -t "$IMG" "$ROOT"
           mkdir -p artifacts
           docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
-          echoe "image built & saved"
+          echo "✅ image built & saved"
 
-      - name: Install Syft & Trivy
+      - name: Install/Upgrade Syft & Trivy (SBOM/Sec)
+        if: ${{ inputs.upgrade_all || inputs.upgrade_sbom_sec || inputs.build_docker == true }}
         shell: bash
         run: |
           set -Eeuo pipefail
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft version || true
           curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version || true
+          echo "✅ Syft/Trivy ready"
 
       - name: Generate SBOMs (pkg & image)
         shell: bash
@@ -679,7 +720,6 @@ jobs:
           if [[ "${{ inputs.build_docker }}" == "true" ]]; then
             syft ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json > security/image-sbom.spdx.json || true
           fi
-          echoe "sboms generated"
 
       - name: Vulnerability scan (Trivy; fail on HIGH+)
         if: ${{ inputs.build_docker == true }}
@@ -687,7 +727,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           trivy image --no-progress --severity HIGH,CRITICAL --exit-code 1 \
-            ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}
+            ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} || {
+              echo "❌ HIGH/CRITICAL vulnerabilities found"; exit 1; }
 
       - name: Prepare ISO staging & info injection
         shell: bash
@@ -701,7 +742,7 @@ jobs:
           printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json"
           cp -a "$ROOT/dist" "$STAGE/pkg/" || true
           cp -a .github/echo_logs "$STAGE/docs/" || true
-          cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || warn "no perm_apply.sh"
+          cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/" || echo "⚠️ no perm_apply.sh"
           [[ -d "$ROOT/extra_manifests" ]] && cp -a "$ROOT/extra_manifests" "$STAGE/docs/" || true
           cp -a "$ROOT/server" "$STAGE/" || true
           if [[ -d "$ROOT" ]]; then
@@ -712,9 +753,14 @@ jobs:
             done < <(find "$ROOT" -type f -name ".iso.include" -print0 | xargs -0 grep -l "include_in_iso=true" || true)
           fi
           cat > "$STAGE/README.txt" <<'TXT'
-          Echo ISO — includes: pkg/dist, config/inject.json, docs/echo_logs, extra_manifests, perm_apply.sh, extra/* (copy-plan selected), server/*
+          Echo ISO — includes:
+          - pkg/dist
+          - config/inject.json
+          - docs/echo_logs, extra_manifests, perm_apply.sh
+          - extra/* (copy-plan selected)
+          - server/*
           TXT
-          echoe "ISO staging prepared at $STAGE"
+          echo "✅ ISO staging prepared: $STAGE"
 
       - name: Add ISO integrity bundle (SHA256 + SBOM copy)
         shell: bash
@@ -739,14 +785,14 @@ jobs:
             genisoimage -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
           fi
           (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
-          echoe "ISO built"
+          echo "✅ ISO built"
 
-      # GHCR 멀티아키(옵션)
+      # (옵션) GHCR 멀티아키 빌드/푸시
       - name: Set up QEMU
         if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Buildx (docker-container driver)
+      - name: Set up Buildx
         if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
         uses: docker/setup-buildx-action@v3
         with:
@@ -775,7 +821,7 @@ jobs:
           MINOR="${V%.*}"
           TAGS="${REPO}:${V}-${RUN},${REPO}:${MAJOR}.${MINOR#${MAJOR}.}-${RUN},${REPO}:${MAJOR}-${RUN},${REPO}:latest"
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echoe "Computed tags: ${TAGS}"
+          echo "Computed tags: ${TAGS}"
 
       - name: Login to GHCR
         if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' && github.token != '' }}
@@ -797,9 +843,8 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
 
-      # Cosign (조건문에 secrets 직접 참조 X → 스텝은 항상 실행, 내부에서 빈값이면 skip)
-      - name: Cosign sign (keyless or key-based auto-skip)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
+      # Cosign keyless/키기반: secrets 표현식 if 사용 대신 런타임 체크
+      - name: Cosign sign artifacts (keyless if available)
         shell: bash
         env:
           COSIGN_EXPERIMENTAL: "1"
@@ -808,26 +853,35 @@ jobs:
         run: |
           set -Eeuo pipefail
           curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin
-          IFS=',' read -r -a TAGS <<< "${{ steps.ghcrtags.outputs.tags }}"
-          if [[ -z "${COSIGN_KEY:-}" ]]; then
-            echoe "Keyless signing"
-            for t in "${TAGS[@]}"; do cosign sign "$t"; done
-          else
-            echoe "Key-based signing"
-            for t in "${TAGS[@]}"; do
-              cosign sign --key env://COSIGN_KEY "$t"
-            done
-          fi
-          if [[ -f security/image-sbom.spdx.json ]]; then
-            if [[ -z "${COSIGN_KEY:-}" ]]; then
-              cosign attest --predicate security/image-sbom.spdx.json --type spdx "${TAGS[0]}"
+          if [[ "${{ steps.parse.outputs.ghcr_enable }}" == "true" && "${{ inputs.build_docker }}" == "true" ]]; then
+            if [[ -n "${COSIGN_KEY}" && -n "${COSIGN_PASSWORD}" ]]; then
+              echo "Using key-based signing for ISO checksum and images"
             else
-              cosign attest --key env://COSIGN_KEY --predicate security/image-sbom.spdx.json --type spdx "${TAGS[0]}"
+              echo "Using keyless signing (OIDC) for images"
+            fi
+            IFS=',' read -r -a TAGS <<< "${{ steps.ghcrtags.outputs.tags }}"
+            for t in "${TAGS[@]}"; do
+              if [[ -n "${COSIGN_KEY}" && -n "${COSIGN_PASSWORD}" ]]; then
+                cosign sign --key env://COSIGN_KEY "$t"
+              else
+                cosign sign "$t"
+              fi
+            done
+            if [[ -f security/image-sbom.spdx.json ]]; then
+              if [[ -n "${COSIGN_KEY}" && -n "${COSIGN_PASSWORD}" ]]; then
+                cosign attest --key env://COSIGN_KEY --predicate security/image-sbom.spdx.json --type spdx "${TAGS[0]}"
+              else
+                cosign attest --predicate security/image-sbom.spdx.json --type spdx "${TAGS[0]}"
+              fi
             fi
           fi
-          echoe "cosign done"
+          if ls artifacts/*.iso.sha256 >/dev/null 2>&1; then
+            if [[ -n "${COSIGN_KEY}" && -n "${COSIGN_PASSWORD}" ]]; then
+              cosign sign-blob --key env://COSIGN_KEY artifacts/*.iso.sha256 > artifacts/ISO_SUMS.sig
+            fi
+          fi
+          echo "✅ cosign done"
 
-      # Docker Hub (옵션)
       - name: Push image to Docker Hub (optional)
         if: ${{ inputs.build_docker == true && steps.parse.outputs.dh_enable == 'true' }}
         shell: bash
@@ -840,7 +894,7 @@ jobs:
           DEST_REPO="${{ steps.parse.outputs.dh_repo }}"
           DEST_TAG="${{ steps.parse.outputs.dh_tag || steps.parse.outputs.image_tag }}"
           if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" || -z "$DEST_REPO" ]]; then
-            warn "DockerHub creds/repo missing; exporting tar fallback"
+            echo "⚠️ DockerHub creds/repo missing; exporting tar fallback"
             mkdir -p artifacts
             docker save "$SRC_IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
             exit 0
@@ -848,9 +902,8 @@ jobs:
           echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
           docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
           docker push "$DEST_REPO:$DEST_TAG"
-          echoe "pushed to Docker Hub: $DEST_REPO:$DEST_TAG"
+          echo "✅ pushed to Docker Hub: $DEST_REPO:$DEST_TAG"
 
-      # Secret/Licenses
       - name: Secret scan (gitleaks)
         uses: gitleaks/gitleaks-action@v2
         with:
@@ -863,9 +916,8 @@ jobs:
           pip install pip-licenses
           mkdir -p security
           pip-licenses --format=json --with-authors --with-urls > security/pip-licenses.json
-          echoe "pip-licenses generated"
+          echo "✅ pip-licenses generated"
 
-      # Draft release notes (항상 가능)
       - name: Ensure release drafter config
         shell: bash
         run: |
@@ -881,7 +933,7 @@ jobs:
               labels: [fix, bug]
           change-template: '- $TITLE (#$NUMBER) @$AUTHOR'
           YML
-          echoe "release-drafter.yml ready"
+          echo "✅ release-drafter.yml ready"
 
       - name: Draft release notes
         uses: release-drafter/release-drafter@v6
@@ -890,7 +942,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 실제 Release는 enable=true일 때만
       - name: Generate changelog (for release)
         if: ${{ steps.parse.outputs.rel_enable == 'true' }}
         shell: bash
@@ -899,6 +950,7 @@ jobs:
           mkdir -p artifacts
           git fetch --tags --force || true
           PREV_TAG=$(git tag --sort=-creatordate | sed -n '2p')
+          CURR_TAG="${{ steps.parse.outputs.rel_tag }}"
           git log --pretty=format:"* %h %s (%an)" ${PREV_TAG}..HEAD > artifacts/CHANGELOG.txt || true
           [[ -s artifacts/CHANGELOG.txt ]] || echo "* Initial release" > artifacts/CHANGELOG.txt
 
@@ -918,7 +970,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 서버 배포 (옵션)
       - name: Deploy to server via SSH (optional)
         if: ${{ steps.parse.outputs.dep_enable == 'true' }}
         shell: bash
@@ -935,7 +986,7 @@ jobs:
           SVC="${{ steps.parse.outputs.dep_svc }}"
           CMD="${{ steps.parse.outputs.dep_cmd }}"
           USE_SUDO="${{ steps.parse.outputs.dep_sudo }}"
-          [[ -z "$SSH_PRIVATE_KEY" ]] && { warn "SERVER_SSH_KEY secret missing"; exit 0; }
+          [[ -z "$SSH_PRIVATE_KEY" ]] && { echo "⚠️ SERVER_SSH_KEY missing"; exit 0; }
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
@@ -944,7 +995,7 @@ jobs:
           SUDO_FLAG=""; [[ "$USE_SUDO" == "true" ]] && SUDO_FLAG="SUDO=sudo"
           ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
             "cd $DEST && $SUDO_FLAG APP_NAME=${P} DEPLOY_PATH=$DEST START_CMD='$CMD' bash ./server/install_deploy.sh"
-          echoe "deployed to $USER@$HOST:$DEST"
+          echo "✅ deployed to $USER@$HOST:$DEST"
 
       - name: Post-deploy health check & rollback
         if: ${{ steps.parse.outputs.dep_enable == 'true' }}
@@ -957,14 +1008,14 @@ jobs:
           SVC="${{ steps.parse.outputs.dep_svc }}"
           ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
             "systemctl is-active $SVC || (echo '❌ unhealthy, try restart'; sudo systemctl restart $SVC; sleep 2; systemctl is-active $SVC || (echo '❌ still unhealthy'; exit 1))"
-          echoe "service healthy"
+          echo "✅ service healthy"
 
       - name: Retry wrapper example (noop)
         shell: bash
         run: |
           set -Eeuo pipefail
           n=0; until [ $n -ge 3 ]; do
-            echoe "try $((n+1))/3"; sleep 1 && break
+            echo "✅ try $((n+1))/3"; sleep 1 && break
             n=$((n+1)); echo "retry $n/3"; sleep 5
           done
 
@@ -983,9 +1034,9 @@ jobs:
               directory: "/"
               schedule: { interval: weekly }
           YML
-          echoe "dependabot.yml ready"
+          echo "✅ dependabot.yml ready"
 
-      - name: Upload artifacts (retention 7d)
+      - name: Upload artifacts (all-in-one, retention 7d)
         uses: actions/upload-artifact@v4
         with:
           name: echo-image-iso-${{ github.run_id }}
@@ -1006,4 +1057,4 @@ jobs:
           set -Eeuo pipefail
           docker system prune -af || true
           sudo rm -rf /var/lib/apt/lists/* || true
-          echoe "cleanup done"
+          echo "✅ cleanup done"
