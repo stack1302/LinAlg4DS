@@ -37,25 +37,24 @@ on:
         type: boolean
         default: true
       copy_plan_json:
-        description: >-
-          디렉토리 복사 계획(JSON). 필드: src, dest_rel, include_globs[], exclude_globs[], max_mb, include_in_iso, required
+        description: "디렉토리 복사 계획(JSON)"
         required: false
         default: "{\"plans\":[{\"src\":\"samples\",\"dest_rel\":\"extra/samples\",\"include_globs\":[\"**/*\"],\"exclude_globs\":[\"**/.git/**\",\"**/.github/**\"],\"max_mb\":100,\"include_in_iso\":true,\"required\":false}]}"
       advanced_json:
         description: >-
           확장 설정(JSON). 예: {
             "packaging":{"mode":"pip"},
-            "ghcr":{"enable":true,"repo":"ghcr.io/<OWNER>/<NAME>","tag":"latest"},
+            "ghcr":{"enable":false,"repo":"ghcr.io/<OWNER>/<NAME>","tag":"latest"},
             "dockerhub":{"enable":false,"repo":"<user>/<name>","tag":"latest"},
-            "release":{"enable":true,"tag":"v0.1.0","draft":false,"prerelease":false},
+            "release":{"enable":false,"tag":"v0.1.0","draft":false,"prerelease":false},
             "server":{"enable":false,"host":"example.com","user":"ubuntu","port":22,"deploy_path":"/opt/mypkg","service_name":"mypkg","start_cmd":"python -m mypkg","use_sudo":true}
           }
         required: false
         default: "{\"packaging\":{\"mode\":\"pip\"},\"ghcr\":{\"enable\":false},\"dockerhub\":{\"enable\":false},\"release\":{\"enable\":false},\"server\":{\"enable\":false}}"
 
 permissions:
-  contents: write      # Release
-  packages: write      # GHCR
+  contents: write
+  packages: write
   actions: read
 
 concurrency:
@@ -79,12 +78,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 전역 echo helper
+      # ──────────────────────────────────────────────────────────────────────────
+      # Echo helpers (left-aligned echo style)
+      # ──────────────────────────────────────────────────────────────────────────
       - name: Global echo helpers (persist across steps)
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "$GITHUB_WORKSPACE" "$LOG_DIR"
+          mkdir -p "$GITHUB_WORKSPACE/.github/echo_logs"
           cat > "$GITHUB_WORKSPACE/.bashenv" <<'SH'
           ECHO_OK="${ECHO_OK:-✅}"
           ECHO_WARN="${ECHO_WARN:-⚠️}"
@@ -108,35 +109,67 @@ jobs:
           trap 'echo "❌ Failed at line $LINENO"; tail -n 200 ${LOG_DIR}/run-* 2>/dev/null || true' ERR
           echo "✅ trap ready"
 
-      # 시스템/툴 업그레이드
-      - name: Upgrade base packages and pip toolchain
+      # ──────────────────────────────────────────────────────────────────────────
+      # Toolchain & upgrades
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: Install/upgrade base toolchain (echo)
         shell: bash
         run: |
           set -Eeuo pipefail
-          logf "apt upgrade & essentials"
+          source "$BASH_ENV"
+          logf "Installing & upgrading toolchain"
           sudo apt-get update -y
-          sudo apt-get -o Dpkg::Options::="--force-confnew" dist-upgrade -y || sudo apt-get upgrade -y
           sudo apt-get install -y python3 python3-venv python3-pip python3-setuptools python3-wheel \
-            git jq rsync xorriso genisoimage dosfstools openssh-client zstd
+              git jq rsync xorriso genisoimage dosfstools openssh-client curl
           python3 --version | tee -a "$LOG_DIR/python.txt"
           pip3 --version | tee -a "$LOG_DIR/pip.txt"
+          rsync --version | head -n1 | tee -a "$LOG_DIR/rsync.txt"
+          echoe "Base toolchain ready"
 
-      # 입력 파싱
-      - name: Parse inputs (metadata_json, image_ref, copy_plan_json, advanced_json)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Pip cache + local wheelhouse cache (restore/save)
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: Pip cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/pyproject.toml') }}
+
+      - name: Restore wheelhouse (optional)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: pip-wheelhouse-${{ github.run_id }}
+          path: .pip-wheelhouse-restore
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Parse inputs (safe quoting) + expose outputs
+      # ──────────────────────────────────────────────────────────────────────────
+      - name: Parse inputs (metadata, image_ref, copy_plan, advanced)
         id: parse
         shell: bash
         run: |
           set -Eeuo pipefail
+          source "$BASH_ENV"
           MJ='${{ inputs.metadata_json }}'
           A_NAME=$(printf '%s' "$MJ" | jq -r '.author_name // "Your Name"')
           A_EMAIL=$(printf '%s' "$MJ" | jq -r '.author_email // "you@example.com"')
           L_NAME=$(printf '%s' "$MJ" | jq -r '.license_name // "MIT"')
+
           IMG='${{ inputs.image_ref }}'
           if [[ "$IMG" == *:* ]]; then IMG_NAME="${IMG%%:*}"; IMG_TAG="${IMG##*:}"; else IMG_NAME="$IMG"; IMG_TAG="latest"; fi
+
           CP='${{ inputs.copy_plan_json }}'
           printf '%s' "$CP" | jq . >/dev/null
+
           ADV='${{ inputs.advanced_json }}'
           printf '%s' "$ADV" | jq . >/dev/null
+
           PKG_MODE=$(printf '%s' "$ADV" | jq -r '.packaging.mode // "pip"')
           GHCR_ENABLE=$(printf '%s' "$ADV" | jq -r '.ghcr.enable // false')
           GHCR_REPO=$(printf '%s' "$ADV" | jq -r '.ghcr.repo // ""')
@@ -156,6 +189,7 @@ jobs:
           DEP_SVC=$(printf '%s' "$ADV" | jq -r '.server.service_name // "mypkg"')
           DEP_CMD=$(printf '%s' "$ADV" | jq -r '.server.start_cmd // "python -m mypkg"')
           DEP_SUDO=$(printf '%s' "$ADV" | jq -r '.server.use_sudo // true')
+
           {
             echo "author_name=$A_NAME"
             echo "author_email=$A_EMAIL"
@@ -182,637 +216,5 @@ jobs:
             echo "dep_cmd=$DEP_CMD"
             echo "dep_sudo=$DEP_SUDO"
           } | tee -a "$LOG_DIR/parsed_inputs.env"
-          for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh_enable dh_repo dh_tag rel_enable rel_tag rel_draft rel_prerelease dep_enable dep_host dep_user dep_port dep_path dep_svc dep_cmd dep_sudo; do
-            v=$(grep "^$k=" "$LOG_DIR/parsed_inputs.env" | cut -d= -f2-)
-            echo "$k=$v" >> "$GITHUB_OUTPUT"
-          done
-          printf '%s' "$CP" > copy_plan.json
-          printf '%s' "$ADV" > advanced.json
-          logf "copy_plan.json & advanced.json saved"
 
-      - name: Validate inputs
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          err(){ echo "❌ $*"; exit 1; }
-          [[ "${{ inputs.package_name }}" =~ ^[a-z0-9_]+$ ]] || err "package_name 은 소문자/숫자/언더스코어만 허용"
-          [[ "${{ inputs.package_version }}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z\.-]+)?$ ]] || err "package_version 은 SemVer 형식 필요"
-          [[ "${{ inputs.image_ref }}" =~ ^[a-z0-9._/-]+(:[a-zA-Z0-9._-]+)?$ ]] || err "image_ref 형식 오류"
-          if [[ "${{ steps.parse.outputs.rel_enable }}" == "true" ]]; then
-            [[ "${{ steps.parse.outputs.rel_tag }}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || err "rel_tag 는 vX.Y.Z 형식 필요"
-          fi
-          echo "✅ input validation passed"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # pip 캐시
-      - name: Pip cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ./.pip-wheelhouse
-          key: pip-${{ runner.os }}-${{ steps.parse.outputs.pkg_mode }}-${{ hashFiles('**/pyproject.toml') }}
-
-      # 패키지 스캐폴드
-      - name: Create Python package skeleton (PEP 621 / server scripts)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          V="${{ inputs.package_version }}"
-          A="${{ steps.parse.outputs.author_name }}"
-          E="${{ steps.parse.outputs.author_email }}"
-          L="${{ steps.parse.outputs.license_name }}"
-          ROOT="workspace/${P}"
-          PKG_DIR="$ROOT/src/${P}"
-          TEST_DIR="$ROOT/tests"
-          DOC_DIR="$ROOT/docs"
-          mkdir -p "$PKG_DIR" "$TEST_DIR" "$DOC_DIR" "$ROOT/server"
-          cat > "$ROOT/pyproject.toml" <<'PYT'
-          [build-system]
-          requires = ["setuptools>=68", "wheel"]
-          build-backend = "setuptools.build_meta"
-          [project]
-          name = "__PKG_NAME__"
-          version = "__PKG_VER__"
-          description = "Auto-generated package with EchoOps"
-          authors = [{ name="__AUTHOR__", email="__EMAIL__"}]
-          license = "MIT"
-          readme = "README.md"
-          requires-python = ">=3.9"
-          classifiers = [
-            "Programming Language :: Python :: 3"
-          ]
-          [tool.setuptools.packages.find]
-          where = ["src"]
-          PYT
-          sed -i "s/__PKG_NAME__/${P}/g" "$ROOT/pyproject.toml"
-          sed -i "s/__PKG_VER__/${V}/g" "$ROOT/pyproject.toml"
-          sed -i "s/__AUTHOR__/${A}/g" "$ROOT/pyproject.toml"
-          sed -i "s/__EMAIL__/${E}/g" "$ROOT/pyproject.toml"
-          cat > "$ROOT/README.md" <<'MD'
-          # Auto Generated Python Package
-          - EchoOps generated.
-          - Includes Dockerfile, ISO injection artifacts, copy-plan manifest, and server deploy scripts.
-          MD
-          cat > "$PKG_DIR/__init__.py" <<'PY'
-          __all__ = ["hello"]
-          __version__ = "__VER__"
-          def hello(name: str = "World") -> str:
-              return f"Hello, {name}!"
-          PY
-          sed -i "s/__VER__/${V}/g" "$PKG_DIR/__init__.py"
-          cat > "$TEST_DIR/test_hello.py" <<'PY'
-          from mypkg import hello
-          def test_hello():
-              assert hello("Echo") == "Hello, Echo!"
-          PY
-          # Dockerfile
-          cat > "$ROOT/Dockerfile" <<'DOCKER'
-          FROM python:3.11-slim
-          WORKDIR /app
-          COPY . /app
-          RUN pip install --no-cache-dir .
-          CMD ["python","-c","import __PKG__; print(__PKG__.hello('Docker'))"]
-          DOCKER
-          sed -i "s/__PKG__/${P}/g" "$ROOT/Dockerfile"
-          # server/install_deploy.sh
-          cat > "$ROOT/server/install_deploy.sh" <<'SH'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          SUDO=${SUDO:-sudo}
-          APP_NAME="${APP_NAME:-__APP__}"
-          DEPLOY_PATH="${DEPLOY_PATH:-/opt/__APP__}"
-          START_CMD="${START_CMD:-python -m __APP__}"
-          $SUDO mkdir -p "$DEPLOY_PATH"
-          $SUDO rsync -a ./ "$DEPLOY_PATH/"
-          $SUDO python3 -m venv "$DEPLOY_PATH/.venv"
-          $SUDO bash -lc "source \"$DEPLOY_PATH/.venv/bin/activate\" && pip install --upgrade pip && pip install ."
-          UNIT="/etc/systemd/system/__APP__.service"
-          cat | $SUDO tee "$UNIT" >/dev/null <<EOF
-          [Unit]
-          Description=__APP__ Service
-          After=network.target
-          [Service]
-          Type=simple
-          WorkingDirectory=$DEPLOY_PATH
-          ExecStart=$DEPLOY_PATH/.venv/bin/${START_CMD}
-          Restart=on-failure
-          [Install]
-          WantedBy=multi-user.target
-          EOF
-          $SUDO systemctl daemon-reload
-          $SUDO systemctl enable __APP__.service
-          $SUDO systemctl restart __APP__.service
-          SH
-          sed -i "s/__APP__/${P}/g" "$ROOT/server/install_deploy.sh"
-          chmod +x "$ROOT/server/install_deploy.sh"
-          echo "Python skeleton + server scripts created at $ROOT"
-
-      - name: Install test deps (wheelhouse prefetch)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          python -m pip install --upgrade pip
-          mkdir -p .pip-wheelhouse
-          pip download --dest ./.pip-wheelhouse build pytest pluggy iniconfig packaging pygments pyproject_hooks || true
-          tar --use-compress-program zstdmt -cf pip-wheelhouse.tzst -C . .pip-wheelhouse || true
-          echo "📦 wheelhouse packed (optional)"
-
-      - name: Upload wheelhouse artifact (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: pip-wheelhouse-${{ github.run_id }}
-          path: pip-wheelhouse.tzst
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Install test deps (from wheelhouse if exists)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [[ -f pip-wheelhouse.tzst ]]; then
-            tar --use-compress-program zstdmt -xf pip-wheelhouse.tzst
-            pip install --no-index --find-links ./.pip-wheelhouse build pytest pluggy iniconfig packaging pygments pyproject_hooks || true
-          else
-            pip install build pytest
-          fi
-
-      - name: Run unit tests (pytest)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd workspace/${{ inputs.package_name }}
-          pytest -q
-
-      # 빌드(모드 선택)
-      - name: Build (pip/poetry/conda)
-        id: buildpkg
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          MODE="${{ steps.parse.outputs.pkg_mode }}"
-          P="${{ inputs.package_name }}"
-          ROOT="workspace/${P}"
-          case "$MODE" in
-            poetry)
-              python3 -m pip install --upgrade pip poetry build
-              (cd "$ROOT" && poetry build)
-              ;;
-            conda)
-              sudo apt-get update -y && sudo apt-get install -y wget bzip2
-              MINI="$HOME/miniconda"
-              wget -qO ~/miniconda.sh https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-              bash ~/miniconda.sh -b -p "$MINI"
-              source "$MINI/etc/profile.d/conda.sh"
-              conda create -y -n "${P}" python=3.11
-              conda activate "${P}"
-              pip install --upgrade pip
-              (cd "$ROOT" && pip install .)
-              pip install conda-pack
-              mkdir -p "$ROOT/dist"
-              conda pack -n "${P}" -o "$ROOT/dist/${P}-env.tar.gz"
-              ;;
-            *)
-              python3 -m pip install --upgrade pip build
-              python3 -m build "$ROOT"
-              ;;
-          esac
-          ls -al "$ROOT/dist" || true
-
-      # 대량 디렉토리 생성 + perm 스크립트
-      - name: Massive directories (+perm script)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          COUNT="${{ inputs.dirs_count }}"
-          BASE="workspace/${P}/echo_mass"
-          mkdir -p "$BASE"
-          cat > "$BASE/perm_apply.sh" <<'SH'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"
-          mkdir -p "$LOG_DIR"
-          OUT="$LOG_DIR/perm-$(date +%Y%m%d%H%M%S).log"
-          echo "perm started: $(date)" | tee -a "$OUT"
-          for d in "$@"; do
-            mkdir -p "$d"
-            chmod 755 "$d"
-            printf 'ECHO %s %s\n' "$(date +%Y-%m-%dT%H:%M:%S)" "$d" | tee -a "$OUT"
-            echo "ok" > "$d/.echo.ok"
-          done
-          echo "done: $(date)" | tee -a "$OUT"
-          SH
-          chmod +x "$BASE/perm_apply.sh"
-          mapfile -t DLIST < <(seq -w 1 "$COUNT" | xargs -I{} echo "$BASE/dir_{}")
-          "$BASE/perm_apply.sh" "${DLIST[@]}"
-          echo "✅ sources ensured"
-
-      # Copy plan 사전 리포트 (jq 안전 인용)
-      - name: Copy plan dry-run summary
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [[ -f copy_plan.json ]]; then
-            jq -r '.plans[] | "\(.src) -> \(.dest_rel) | include:\((.include_globs//[])|join("|")) exclude:\((.exclude_globs//[])|join("|")) max:\(.max_mb)MB"' copy_plan.json || true
-          else
-            echo "no copy_plan.json"
-          fi
-
-      # samples 소스 보강(없어도 스킵되지 않도록)
-      - name: Ensure sample source folder exists (for copy plan)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if jq -e '.plans[].src=="samples"' copy_plan.json >/dev/null 2>&1; then
-            mkdir -p samples && echo "demo" > samples/hello.txt
-            echo "✅ samples prepared"
-          fi
-
-      # 디렉토리 복사 + 매니페스트
-      - name: Copy directories by copy_plan_json (manifest+checksums)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          ROOT="workspace/${P}"
-          PLAN_FILE="copy_plan.json"
-          DEST_BASE="$ROOT"
-          [[ -f "$PLAN_FILE" ]] || { echo "no copy_plan.json"; exit 0; }
-          mkdir -p "$ROOT/extra_manifests"
-          MANIFEST_CSV="$ROOT/extra_manifests/manifest-$(date +%Y%m%d%H%M%S).csv"
-          echo "src,resolved_src,dest_rel,relpath,bytes,sha256" > "$MANIFEST_CSV"
-          nf(){ if command -v numfmt >/dev/null 2>&1; then numfmt --to=iec "$1"; else echo "$1 bytes"; fi; }
-          COUNT_PLANS=$(jq -r '.plans | length' "$PLAN_FILE")
-          for i in $(seq 0 $((COUNT_PLANS-1))); do
-            SRC=$(jq -r ".plans[$i].src" "$PLAN_FILE")
-            DEST_REL=$(jq -r ".plans[$i].dest_rel // \"extra\"" "$PLAN_FILE")
-            MAX_MB=$(jq -r ".plans[$i].max_mb // 100" "$PLAN_FILE")
-            INCLUDE_ISO=$(jq -r ".plans[$i].include_in_iso // true" "$PLAN_FILE")
-            REQUIRED=$(jq -r ".plans[$i].required // false" "$PLAN_FILE")
-            mapfile -t INCLUDES < <(jq -r ".plans[$i].include_globs[]?" "$PLAN_FILE")
-            mapfile -t EXCLUDES < <(jq -r ".plans[$i].exclude_globs[]?" "$PLAN_FILE")
-            RESOLVED_SRC=""
-            if [[ "$SRC" == /* ]]; then
-              [[ -d "$SRC" ]] && RESOLVED_SRC="$SRC"
-            else
-              [[ -d "$GITHUB_WORKSPACE/$SRC" ]] && RESOLVED_SRC="$GITHUB_WORKSPACE/$SRC"
-              [[ -z "$RESOLVED_SRC" && -d "$DEST_BASE/$SRC" ]] && RESOLVED_SRC="$DEST_BASE/$SRC"
-              [[ -z "$RESOLVED_SRC" && -d "$SRC" ]] && RESOLVED_SRC="$SRC"
-            fi
-            if [[ -z "$RESOLVED_SRC" ]]; then
-              if [[ "$REQUIRED" == "true" ]]; then
-                echo "❌ required src not found: $SRC" && exit 1
-              else
-                echo "⚠️ SRC not found: $SRC — skip"
-                continue
-              fi
-            fi
-            DEST_DIR="$DEST_BASE/$DEST_REL"
-            mkdir -p "$DEST_DIR"
-            RSYNC_ARGS=(-a --delete --prune-empty-dirs)
-            for p in "${INCLUDES[@]}";  do RSYNC_ARGS+=(--include "$p"); done
-            for p in "${EXCLUDES[@]}";  do RSYNC_ARGS+=(--exclude "$p"); done
-            RSYNC_ARGS+=(--exclude '.git/' --exclude '.github/')
-            RSYNC_ARGS+=(--include '*/' --exclude '*')
-            TMP_STAGE="$(mktemp -d)"
-            rsync "${RSYNC_ARGS[@]}" "$RESOLVED_SRC/" "$TMP_STAGE/"
-            TOTAL_BYTES=$(du -sb "$TMP_STAGE" | awk '{print $1}')
-            LIMIT_BYTES=$((MAX_MB * 1024 * 1024))
-            if (( TOTAL_BYTES > LIMIT_BYTES )); then
-              echo "⚠️ size exceed: $(nf "$TOTAL_BYTES") > $(nf "$LIMIT_BYTES"). newest-first truncation."
-              mkdir -p "$DEST_DIR"; REMAIN=$LIMIT_BYTES
-              mapfile -t FILES < <(find "$TMP_STAGE" -type f -printf '%T@ %p\n' | sort -nr | awk '{sub($1 FS,""); print}')
-              for f in "${FILES[@]}"; do
-                sz=$(stat -c%s "$f"); (( sz <= REMAIN )) || continue
-                rel="${f#"$TMP_STAGE/"}"
-                mkdir -p "$DEST_DIR/$(dirname "$rel")"
-                cp -a "$f" "$DEST_DIR/$rel"
-                REMAIN=$((REMAIN - sz))
-              done
-            else
-              rsync -a --delete "$TMP_STAGE/" "$DEST_DIR/"
-            fi
-            if [[ -d "$DEST_DIR" ]]; then
-              while IFS= read -r -d '' f; do
-                rel="${f#"$DEST_BASE/"}"
-                bytes=$(stat -c%s "$f")
-                sha=$(sha256sum "$f" | awk '{print $1}')
-                printf '%s,%s,%s,%s,%s\n' "$SRC" "$RESOLVED_SRC" "$DEST_REL" "${rel#"$DEST_REL/"}" "$bytes" "$sha" >> "$MANIFEST_CSV"
-              done < <(find "$DEST_DIR" -type f -print0)
-            fi
-            rm -rf "$TMP_STAGE"
-            echo "include_in_iso=${INCLUDE_ISO}" > "$DEST_DIR/.iso.include"
-            echo "Plan[$i] done → $DEST_DIR"
-          done
-          echo "✅ Manifest generated: $MANIFEST_CSV"
-
-      # Buildx/QEMU 최신 셋업
-      - name: Setup QEMU (latest)
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: all
-
-      - name: Setup Buildx (docker-container)
-        uses: docker/setup-buildx-action@v3
-        with:
-          install: true
-          driver: docker-container
-          buildkitd-flags: --debug
-
-      # buildx + 캐시 + 로드
-      - name: Docker buildx build (with gha cache) and LOAD
-        if: ${{ inputs.build_docker == true }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          ROOT="workspace/${{ inputs.package_name }}"
-          IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
-          docker buildx build \
-            --builder default \
-            --platform linux/amd64 \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
-            -t "$IMG" \
-            -f "$ROOT/Dockerfile" "$ROOT" \
-            --load
-          mkdir -p artifacts
-          docker save "$IMG" | gzip -c > "artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz"
-          echo "✅ image built & saved"
-
-      # 보안 도구 최신화
-      - name: Install/Upgrade Syft & Trivy
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          (curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin) || true
-          (curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin) || true
-          syft version || true
-          trivy --version || true
-
-      - name: SBOM & Vulnerability scan (dir + image)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p security
-          syft scan dir:workspace/${{ inputs.package_name }} -o spdx-json -q > security/pkg-sbom.spdx.json || echo '{}' > security/pkg-sbom.spdx.json
-          if docker image inspect ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} >/dev/null 2>&1; then
-            syft scan ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} -o spdx-json -q > security/image-sbom.spdx.json || echo '{}' > security/image-sbom.spdx.json
-            trivy image --no-progress --severity HIGH,CRITICAL --format table \
-              -o security/image-vuln.txt ${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }} || true
-          else
-            trivy fs --no-progress --severity HIGH,CRITICAL --format table \
-              -o security/image-vuln.txt workspace/${{ inputs.package_name }} || true
-          fi
-          echo "✅ vuln scan done"
-
-      # ISO 스테이징
-      - name: Prepare ISO staging & info injection
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          ROOT="workspace/${P}"
-          STAGE="iso_stage/${P}"
-          mkdir -p "$STAGE/config" "$STAGE/pkg" "$STAGE/docs" "$STAGE/extra" "$STAGE/server"
-          echo "${{ github.repository }},${{ github.run_id }},${{ github.ref_name }}" > "$STAGE/build_info.csv"
-          printf '%s' '${{ inputs.inject_info_json }}' | jq . > "$STAGE/config/inject.json" || echo '{}' > "$STAGE/config/inject.json"
-          cp -a "$ROOT/dist" "$STAGE/pkg/" 2>/dev/null || true
-          cp -a .github/echo_logs "$STAGE/docs/" 2>/dev/null || true
-          # perm_apply.sh 가 없다면 생성
-          if [[ -f "$ROOT/echo_mass/perm_apply.sh" ]]; then
-            cp -a "$ROOT/echo_mass/perm_apply.sh" "$STAGE/docs/"
-          else
-            cat > "$STAGE/docs/perm_apply.sh" <<'SH'
-            #!/usr/bin/env bash
-            set -Eeuo pipefail
-            for d in "$@"; do mkdir -p "$d" && chmod 755 "$d"; done
-            echo "perm done"
-            SH
-            chmod +x "$STAGE/docs/perm_apply.sh"
-          fi
-          [[ -d "$ROOT/extra_manifests" ]] && cp -a "$ROOT/extra_manifests" "$STAGE/docs/" || true
-          cp -a "$ROOT/server" "$STAGE/" 2>/dev/null || true
-          if [[ -d "$ROOT" ]]; then
-            while IFS= read -r -d '' marker; do
-              d="$(dirname "$marker")"
-              rel="${d#"$ROOT/"}"
-              mkdir -p "$STAGE/extra/$rel"
-              rsync -a "$d/" "$STAGE/extra/$rel/"
-            done < <(find "$ROOT" -type f -name ".iso.include" -print0 | xargs -0 grep -l "include_in_iso=true" || true)
-          fi
-          cat > "$STAGE/README.txt" <<'TXT'
-          Echo ISO — includes:
-          - pkg/dist: built wheels/sdists or conda env pack
-          - config/inject.json: injected metadata
-          - docs/echo_logs: run logs
-          - docs/perm_apply.sh
-          - docs/extra_manifests: copy-plan manifest & checksums
-          - extra/*: directories copied per copy_plan (include_in_iso=true)
-          - server/*: install_deploy.sh & systemd unit template
-          TXT
-          echo "✅ ISO staging prepared"
-
-      - name: Add ISO integrity bundle (SHA256 + SBOM copy)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          STAGE="iso_stage/${{ inputs.package_name }}"
-          mkdir -p "$STAGE/docs"
-          (cd "$STAGE" && find . -type f -print0 | xargs -0 sha256sum) > "$STAGE/docs/ISO_FILES.sha256"
-          cp -a security/*.json "$STAGE/docs/" 2>/dev/null || true
-
-      - name: Build ISO (xorriso / genisoimage fallback)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          ISO_NAME="${{ inputs.package_name }}-${{ inputs.package_version }}.iso"
-          LABEL="${{ inputs.iso_label }}"
-          STAGE="iso_stage/${{ inputs.package_name }}"
-          mkdir -p artifacts
-          if command -v xorriso >/dev/null 2>&1; then
-            xorriso -as mkisofs -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
-          else
-            genisoimage -R -J -V "$LABEL" -o "artifacts/${ISO_NAME}" "$STAGE"
-          fi
-          (cd artifacts && sha256sum "${ISO_NAME}" > "${ISO_NAME}.sha256" )
-          echo "✅ ISO built"
-
-      # GHCR 태그
-      - name: Compute GHCR semver tags
-        id: ghcrtags
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          REPO="${{ steps.parse.outputs.ghcr_repo }}"
-          V="${{ inputs.package_version }}"
-          MAJOR="${V%%.*}"
-          MINOR="${V%.*}"
-          TAGS="${REPO}:${V}-${{ github.run_id }},${REPO}:${MAJOR}.${MINOR#${MAJOR}.}-${{ github.run_id }},${REPO}:${MAJOR}-${{ github.run_id }},${REPO}:latest"
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
-          echo "Computed tags: ${TAGS}"
-
-      - name: Login GHCR (skip if token missing)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [[ -n "${{ github.token }}" ]]; then
-            echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          else
-            echo "⚠️ GH token missing; will try anonymous (likely to fail)"
-          fi
-
-      - name: Buildx multi-arch PUSH to GHCR (with cache) or fallback to --load
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          ROOT="workspace/${{ inputs.package_name }}"
-          T1="$(echo "${{ steps.ghcrtags.outputs.tags }}"|cut -d, -f1)"
-          if docker buildx build \
-              --builder default \
-              --platform linux/amd64,linux/arm64 \
-              --cache-from type=gha \
-              --cache-to type=gha,mode=max \
-              -t "$T1" \
-              -f "$ROOT/Dockerfile" "$ROOT" \
-              --push ; then
-            echo "✅ multi-arch push 완료"
-          else
-            echo "⚠️ multi-arch push 실패 → 단일 아치 --load 폴백"
-            docker buildx build \
-              --builder default \
-              --platform linux/amd64 \
-              --cache-from type=gha \
-              --cache-to type=gha,mode=max \
-              -t "$T1" \
-              -f "$ROOT/Dockerfile" "$ROOT" \
-              --load || true
-          fi
-          echo "✅ GHCR step done"
-
-      # Docker Hub (비밀키 유무 내부 체크)
-      - name: Push image to Docker Hub (optional)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.dh_enable == 'true' }}
-        shell: bash
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          set -Eeuo pipefail
-          SRC_IMG="${{ steps.parse.outputs.image_name }}:${{ steps.parse.outputs.image_tag }}"
-          DEST_REPO="${{ steps.parse.outputs.dh_repo }}"
-          DEST_TAG="${{ steps.parse.outputs.dh_tag }}"
-          if [[ -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ]]; then
-            echo "ℹ️ No DockerHub creds; exporting fallback tar"
-            cp -f artifacts/${{ steps.parse.outputs.image_name }}-${{ steps.parse.outputs.image_tag }}.tar.gz artifacts/dockerhub-fallback-${{ steps.parse.outputs.image_tag }}.tar.gz || true
-          else
-            [[ -z "$DEST_REPO" ]] && { echo "⚠️ dockerhub.repo empty, skip"; exit 0; }
-            [[ -z "$DEST_TAG"  ]] && DEST_TAG="${{ steps.parse.outputs.image_tag }}"
-            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
-            docker tag "$SRC_IMG" "$DEST_REPO:$DEST_TAG"
-            docker push "$DEST_REPO:$DEST_TAG"
-            echo "✅ DockerHub push 완료"
-          fi
-          echo "✅ DockerHub step done"
-
-      # Cosign (if key 존재시만 내부에서 판단)
-      - name: Cosign sign GHCR images (optional; safe guard)
-        if: ${{ inputs.build_docker == true && steps.parse.outputs.ghcr_enable == 'true' }}
-        shell: bash
-        env:
-          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-        run: |
-          set -Eeuo pipefail
-          if [[ -z "$COSIGN_KEY" ]]; then
-            echo "ℹ️ COSIGN_KEY not provided; skip signing"
-            exit 0
-          fi
-          curl -sSfL https://raw.githubusercontent.com/sigstore/cosign/main/install.sh | sh -s -- -b /usr/local/bin || true
-          IFS=',' read -r -a TAGS <<< "${{ steps.ghcrtags.outputs.tags }}"
-          for t in "${TAGS[@]}"; do
-            echo "Signing $t"
-            COSIGN_EXPERIMENTAL=1 cosign sign --key env://COSIGN_KEY "$t" || true
-          done
-          if [[ -f security/image-sbom.spdx.json ]]; then
-            COSIGN_EXPERIMENTAL=1 cosign attest --key env://COSIGN_KEY \
-              --predicate security/image-sbom.spdx.json --type spdx "${TAGS[0]}" || true
-          fi
-
-      # Changelog & Release (옵션)
-      - name: Generate changelog (for release)
-        if: ${{ steps.parse.outputs.rel_enable == 'true' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p artifacts
-          git fetch --tags --force || true
-          PREV_TAG=$(git tag --sort=-creatordate | sed -n '2p')
-          git log --pretty=format:"* %h %s (%an)" ${PREV_TAG}..HEAD > artifacts/CHANGELOG.txt || echo "* Initial release" > artifacts/CHANGELOG.txt
-
-      - name: Create GitHub Release (optional)
-        if: ${{ steps.parse.outputs.rel_enable == 'true' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.parse.outputs.rel_tag }}
-          draft: ${{ steps.parse.outputs.rel_draft }}
-          prerelease: ${{ steps.parse.outputs.rel_prerelease }}
-          files: |
-            artifacts/*.iso
-            artifacts/*.sha256
-            artifacts/CHANGELOG.txt
-            artifacts/*.tar.gz
-            security/**
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # 서버 배포(옵션)
-      - name: Deploy to server via SSH (optional)
-        if: ${{ steps.parse.outputs.dep_enable == 'true' }}
-        shell: bash
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.SERVER_SSH_KEY }}
-        run: |
-          set -Eeuo pipefail
-          P="${{ inputs.package_name }}"
-          ROOT="workspace/${P}"
-          HOST="${{ steps.parse.outputs.dep_host }}"
-          USER="${{ steps.parse.outputs.dep_user }}"
-          PORT="${{ steps.parse.outputs.dep_port }}"
-          DEST="${{ steps.parse.outputs.dep_path }}"
-          SVC="${{ steps.parse.outputs.dep_svc }}"
-          CMD="${{ steps.parse.outputs.dep_cmd }}"
-          USE_SUDO="${{ steps.parse.outputs.dep_sudo }}"
-          [[ -z "$SSH_PRIVATE_KEY" ]] && { echo "❌ SERVER_SSH_KEY secret missing"; exit 1; }
-          mkdir -p ~/.ssh
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
-          ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" "mkdir -p $DEST"
-          rsync -az -e "ssh -p $PORT -o StrictHostKeyChecking=no" "$ROOT/" "$USER@$HOST:$DEST/"
-          SUDO_FLAG=""
-          [[ "$USE_SUDO" == "true" ]] && SUDO_FLAG="SUDO=sudo"
-          ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
-            "cd $DEST && $SUDO_FLAG APP_NAME=${P} DEPLOY_PATH=$DEST START_CMD='$CMD' bash ./server/install_deploy.sh"
-          ssh -o StrictHostKeyChecking=no -p "$PORT" "$USER@$HOST" \
-            "sudo systemctl is-active $SVC && sudo systemctl status --no-pager $SVC | tail -n 50"
-
-      # 아티팩트 업로드
-      - name: Upload artifacts (retention 7d)
-        uses: actions/upload-artifact@v4
-        with:
-          name: echo-image-iso-${{ github.run_id }}
-          path: |
-            artifacts/**
-            workspace/**/dist/**
-            .github/echo_logs/**
-            security/**
-          retention-days: 7
-          if-no-files-found: warn
+          for k in author_name author_email license_name image_name image_tag pkg_mode ghcr_enable ghcr_repo ghcr_tag dh
