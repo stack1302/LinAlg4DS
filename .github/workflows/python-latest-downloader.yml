@@ -1,0 +1,190 @@
+name: "🐍 Python Latest Downloader (curl + official URLs + Echo + 호출용)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: "받을 트랙: latest(최신 3.x), 3.13, 3.12 처럼 특정 마이너만"
+        required: false
+        default: "latest"
+      version_override:
+        description: "정확한 버전을 강제로 지정 (예: 3.13.0). 지정 시 track 무시"
+        required: false
+        default: ""
+      include_installers:
+        description: "Windows/macOS 설치 파일까지 함께 다운로드"
+        type: boolean
+        required: false
+        default: false
+  workflow_call:
+    inputs:
+      track:
+        required: false
+        type: string
+        default: "latest"
+      version_override:
+        required: false
+        type: string
+        default: ""
+      include_installers:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_logs
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
+
+jobs:
+  resolve-and-download:
+    name: "Resolve latest version & Download from official URLs"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: "Checkout (for artifact path)"
+        uses: actions/checkout@v4
+
+      - name: "Install tools (jq, coreutils)"
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq coreutils
+
+      - name: "Init echo helpers"
+        id: echo_init
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}"
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "${LOG_DIR}/python-download.log"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "${LOG_DIR}/python-download.log"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "${LOG_DIR}/python-download.log"; }
+          run_cmd(){ printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/python-download.log"; eval "$@" 2>&1 | tee -a "${LOG_DIR}/python-download.log"; }
+          curl_get(){
+            local url="$1"; local out="$2"
+            run_cmd "curl -fSsvL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 600 \"$url\" -o \"$out\""
+          }
+          # export functions to subshells
+          declare -f echoe; declare -f warn; declare -f fail; declare -f run_cmd; declare -f curl_get > /tmp/echo_helpers.sh
+          echo "helpers=/tmp/echo_helpers.sh" >> "$GITHUB_OUTPUT"
+
+      - name: "Resolve Python version (official cpython releases)"
+        id: resolve
+        env:
+          INPUT_TRACK: ${{ inputs.track || github.event.inputs.track }}
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override || github.event.inputs.version_override }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          . "$(/usr/bin/grep -oP '(?<=helpers=).*' <<< '${{ steps.echo_init.outputs.helpers }}')"
+
+          TRACK="${INPUT_TRACK:-latest}"
+          OVERRIDE="${INPUT_VERSION_OVERRIDE:-}"
+          API_URL="https://api.github.com/repos/python/cpython/releases?per_page=100"
+
+          if [ -n "$OVERRIDE" ]; then
+            VERSION="$OVERRIDE"
+            echoe "version_override 지정됨 → VERSION=${VERSION}"
+          else
+            echoe "릴리스 목록 조회: $API_URL (사전 릴리스/드래프트 제외)"
+            # GH_TOKEN 있으면 헤더로, 없어도 공개 API 호출 가능
+            if [ -n "${GH_TOKEN:-}" ]; then
+              RESP="$(curl -fSsL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" "$API_URL")"
+            else
+              RESP="$(curl -fSsL -H "Accept: application/vnd.github+json" "$API_URL")"
+            fi
+
+            # 안정 릴리스만 필터하고, 태그명(v3.13.0)에서 v 제거
+            # TRACK=latest → 최신 3.x 하나 선택
+            # TRACK=3.13 처럼 주어지면 그 prefix로 시작하는 최신 선택
+            if [ "${TRACK}" = "latest" ]; then
+              VERSION="$(echo "$RESP" | jq -r '[.[] | select(.prerelease==false and .draft==false) | .tag_name] 
+                | map(gsub("^v";"")) 
+                | map(select(startswith("3."))) 
+                | .[0]')"
+            else
+              PREFIX="${TRACK}."
+              VERSION="$(echo "$RESP" | jq -r --arg pfx "$PREFIX" '[.[] 
+                | select(.prerelease==false and .draft==false) 
+                | .tag_name 
+                | gsub("^v";"") 
+                | select(startswith($pfx))] 
+                | .[0]')"
+            fi
+
+            if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
+              fail "GitHub 릴리스에서 버전을 찾지 못했습니다. track=${TRACK}"
+              exit 1
+            fi
+            echoe "해결된 최신 버전: ${VERSION} (track=${TRACK})"
+          fi
+
+          # 대소문자 섞여 있으니 변수 준비
+          V_LC="$(printf '%s' "${VERSION}" | tr '[:upper:]' '[:lower:]')"
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "v_lc=${V_LC}"       >> "$GITHUB_OUTPUT"
+
+      - name: "Download from official python.org (source + optional installers)"
+        id: download
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          INCLUDE_INSTALLERS: ${{ inputs.include_installers || github.event.inputs.include_installers }}
+        run: |
+          set -Eeuo pipefail
+          . "$(/usr/bin/grep -oP '(?<=helpers=).*' <<< '${{ steps.echo_init.outputs.helpers }}')"
+
+          BASE_DIR="downloads/python-${VERSION}"
+          run_cmd "mkdir -p \"$BASE_DIR\""
+
+          PY_FTP_BASE="https://www.python.org/ftp/python/${VERSION}"
+
+          # 공식 소스 (둘 다 시도: .tgz, .tar.xz)
+          SRC_TGZ="${PY_FTP_BASE}/Python-${VERSION}.tgz"
+          SRC_TXZ="${PY_FTP_BASE}/Python-${VERSION}.tar.xz"
+
+          echoe "소스 다운로드 (python.org 공식):"
+          curl_get "$SRC_TGZ" "$BASE_DIR/Python-${VERSION}.tgz" || warn "tgz 미제공일 수 있음"
+          curl_get "$SRC_TXZ" "$BASE_DIR/Python-${VERSION}.tar.xz" || warn "tar.xz 미제공일 수 있음"
+
+          # 선택: Windows/macOS 설치 파일
+          if [ "${INCLUDE_INSTALLERS}" = "true" ]; then
+            echoe "설치 파일(공식) 추가 다운로드:"
+            # Windows (64-bit) 설치 EXE & Embeddable ZIP (파일명은 소문자 'python-')
+            WIN_EXE="${PY_FTP_BASE}/python-${VERSION}-amd64.exe"
+            WIN_EMB="${PY_FTP_BASE}/python-${VERSION}-embed-amd64.zip"
+            curl_get "$WIN_EXE" "$BASE_DIR/python-${VERSION}-amd64.exe" || warn "Windows exe 미제공 버전"
+            curl_get "$WIN_EMB" "$BASE_DIR/python-${VERSION}-embed-amd64.zip" || warn "Windows embeddable 미제공 버전"
+
+            # macOS universal2 설치 패키지 (macos11)
+            MAC_PKG="${PY_FTP_BASE}/python-${VERSION}-macos11.pkg"
+            curl_get "$MAC_PKG" "$BASE_DIR/python-${VERSION}-macos11.pkg" || warn "macOS pkg 미제공 버전"
+          fi
+
+          echoe "다운로드 목록:"
+          run_cmd "ls -al \"$BASE_DIR\" || true"
+
+          # 간단 무결성: 사이즈 0인 파일 제거
+          find "$BASE_DIR" -type f -size 0 -print -delete | tee -a "${LOG_DIR}/python-download.log" || true
+
+          echo "base_dir=${BASE_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: "Upload artifacts"
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ steps.resolve.outputs.version }}-official
+          path: ${{ steps.download.outputs.base_dir }}
+          if-no-files-found: warn
+          compression-level: 6
+
+      - name: "Summary"
+        run: |
+          set -Eeuo pipefail
+          . "$(/usr/bin/grep -oP '(?<=helpers=).*' <<< '${{ steps.echo_init.outputs.helpers }}')"
+          echoe "✅ 완료: Python ${VERSION} 다운로드 (공식 URL 기반)."
+          echoe "아티팩트 이름: python-${VERSION}-official"
