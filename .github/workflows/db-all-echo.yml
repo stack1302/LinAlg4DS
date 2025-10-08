@@ -28,9 +28,6 @@ env:
   ECHO_FAIL: "❌"
 
 jobs:
-  # ------------------------------------------------------------
-  # 0) 공통 준비: echo 헬퍼/검증 함수 + curl 허용도메인 + 공통 클라이언트 설치
-  # ------------------------------------------------------------
   prepare:
     runs-on: ubuntu-latest
     outputs:
@@ -53,11 +50,10 @@ jobs:
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           logf(){  printf '%s\n' "$*" | tee -a "$1"; }
 
-          # run_cmd "LOG_FILE" cmd...
+          # run_cmd "LOG_FILE" cmd args...
           run_cmd(){
             local LOG_FILE="$1"; shift
             logf "$LOG_FILE" "▶ $*"
-            # shellcheck disable=SC2068
             "$@" 2>&1 | tee -a "$LOG_FILE"
             local rc=${PIPESTATUS[0]}
             if [ $rc -eq 0 ]; then echoe "DONE: $*"; else warn "RC=$rc ← $*"; fi
@@ -78,7 +74,7 @@ jobs:
             fi
           }
 
-          # wait-for port with timeout
+          # wait_port host port [timeout=60]
           wait_port(){
             local host="$1" port="$2" wait="${3:-60}"
             local end=$((SECONDS+wait))
@@ -102,15 +98,15 @@ jobs:
           source /tmp/echo_helpers.sh
           LOG="${LOG_DIR}/clients-install.log"
           run_cmd "$LOG" sudo apt-get update
+          # NOTE: Ubuntu 24.04에는 'mongodb-clients' 패키지가 없음 → 제거
           run_cmd "$LOG" sudo apt-get install -y --no-install-recommends \
             postgresql-client \
             mysql-client \
             mariadb-client \
             redis-tools \
-            mongodb-clients \
             clickhouse-client \
             curl jq netcat-traditional
-          echoe "Clients installed."
+          echoe "Clients installed (Mongo는 컨테이너 기반 mongosh 사용)."
 
       - name: Export allow domains
         id: export-allow
@@ -126,7 +122,6 @@ jobs:
           source /tmp/echo_helpers.sh
           LOG="${LOG_DIR}/curl-downloads.log"
           mkdir -p .github/downloads
-          # 공백/쉼표/줄바꿈을 모두 구분자로 처리
           printf '%s\n' "${{ github.event.inputs.extra_files }}" | tr ',\n' '  ' | xargs -n1 -I{} bash -c '
             f={}; [ -z "$f" ] && exit 0
             base=$(basename "$f")
@@ -134,9 +129,6 @@ jobs:
           '
           echoe "curl downloads completed."
 
-  # ------------------------------------------------------------
-  # 1) 핵심 DB 묶음 (PostgreSQL, MySQL, MariaDB, MongoDB, Redis)
-  # ------------------------------------------------------------
   core-dbs:
     runs-on: ubuntu-latest
     needs: [prepare]
@@ -169,7 +161,7 @@ jobs:
           MARIADB_DATABASE: app
           MARIADB_USER: app
           MARIADB_PASSWORD: app
-        ports: ["3307:3306"] # 호스트 3307로 매핑(3306과 충돌 방지)
+        ports: ["3307:3306"]
       mongo:
         image: mongo:7
         ports: ["27017:27017"]
@@ -177,14 +169,10 @@ jobs:
         image: redis:7
         ports: ["6379:6379"]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Copy echo helpers from prepare
-        run: |
-          set -Eeuo pipefail
-          cp -f /tmp/echo_helpers.sh /tmp/echo_helpers.sh || true
-          echo "OK"
+        run: cp -f /tmp/echo_helpers.sh /tmp/echo_helpers.sh || true
 
       - name: Wait ports
         run: |
@@ -197,7 +185,7 @@ jobs:
           run_cmd "$LOG" wait_port 127.0.0.1 27017 90
           run_cmd "$LOG" wait_port 127.0.0.1 6379 60
 
-      - name: Health & smoke tests (psql/mysql/mariadb/mongo/redis)
+      - name: Health & smoke tests (psql/mysql/mariadb/redis) + Mongo via container mongosh
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
@@ -213,18 +201,15 @@ jobs:
           # MariaDB (port 3307)
           run_cmd "$LOG" mariadb -h 127.0.0.1 -P 3307 -uroot -proot -e "SELECT VERSION(); CREATE DATABASE IF NOT EXISTS smoke; USE smoke; CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(50)); INSERT INTO t(v) VALUES('ok'); SELECT COUNT(*) FROM t;"
 
-          # MongoDB
-          run_cmd "$LOG" mongo --host 127.0.0.1 --eval 'db.runCommand({ ping: 1 })'
-          run_cmd "$LOG" mongo --host 127.0.0.1 --eval 'db.getSiblingDB("smoke").t.insertOne({v:"ok"}); db.getSiblingDB("smoke").t.countDocuments()'
+          # MongoDB — 우분투 24.04에 native client 없음 → 컨테이너로 mongosh 실행
+          run_cmd "$LOG" bash -lc 'docker run --rm --network=host mongo:7 mongosh --host 127.0.0.1 --eval "db.runCommand({ ping: 1 })"'
+          run_cmd "$LOG" bash -lc 'docker run --rm --network=host mongo:7 mongosh --host 127.0.0.1 --eval "db.getSiblingDB(\"smoke\").t.insertOne({v:\"ok\"}); db.getSiblingDB(\"smoke\").t.countDocuments()"'
 
           # Redis
           run_cmd "$LOG" redis-cli -h 127.0.0.1 PING
           run_cmd "$LOG" redis-cli -h 127.0.0.1 SET foo bar
           run_cmd "$LOG" redis-cli -h 127.0.0.1 GET foo
 
-  # ------------------------------------------------------------
-  # 2) 분석/시계열 묶음 (ClickHouse, QuestDB, InfluxDB, VictoriaMetrics)
-  # ------------------------------------------------------------
   analytical-dbs:
     runs-on: ubuntu-latest
     needs: [prepare]
@@ -234,7 +219,7 @@ jobs:
         ports: ["9000:9000", "8123:8123"]
       questdb:
         image: questdb/questdb:latest
-        ports: ["9009:9009","8812:8812","9000:9000"] # 9000은 UI(중복시 무시)
+        ports: ["9009:9009","8812:8812","9000:9000"]
       influx:
         image: influxdb:2
         ports: ["8086:8086"]
@@ -250,39 +235,27 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           LOG="${LOG_DIR}/anal-wait.log"
-          run_cmd "$LOG" wait_port 127.0.0.1 8123 120   # ClickHouse HTTP
-          run_cmd "$LOG" wait_port 127.0.0.1 9000 120   # ClickHouse native / QuestDB UI 충돌 무시
-          run_cmd "$LOG" wait_port 127.0.0.1 8812 120   # QuestDB PG wire
-          run_cmd "$LOG" wait_port 127.0.0.1 8086 120   # InfluxDB 2
-          run_cmd "$LOG" wait_port 127.0.0.1 8428 120   # VictoriaMetrics
+          run_cmd "$LOG" wait_port 127.0.0.1 8123 120
+          run_cmd "$LOG" wait_port 127.0.0.1 9000 120
+          run_cmd "$LOG" wait_port 127.0.0.1 8812 120
+          run_cmd "$LOG" wait_port 127.0.0.1 8086 120
+          run_cmd "$LOG" wait_port 127.0.0.1 8428 120
       - name: Health & smoke tests
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           LOG="${LOG_DIR}/anal-smoke.log"
 
-          # ClickHouse (HTTP ping)
           run_cmd "$LOG" bash -lc 'curl -fsS http://127.0.0.1:8123/ping'
-
-          # ClickHouse client (존재 시)
           if command -v clickhouse-client >/dev/null 2>&1; then
             run_cmd "$LOG" clickhouse-client --host 127.0.0.1 --query "SELECT version();"
           fi
-
-          # QuestDB (PG wire 호환: 127.0.0.1:8812) → psql 사용 가능(있다면)
           if command -v psql >/dev/null 2>&1; then
             run_cmd "$LOG" psql "postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable" -c "SELECT 1;" || true
           fi
-
-          # InfluxDB v2 readiness
           run_cmd "$LOG" curl -fsS http://127.0.0.1:8086/health
-
-          # VictoriaMetrics readiness
           run_cmd "$LOG" curl -fsS http://127.0.0.1:8428/metrics | head -n 5
 
-  # ------------------------------------------------------------
-  # 3) 그래프/멀티모델/키값 묶음 (Neo4j, ArangoDB, etcd, CouchDB)
-  # ------------------------------------------------------------
   graph-kv-dbs:
     runs-on: ubuntu-latest
     needs: [prepare]
@@ -331,23 +304,13 @@ jobs:
           source /tmp/echo_helpers.sh
           LOG="${LOG_DIR}/gkv-smoke.log"
 
-          # Neo4j (HTTP UI)
           run_cmd "$LOG" curl -fsS http://127.0.0.1:7474/ || true
-
-          # ArangoDB
           run_cmd "$LOG" curl -fsS http://127.0.0.1:8529/_api/version
           run_cmd "$LOG" curl -fsS -u root:root --header 'Content-Type: application/json' \
             --data '{"name":"smoke"}' http://127.0.0.1:8529/_api/database || true
-
-          # etcd
           run_cmd "$LOG" curl -fsS http://127.0.0.1:2379/health || true
-
-          # CouchDB
           run_cmd "$LOG" curl -fsS http://admin:admin@127.0.0.1:5984/
 
-  # ------------------------------------------------------------
-  # 4) 무거운 DB (옵션): Cassandra, ScyllaDB
-  # ------------------------------------------------------------
   heavy-dbs:
     if: ${{ inputs.enable_heavy == true }}
     runs-on: ubuntu-latest
@@ -361,7 +324,7 @@ jobs:
           --health-interval=20s --health-timeout=10s --health-retries=30
       scylla:
         image: scylladb/scylla:5.4
-        ports: ["9142:9042"] # 호스트 9142→컨테이너 9042 (cassandra와 충돌 방지)
+        ports: ["9142:9042"]
     steps:
       - uses: actions/checkout@v4
       - name: Copy echo helpers
@@ -378,8 +341,6 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           LOG="${LOG_DIR}/heavy-smoke.log"
-          # cqlsh 패키지는 기본 미포함 → 컨테이너 exec로 간단 체크
           run_cmd "$LOG" bash -lc 'docker ps'
-          # 간단한 TCP 확인
           run_cmd "$LOG" bash -lc 'echo | nc -vz 127.0.0.1 9042'
           run_cmd "$LOG" bash -lc 'echo | nc -vz 127.0.0.1 9142'
