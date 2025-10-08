@@ -4,18 +4,17 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - ".github/workflows/db-workflow.yml"
+      - ".github/workflows/db-all-echo.yml"
       - "infra/**"
 
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
   DOCKER_LOG_DIR: .github/echo_logs/docker-logs
-  DOWNLOAD_DIR: .github/echo_downloads   # ⬅️ 고정 다운로드 경로
+  DOWNLOAD_DIR: .github/echo_downloads          # ⬅️ 고정 다운로드 경로
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
-  # 필요시 외부 다운로드 허용 도메인 화이트리스트(콤마로 구분)
   ALLOW_DOMAINS_CSV: "github.com,storage.googleapis.com,repo1.maven.org,dlcdn.apache.org"
 
 jobs:
@@ -24,69 +23,65 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 모든 job에서 동일하게 /tmp/echo_helpers.sh 를 "로컬에서 즉시 생성"
+      # 잡마다 헬퍼 스크립트를 로컬로 "즉시" 작성 (다른 잡과 독립)
       - name: Setup echo helpers (local per job)
+        shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
           cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
           set -Eeuo pipefail
           : "${LOG_DIR:=.github/echo_logs}"
           : "${DOCKER_LOG_DIR:=.github/echo_logs/docker-logs}"
           : "${DOWNLOAD_DIR:=.github/echo_downloads}"
+          : "${ECHO_OK:=OK}"; : "${ECHO_WARN:=WARN}"; : "${ECHO_FAIL:=FAIL}"
           mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
-
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
-
           logf(){  printf '%s\n' "$*" | tee -a "$1"; }
-
-          run_cmd(){ local L="$1"; shift; logf "$L" "▶ $*"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
-
-          wait_port(){ local host="$1" port="$2" t="${3:-60}"; local end=$((SECONDS+t)); while [ $SECONDS -lt $end ]; do (echo >"/dev/tcp/$host/$port") >/dev/null 2>&1 && { echoe "port $host:$port open"; return 0; }; sleep 1; done; warn "timeout waiting for $host:$port"; return 1; }
-
+          run_cmd(){ local L="$1"; shift; printf '%s ▶ %s\n' "$L" "$*" | tee -a "$L"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
+          wait_port(){ local host="$1" port="$2" t="${3:-60}"; local end=$((SECONDS+t)); while [ $SECONDS -lt $end ]; do (echo >"/dev/tcp/$host/$port") >/dev/null 2>&1 && { echoe "port $host:$port open"; return 0; }; sleep 1; done; warn "timeout $host:$port"; return 1; }
           curl_get(){
             local u="$1" o="$2" s="${3:-}"; local a="${ALLOW_DOMAINS_CSV:-}"; local h
             h=$(printf '%s' "$u" | awk -F/ '{print $3}')
-            if [ -n "$a" ] && ! printf '%s\n' "$a" | tr ',' '\n' | tr -d ' ' | grep -Fxq "$h"; then
+            if [ -n "$a" ] && ! printf '%s' "$a" | tr ',' '\n' | tr -d ' ' | grep -Fxq "$h"; then
               echo "Blocked host: $h (allow=$a)"; return 2
             fi
             curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 180 "$u" -o "$o"
             [ -n "$s" ] && echo "$s  $o" | sha256sum -c -
           }
-
           dump_all_docker_logs(){
             local PS="${DOCKER_LOG_DIR}/docker-ps.log"
+            mkdir -p "${DOCKER_LOG_DIR}"
             docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}' | tee "$PS" || true
             while read -r id img name status; do
               [ -z "$id" ] && continue
-              docker logs --details "$id" 2>&1 | tail -c 2000000 > "${DOCKER_LOG_DIR}/${name}-${id}.log" || true
+              docker logs --details "$id" 2>&1 | tail -c 2000000 > "${DOCKER_LOG_DIR}/${name:-container}-${id}.log" || true
             done < <(docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}')
           }
           SH
           chmod +x /tmp/echo_helpers.sh
 
-      # 에코 기능: 대량 디렉토리/파일 생성 + 권한 + 고정 다운로드 경로
+      # 에코 기능: 디렉토리/파일 대량 생성 + 권한 + 고정 다운로드 경로
       - name: Create echo directory tree & files with permissions
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           L="${LOG_DIR}/echo-init.log"
-
-          # 대량 디렉토리 생성
+          # 대량 디렉토리(로그/도커로그/다운로드 모두 동시 생성)
           for d in core/{pg,mysql,mariadb,redis,mongo} analytical/{clickhouse,questdb,vm} graphkv/{neo4j,arangodb,etcd,couchdb} tmp/tools; do
             run_cmd "$L" mkdir -p "${LOG_DIR}/${d}" "${DOCKER_LOG_DIR}/${d}" "${DOWNLOAD_DIR}/${d}"
           done
-
-          # 대량 에코 파일 생성 (샘플 20개)
-          for i in $(seq 1 20); do
+          # 에코 파일 50개 생성 + 권한
+          for i in $(seq 1 50); do
             f="${LOG_DIR}/echo_file_${i}.log"
-            run_cmd "$L" bash -c "echo '[echo] file ${i}' > '${f}'"
+            run_cmd "$L" bash -lc "echo \"[echo] file ${i} :: $(date -Is)\" > '${f}'"
             run_cmd "$L" chmod 0644 "${f}"
           done
-
-          # 에코 스크립트 자체(에코 실행 테스트)
+          # 에코 실행 스크립트
           E="${LOG_DIR}/echo.sh"
           cat > "$E" <<'BASH'
           #!/usr/bin/env bash
@@ -96,8 +91,9 @@ jobs:
           chmod 0755 "$E"
           run_cmd "$L" "$E" "echo subsystem ready"
 
-      # 업그레이드 훅(옵셔널): OS 캐시/패키지 메타 업그레이드
+      # (옵션) 베이스 패키지 업그레이드
       - name: Upgrade base packages (optional)
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
@@ -105,6 +101,15 @@ jobs:
           run_cmd "$L" sudo apt-get update
           run_cmd "$L" sudo apt-get -y dist-upgrade
           run_cmd "$L" sudo apt-get -y autoremove --purge
+
+      - name: Upload prepare artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepare-logs
+          path: |
+            .github/echo_logs/**
+            .github/echo_downloads/**
 
   analytical-dbs:
     runs-on: ubuntu-24.04
@@ -116,62 +121,88 @@ jobs:
           - 9000:9000    # native
           - 8123:8123    # http
         options: >-
-          --health-cmd="clickhouse-client --query='SELECT 1'" 
+          --health-cmd="clickhouse-client --query='SELECT 1'"
           --health-interval=5s --health-retries=30 --health-timeout=3s
+
       questdb:
         image: questdb/questdb:latest
-        # 내부 9000 → 호스트 9001 로 매핑해서 ClickHouse(9000)와 충돌 방지
+        # 내부 9000 → 외부 9001로 매핑하여 ClickHouse(9000)와 충돌 방지
         ports:
           - 9009:9009    # influx
           - 8812:8812    # pg-wire
           - 9001:9000    # web/native
         options: >-
-          --health-cmd="sh -c 'nc -z 127.0.0.1 9000 || exit 1'"
-          --health-interval=5s --health-retries=30 --health-timeout=3s
+          --health-cmd="sh -c 'wget -qO- http://127.0.0.1:9000/ || exit 1'"
+          --health-interval=5s --health-retries=40 --health-timeout=4s
+
       victoriametrics:
         image: victoriametrics/victoria-metrics:v1.103.0
         ports:
           - 8428:8428
         options: >-
           --health-cmd="wget -qO- http://127.0.0.1:8428/health"
-          --health-interval=5s --health-retries=30 --health-timeout=3s
+          --health-interval=5s --health-retries=40 --health-timeout=4s
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup echo helpers (local per job)
+        shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
-          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          : "${LOG_DIR:=.github/echo_logs}"; : "${DOCKER_LOG_DIR:=.github/echo_logs/docker-logs}"; : "${DOWNLOAD_DIR:=.github/echo_downloads}"
+          : "${ECHO_OK:=OK}"; : "${ECHO_WARN:=WARN}"; : "${ECHO_FAIL:=FAIL}"
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "$1"; }
+          run_cmd(){ local L="$1"; shift; printf '%s ▶ %s\n' "$L" "$*" | tee -a "$L"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
+          wait_port(){ local h="$1" p="$2" t="${3:-60}"; local e=$((SECONDS+t)); while [ $SECONDS -lt $e ]; do (echo >"/dev/tcp/$h/$p") >/dev/null 2>&1 && { echoe "port $h:$p open"; return 0; }; sleep 1; done; warn "timeout $h:$p"; return 1; }
+          dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
+          SH
+          chmod +x /tmp/echo_helpers.sh
 
       - name: Wait for analytical services
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           L="${LOG_DIR}/analytical-wait.log"
-          run_cmd "$L" wait_port 127.0.0.1 8123 180
-          run_cmd "$L" wait_port 127.0.0.1 9000 180
-          run_cmd "$L" wait_port 127.0.0.1 8812 180
-          run_cmd "$L" wait_port 127.0.0.1 9001 180
-          run_cmd "$L" wait_port 127.0.0.1 8428 180
+          run_cmd "$L" wait_port 127.0.0.1 8123 240   # ClickHouse http
+          run_cmd "$L" wait_port 127.0.0.1 9000 240   # ClickHouse native
+          run_cmd "$L" wait_port 127.0.0.1 8812 240   # QuestDB pg-wire
+          run_cmd "$L" wait_port 127.0.0.1 9001 240   # QuestDB web/native
+          run_cmd "$L" wait_port 127.0.0.1 8428 240   # VictoriaMetrics
 
       - name: Smoke test (analytical)
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           L="${LOG_DIR}/analytical-smoke.log"
           run_cmd "$L" bash -lc "curl -fsS http://127.0.0.1:9001/ | head -n1"
-          run_cmd "$L" bash -lc "curl -fsS http://127.0.0.1:8123/?query=SELECT%201"
+          run_cmd "$L" bash -lc "curl -fsS 'http://127.0.0.1:8123/?query=SELECT%201'"
 
       - name: Always dump docker logs (analytical)
         if: always()
+        shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; else
-            dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
-          fi
-          dump_all_docker_logs
+          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; fi
+          dump_all_docker_logs || true
+
+      - name: Upload analytical artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analytical-logs
+          path: |
+            .github/echo_logs/**
+            .github/echo_downloads/**
 
   graph-kv-dbs:
     runs-on: ubuntu-24.04
@@ -186,7 +217,7 @@ jobs:
           - 7687:7687
         options: >-
           --health-cmd="wget -qO- http://127.0.0.1:7474 || exit 1"
-          --health-interval=5s --health-retries=40 --health-timeout=3s
+          --health-interval=5s --health-retries=60 --health-timeout=4s
 
       arangodb:
         image: arangodb:3.11
@@ -196,30 +227,27 @@ jobs:
           - 8529:8529
         options: >-
           --health-cmd="curl -fsS http://127.0.0.1:8529/_api/version"
-          --health-interval=5s --health-retries=40 --health-timeout=3s
+          --health-interval=5s --health-retries=60 --health-timeout=4s
 
       etcd:
         image: gcr.io/etcd-development/etcd:v3.5.13
         env:
           ETCDCTL_API: "3"
+          ETCD_NAME: "s1"
+          ETCD_DATA_DIR: "/var/lib/etcd"
+          ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://127.0.0.1:2380"
+          ETCD_LISTEN_PEER_URLS: "http://0.0.0.0:2380"
+          ETCD_ADVERTISE_CLIENT_URLS: "http://127.0.0.1:2379"
+          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+          ETCD_INITIAL_CLUSTER: "s1=http://127.0.0.1:2380"
+          ETCD_INITIAL_CLUSTER_STATE: "new"
+          ETCD_LOGGER: "zap"
         ports:
           - 2379:2379
           - 2380:2380
-        # 단일 노드용 명시적 설정 + 실동작 헬스체크 적용
-        command: >
-          /usr/local/bin/etcd
-          --name s1
-          --data-dir /var/lib/etcd
-          --initial-advertise-peer-urls http://127.0.0.1:2380
-          --listen-peer-urls http://0.0.0.0:2380
-          --advertise-client-urls http://127.0.0.1:2379
-          --listen-client-urls http://0.0.0.0:2379
-          --initial-cluster s1=http://127.0.0.1:2380
-          --initial-cluster-state new
-          --logger=zap
         options: >-
           --health-cmd="sh -c 'ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint status || exit 1'"
-          --health-interval=5s --health-retries=60 --health-timeout=4s
+          --health-interval=5s --health-retries=80 --health-timeout=5s
 
       couchdb:
         image: couchdb:3
@@ -231,41 +259,57 @@ jobs:
           - 5984:5984
         options: >-
           --health-cmd="curl -fsS http://127.0.0.1:5984/_up"
-          --health-interval=5s --health-retries=40 --health-timeout=3s
+          --health-interval=5s --health-retries=60 --health-timeout=4s
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup echo helpers (local per job)
+        shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
-          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          : "${LOG_DIR:=.github/echo_logs}"; : "${DOCKER_LOG_DIR:=.github/echo_logs/docker-logs}"; : "${DOWNLOAD_DIR:=.github/echo_downloads}"
+          : "${ECHO_OK:=OK}"; : "${ECHO_WARN:=WARN}"; : "${ECHO_FAIL:=FAIL}"
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "$1"; }
+          run_cmd(){ local L="$1"; shift; printf '%s ▶ %s\n' "$L" "$*" | tee -a "$L"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
+          wait_port(){ local h="$1" p="$2" t="${3:-60}"; local e=$((SECONDS+t)); while [ $SECONDS -lt $e ]; do (echo >"/dev/tcp/$h/$p") >/dev/null 2>&1 && { echoe "port $h:$p open"; return 0; }; sleep 1; done; warn "timeout $h:$p"; return 1; }
+          dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
+          SH
+          chmod +x /tmp/echo_helpers.sh
 
       - name: Wait for graph/kv services
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           L="${LOG_DIR}/graphkv-wait.log"
-          run_cmd "$L" wait_port 127.0.0.1 7474 180
-          run_cmd "$L" wait_port 127.0.0.1 7687 180
-          run_cmd "$L" wait_port 127.0.0.1 8529 180
-          run_cmd "$L" wait_port 127.0.0.1 2379 240
-          run_cmd "$L" wait_port 127.0.0.1 5984 180
+          run_cmd "$L" wait_port 127.0.0.1 7474 240
+          run_cmd "$L" wait_port 127.0.0.1 7687 240
+          run_cmd "$L" wait_port 127.0.0.1 8529 240
+          run_cmd "$L" wait_port 127.0.0.1 2379 300
+          run_cmd "$L" wait_port 127.0.0.1 5984 240
 
-      # CouchDB _users DB 생성(로그의 반복 경고 및 에러를 사전 차단)
+      # CouchDB 시스템 데이터베이스 생성(반복 에러/노티스 사전 차단)
       - name: Initialize CouchDB system databases
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           L="${LOG_DIR}/couchdb-init.log"
           base="http://admin:test1234@127.0.0.1:5984"
-
-          run_cmd "$L" bash -lc "curl -fsS ${base}/_users     || curl -fsS -X PUT ${base}/_users"
-          run_cmd "$L" bash -lc "curl -fsS ${base}/_replicator || curl -fsS -X PUT ${base}/_replicator"
-          run_cmd "$L" bash -lc "curl -fsS ${base}/_global_changes || curl -fsS -X PUT ${base}/_global_changes"
+          run_cmd "$L" bash -lc "curl -fsS ${base}/_users           || curl -fsS -X PUT ${base}/_users"
+          run_cmd "$L" bash -lc "curl -fsS ${base}/_replicator      || curl -fsS -X PUT ${base}/_replicator"
+          run_cmd "$L" bash -lc "curl -fsS ${base}/_global_changes  || curl -fsS -X PUT ${base}/_global_changes"
 
       - name: Smoke test (graph/kv)
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
@@ -275,12 +319,20 @@ jobs:
 
       - name: Always dump docker logs (graph/kv)
         if: always()
+        shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; else
-            dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
-          fi
-          dump_all_docker_logs
+          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; fi
+          dump_all_docker_logs || true
+
+      - name: Upload graph/kv artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphkv-logs
+          path: |
+            .github/echo_logs/**
+            .github/echo_downloads/**
 
   core-dbs:
     runs-on: ubuntu-24.04
@@ -289,39 +341,61 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Setup echo helpers (local per job)
+        shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
-          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          : "${LOG_DIR:=.github/echo_logs}"; : "${DOCKER_LOG_DIR:=.github/echo_logs/docker-logs}"; : "${DOWNLOAD_DIR:=.github/echo_downloads}"
+          : "${ECHO_OK:=OK}"; : "${ECHO_WARN:=WARN}"; : "${ECHO_FAIL:=FAIL}"
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "$1"; }
+          run_cmd(){ local L="$1"; shift; printf '%s ▶ %s\n' "$L" "$*" | tee -a "$L"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
+          wait_port(){ local h="$1" p="$2" t="${3:-60}"; local e=$((SECONDS+t)); while [ $SECONDS -lt $e ]; do (echo >"/dev/tcp/$h/$p") >/dev/null 2>&1 && { echoe "port $h:$p open"; return 0; }; sleep 1; done; warn "timeout $h:$p"; return 1; }
+          SH
+          chmod +x /tmp/echo_helpers.sh
 
-      # 클라이언트 툴 설치 (mongodb-clients 제외, maria/mysql 충돌 회피)
+      # DB 클라이언트 설치(충돌 피해서 구성, mongodb-clients 제외)
       - name: Install DB clients with echo
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           L="${LOG_DIR}/clients-install.log"
           run_cmd "$L" sudo apt-get update
-          # mysql-client & mariadb-client 충돌 방지: mysql만 설치(이미 최신이면 스킵)
+          # mysql-client vs mariadb-client 충돌 회피: mysql만 설치
           run_cmd "$L" sudo apt-get install -y --no-install-recommends \
             postgresql-client mysql-client redis-tools clickhouse-client \
             curl jq netcat-traditional
 
-      # 포트 대기(옵션: 실제 core DB 컨테이너를 띄우지 않는 경우 스킵 가능)
+      # (옵션) 포트 대기 – 실제 코어 DB 컨테이너 미사용이므로 soft wait
       - name: Wait (optional ports)
+        shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           L="${LOG_DIR}/core-wait.log"
-          # 사용 안 하는 포트는 필요시 주석
           run_cmd "$L" wait_port 127.0.0.1 5432 5 || true
           run_cmd "$L" wait_port 127.0.0.1 3306 5 || true
           run_cmd "$L" wait_port 127.0.0.1 6379 5 || true
 
       - name: Always dump docker logs (core)
         if: always()
+        shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; else
-            dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
-          fi
-          dump_all_docker_logs
+          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; fi
+          dump_all_docker_logs || true
+
+      - name: Upload core artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-logs
+          path: |
+            .github/echo_logs/**
+            .github/echo_downloads/**
