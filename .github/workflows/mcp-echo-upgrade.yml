@@ -1,0 +1,337 @@
+name: "🔧 MCP Install + Echo Files + Echo Permissions + Auto-Upgrade (ALL-ECHO)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mcp_npm_pkg:
+        description: "MCP CLI 패키지 (기본: mcp, 실패시 @modelcontextprotocol/cli)"
+        required: false
+        default: "mcp"
+      mcp_version:
+        description: "MCP CLI 버전(선택, 예: 0.3.2). 비우면 latest"
+        required: false
+        default: ""
+      mcp_servers_csv:
+        description: "추가 MCP 서버 NPM 패키지(쉼표구분, 예: @mcp/server-files,@mcp/server-shell)"
+        required: false
+        default: ""
+      allow_domains_csv:
+        description: "curl 허용 도메인(쉼표구분, 예: raw.githubusercontent.com,github.com)"
+        required: false
+        default: "raw.githubusercontent.com,github.com"
+      download_urls_csv:
+        description: "추가로 받을 파일 URL(쉼표구분). 파일명은 basename으로 저장"
+        required: false
+        default: ""
+      echo_root:
+        description: "에코 아웃풋 루트 디렉토리"
+        required: true
+        default: ".github/echo_mcp"
+      dirs_count:
+        description: "대량 디렉토리 생성 개수(0=건너뜀)"
+        required: true
+        default: "0"
+      do_upgrade:
+        description: "Auto Upgrade 수행 (apt/npm/pip)"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_logs
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
+
+jobs:
+  mcp-echo-upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare echo folders
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}" \
+                   "${{ inputs.echo_root }}/configs" \
+                   "${{ inputs.echo_root }}/servers" \
+                   "${{ inputs.echo_root }}/downloads" \
+                   "${{ inputs.echo_root }}/perm" \
+                   "${{ inputs.echo_root }}/logs" \
+                   ".github/echo_perm" \
+                   ".github/echo_up"
+
+      - name: Install Node.js (for MCP CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: (Optional) Python for pip upgrade support
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Echo helpers (run_cmd, curl_get)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat <<'SH' > /tmp/echo_helpers.sh
+          set -Eeuo pipefail
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
+          SAFE_SERVICE="${SAFE_SERVICE:-mcp}"
+          logf(){ printf '%s\n' "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
+
+          run_cmd(){
+            logf "▶ $*"
+            # shellcheck disable=SC2086
+            eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"
+            local rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then echoe "DONE (rc=$rc): $*"; else warn "FAILED (rc=$rc): $*"; fi
+            return $rc
+          }
+
+          # curl with allowlist + checksum(opt) support
+          curl_get(){
+            local url="$1"; local out="$2"; local want_sha="${3:-}"
+            local allow="${ALLOW_DOMAINS_CSV:-}"
+            local host; host=$(printf '%s' "$url" | awk -F/ '{print $3}')
+            if [ -n "$allow" ]; then
+              local ok=; IFS=',' read -r -a arr <<< "$allow"
+              for d in "${arr[@]}"; do [ "$host" = "$d" ] && ok=1 && break; done
+              if [ -z "$ok" ]; then warn "Host $host not in allowlist; skip $url"; return 2; fi
+            fi
+            run_cmd curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 "$url" -o "$out"
+            if [ -n "$want_sha" ] && [ -f "$out" ]; then
+              local got; got=$(sha256sum "$out" | awk '{print $1}')
+              if [ "$got" != "$want_sha" ]; then
+                warn "SHA256 mismatch: want=$want_sha got=$got for $out"
+                return 3
+              fi
+            fi
+          }
+          SH
+          chmod +x /tmp/echo_helpers.sh
+          echo "OK" > "${{ inputs.echo_root }}/logs/helpers_ready.txt"
+
+      - name: Node/npm health (echo)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          run_cmd node -v
+          run_cmd npm -v
+          run_cmd which npm || true
+
+      - name: Install MCP CLI (primary → fallback)
+        shell: bash
+        env:
+          ALLOW_DOMAINS_CSV: ${{ inputs.allow_domains_csv }}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          PKG="${{ inputs.mcp_npm_pkg }}"
+          VER="${{ inputs.mcp_version }}"
+          if [ -n "$VER" ]; then
+            run_cmd npm i -g "${PKG}@${VER}" || true
+          else
+            run_cmd npm i -g "${PKG}" || true
+          fi
+
+          # fallback to @modelcontextprotocol/cli if first failed
+          if ! command -v mcp >/dev/null 2>&1; then
+            warn "Fallback: installing @modelcontextprotocol/cli"
+            if [ -n "$VER" ]; then
+              run_cmd npm i -g "@modelcontextprotocol/cli@${VER}" || true
+            else
+              run_cmd npm i -g "@modelcontextprotocol/cli" || true
+            fi
+          fi
+
+          # verify
+          if command -v mcp >/dev/null 2>&1; then
+            run_cmd mcp --help || true
+          else
+            # 일부 CLI는 'mcp' 바이너리가 아닌 경우가 있어 ls -l global bin 출력
+            run_cmd npm bin -g
+            run_cmd ls -l "$(npm bin -g)"
+          fi
+
+      - name: (Optional) Install additional MCP servers (CSV)
+        if: ${{ inputs.mcp_servers_csv != '' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          IFS=',' read -r -a SRVS <<< "${{ inputs.mcp_servers_csv }}"
+          for pkg in "${SRVS[@]}"; do
+            [ -z "$pkg" ] && continue
+            run_cmd npm i -g "$pkg" || warn "install failed: $pkg"
+          done
+
+      - name: Download extra files via curl (allowlist)
+        if: ${{ inputs.download_urls_csv != '' }}
+        shell: bash
+        env:
+          ALLOW_DOMAINS_CSV: ${{ inputs.allow_domains_csv }}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          mkdir -p "${{ inputs.echo_root }}/downloads"
+          IFS=',' read -r -a URLS <<< "${{ inputs.download_urls_csv }}"
+          for u in "${URLS[@]}"; do
+            [ -z "$u" ] && continue
+            base=$(basename "$u")
+            out="${{ inputs.echo_root }}/downloads/${base}"
+            curl_get "$u" "$out" || warn "download failed: $u"
+          done
+          run_cmd ls -l "${{ inputs.echo_root }}/downloads" || true
+
+      - name: Generate MCP config templates (echo)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          root="${{ inputs.echo_root }}"
+          cat <<'JSON' > "${root}/configs/mcp.config.json"
+          {
+            "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/ts/main/schema/mcp.json",
+            "clients": {
+              "default": {
+                "providers": []
+              }
+            },
+            "servers": {
+              "files": {
+                "command": "mcp",
+                "args": ["files"],
+                "enabled": true,
+                "env": { "MCP_FILES_ROOT": "./" }
+              },
+              "shell": {
+                "command": "mcp",
+                "args": ["shell"],
+                "enabled": false
+              }
+            }
+          }
+          JSON
+
+          cat <<'MD' > "${root}/README.md"
+          # MCP + EchoOps
+          - MCP CLI/서버 설치, 에코 파일 생성, 퍼미션 덤프, 업그레이드까지 한 번에 수행합니다.
+          - 수정 포인트: `configs/mcp.config.json`, `servers/*`, `perm/*`
+          MD
+
+          cat <<'SH' > "${root}/servers/sample-server.sh"
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          echo "Sample MCP server boot..."
+          # 실제 서버 진입점은 프로젝트/환경에 맞게 교체
+          exec sleep 10
+          SH
+          chmod +x "${root}/servers/sample-server.sh"
+
+      - name: Echo permissions dump (권한 에코 파일 생성)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          root="${{ inputs.echo_root }}"
+          # 대상 디렉토리 권한, 실행 권한 설정
+          chmod -R a+r "${root}" || true
+          find "${root}" -type d -exec chmod a+rx {} \; || true
+          find "${root}/servers" -type f -name "*.sh" -exec chmod a+rx {} \; || true
+
+          # 퍼미션/소유/해시 덤프
+          ls -lR "${root}" > "${root}/perm/perm.tree.txt"
+          find "${root}" -type f -exec sha256sum {} \; > "${root}/perm/perm.sha256.txt"
+          printf 'umask is: %s\n' "$(umask)" > "${root}/perm/umask.txt"
+
+          # 루트에도 퍼미션 요약
+          ls -lR "${root}" > ".github/echo_perm/perm-${{ github.run_id }}.txt"
+
+      - name: Massive echo directories (optional)
+        if: ${{ inputs.dirs_count != '0' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          root="${{ inputs.echo_root }}"
+          N="${{ inputs.dirs_count }}"
+          echo "Create ${N} echo dirs under ${root}/mass"
+          mkdir -p "${root}/mass"
+          for i in $(seq 1 "$N"); do
+            d="${root}/mass/dir$(printf '%05d' "$i")"
+            mkdir -p "$d"
+            printf 'echo dir %s\n' "$d" > "${d}/README.echo.txt"
+          done
+          echo "Mass dir count:" $(find "${root}/mass" -maxdepth 1 -type d | wc -l) > "${root}/logs/mass.done.txt"
+
+      - name: Auto Upgrade (apt + npm + pip) — optional
+        if: ${{ inputs.do_upgrade }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          # apt
+          run_cmd sudo apt-get update -y
+          run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || true
+          run_cmd sudo apt-get -y autoremove || true
+          # npm
+          run_cmd npm -g update || true
+          run_cmd npm -g outdated || true
+          # pip
+          python -V || true
+          python - <<'PY' || true
+          import sys, subprocess
+          try:
+              import pkg_resources
+          except Exception:
+              sys.exit(0)
+          pkgs = [d.project_name for d in pkg_resources.working_set]
+          if pkgs:
+              subprocess.call([sys.executable, "-m", "pip", "install", "-U"] + pkgs)
+          PY
+
+          # 업그레이드 로그 보존
+          date '+%F %T' > ".github/echo_up/upgrade-${{ github.run_id }}.stamp"
+
+      - name: Summaries (artifact-like echo)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          root="${{ inputs.echo_root }}"
+          {
+            echo "# MCP/Echo/Upgrade Summary"
+            echo "- MCP NPM PKG: ${{ inputs.mcp_npm_pkg }}"
+            echo "- MCP VERSION:  ${{ inputs.mcp_version }}"
+            echo "- Servers CSV:  ${{ inputs.mcp_servers_csv }}"
+            echo "- Allowlist:    ${{ inputs.allow_domains_csv }}"
+            echo "- Dirs Count:   ${{ inputs.dirs_count }}"
+            echo "- Do Upgrade:   ${{ inputs.do_upgrade }}"
+            echo
+            echo "## Tree"
+            echo '```'
+            ls -la "${root}"
+            echo '```'
+          } > "${root}/logs/summary.md"
+
+      - name: Upload echo outputs (optional)
+        uses: actions/upload-artifact@v4
+        with:
+            name: mcp-echo-${{ github.run_id }}
+            path: |
+              ${{ inputs.echo_root }}/**
+              .github/echo_perm/**
+              .github/echo_up/**
+              ${{ env.LOG_DIR }}/**
+            if-no-files-found: ignore
