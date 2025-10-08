@@ -48,16 +48,46 @@ on:
 
   workflow_call:
     inputs:
-      track:           { required: false, type: string,  default: "latest" }
-      version_override:{ required: false, type: string,  default: "" }
-      include_installers:{ required: false, type: boolean, default: false }
-      dirs:            { required: false, type: string,  default: "root=.github/echo_dirs,count=0" }
-      iso_name:        { required: false, type: string,  default: "python-latest" }
-      iso_label:       { required: false, type: string,  default: "PYTHON_LATEST" }
-      iso_inject:      { required: false, type: string,  default: "dir=,glob=" }
-      iso_extra_text:  { required: false, type: string,  default: "" }
-      retention_days:  { required: false, type: string,  default: "14" }
-      create_release:  { required: false, type: boolean, default: false }
+      track:
+        required: false
+        type: string
+        default: "latest"
+      version_override:
+        required: false
+        type: string
+        default: ""
+      include_installers:
+        required: false
+        type: boolean
+        default: false
+      dirs:
+        required: false
+        type: string
+        default: "root=.github/echo_dirs,count=0"
+      iso_name:
+        required: false
+        type: string
+        default: "python-latest"
+      iso_label:
+        required: false
+        type: string
+        default: "PYTHON_LATEST"
+      iso_inject:
+        required: false
+        type: string
+        default: "dir=,glob="
+      iso_extra_text:
+        required: false
+        type: string
+        default: ""
+      retention_days:
+        required: false
+        type: string
+        default: "14"
+      create_release:
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -109,7 +139,7 @@ jobs:
             run_cmd "curl -C - -fSsvL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 1200 \"$url\" -o \"$out\""
           }
           # 간단한 key=value 파서 (콤마 구분, 키 대소문자 무시)
-          kv_get(){ echo "$1" | tr ',' '\n' | awk -F= -v k="$2" 'BEGIN{IGNORECASE=1} $1==k{ $1=""; sub(/^=/,""); print $0 }'; }
+          kv_get(){ echo "$1" | tr ',' '\n' | awk -F= -v k="$2" 'BEGIN{IGNORECASE=1} $1==k{ $1=\"\"; sub(/^=/,\"\"); print $0 }'; }
           SH
           chmod +x /tmp/echo_helpers.sh
           echo "ECHO_HELPERS=/tmp/echo_helpers.sh" >> "$GITHUB_ENV"
@@ -272,15 +302,18 @@ jobs:
           source "$ECHO_HELPERS"
           BASE="downloads/python-${VERSION}"
           FTP="https://www.python.org/ftp/python/${VERSION}"
+
           for f in tgz tar.xz; do
             curl_get "${FTP}/Python-${VERSION}.${f}.sha256" "${BASE}/Python-${VERSION}.${f}.sha256" || true
             curl_get "${FTP}/Python-${VERSION}.${f}.asc"    "${BASE}/Python-${VERSION}.${f}.asc"    || true
           done
+
           for f in tgz tar.xz; do
             if [ -s "${BASE}/Python-${VERSION}.${f}" ] && [ -s "${BASE}/Python-${VERSION}.${f}.sha256" ]; then
               echo "($(cut -d' ' -f1 ${BASE}/Python-${VERSION}.${f}.sha256))  ${BASE}/Python-${VERSION}.${f}" | sha256sum -c -
             fi
           done
+
           curl_get "https://www.python.org/static/files/pubkeys.txt" "${BASE}/python_pubkeys.txt" || true
           if [ -s "${BASE}/python_pubkeys.txt" ]; then
             gpg --batch --import "${BASE}/python_pubkeys.txt" || true
@@ -348,7 +381,6 @@ jobs:
           set -Eeuo pipefail
           source "$ECHO_HELPERS"
 
-          # iso_inject 파싱 (dir, glob)
           INJECT_DIR="$(kv_get "${INJECT_SPEC}" dir)";  INJECT_DIR="${INJECT_DIR:-}"
           INJECT_GLOB="$(kv_get "${INJECT_SPEC}" glob)"; INJECT_GLOB="${INJECT_GLOB:-}"
 
