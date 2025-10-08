@@ -36,16 +36,12 @@ jobs:
           : "${DOWNLOAD_DIR:=.github/echo_downloads}"
           : "${ECHO_OK:=OK}"; : "${ECHO_WARN:=WARN}"; : "${ECHO_FAIL:=FAIL}"
           mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
-
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           logf(){  printf '%s\n' "$*" | tee -a "$1"; }
-
-          run_cmd(){ local L="$1"; shift; printf '%s ▶ %s\n' "$L" "$*" | tee -a "$L"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
-
+          run_cmd(){ local L="$1"; shift; logf "$L" "▶ $*"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
           wait_port(){ local host="$1" port="$2" t="${3:-60}"; local end=$((SECONDS+t)); while [ $SECONDS -lt $end ]; do (echo >"/dev/tcp/$host/$port") >/dev/null 2>&1 && { echoe "port $host:$port open"; return 0; }; sleep 1; done; warn "timeout waiting for $host:$port"; return 1; }
-
           dump_all_docker_logs(){
             mkdir -p "${DOCKER_LOG_DIR}"
             docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}' | tee "${DOCKER_LOG_DIR}/docker-ps.log" || true
@@ -96,51 +92,58 @@ jobs:
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:24.8
-        ports:
-          - 9000:9000
-          - 8123:8123
+        ports: [ "9000:9000", "8123:8123" ]
+        options: >-
+          --health-cmd="curl -fsS http://127.0.0.1:8123/ping || exit 1"
+          --health-interval=5s --health-retries=60 --health-timeout=4s
+          --health-start-period=20s
       questdb:
         image: questdb/questdb:latest
         ports:
           - 9009:9009   # ILP
           - 8812:8812   # PG-wire
           - 9001:9000   # Web (Host 9001 → Container 9000)
+        options: >-
+          --health-cmd="sh -lc 'wget -qO- http://127.0.0.1:9000/ || exit 1'"
+          --health-interval=5s --health-retries=80 --health-timeout=4s
+          --health-start-period=25s
       victoriametrics:
         image: victoriametrics/victoria-metrics:v1.103.0
-        ports:
-          - 8428:8428
+        ports: [ "8428:8428" ]
+        options: >-
+          --health-cmd="wget -qO- http://127.0.0.1:8428/health"
+          --health-interval=5s --health-retries=60 --health-timeout=4s
+          --health-start-period=10s
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure helpers exist
+      - name: Setup echo helpers (local per job)
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ ! -f /tmp/echo_helpers.sh ]; then
-            printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nwait_port(){ h=$1; p=$2; t=${3:-60}; e=$((SECONDS+t)); while [ $SECONDS -lt $e ]; do (echo >"/dev/tcp/$h/$p") >/dev/null 2>&1 && { echo "open $h:$p"; exit 0; }; sleep 1; done; echo "timeout $h:$p"; exit 1; }\n' >/tmp/echo_helpers.sh
-            chmod +x /tmp/echo_helpers.sh
-          fi
+          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
 
       - name: Wait for analytical services
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          wait_port 127.0.0.1 8123 240   # ClickHouse HTTP
-          wait_port 127.0.0.1 9000 240   # ClickHouse Native
-          wait_port 127.0.0.1 9001 300   # QuestDB Web
-          wait_port 127.0.0.1 8812 300   # QuestDB PG-wire
-          wait_port 127.0.0.1 8428 240   # VictoriaMetrics
+          L="${LOG_DIR}/analytical-wait.log"
+          run_cmd "$L" wait_port 127.0.0.1 8123 240
+          run_cmd "$L" wait_port 127.0.0.1 9001 300
+          run_cmd "$L" wait_port 127.0.0.1 8812 300
+          run_cmd "$L" wait_port 127.0.0.1 9009 240
+          run_cmd "$L" wait_port 127.0.0.1 8428 240
 
       - name: Smoke test (analytical)
         shell: bash
         run: |
           set -Eeuo pipefail
-          # ClickHouse
-          curl -fsS 'http://127.0.0.1:8123/?query=SELECT%201'
-          # QuestDB(텍스트 핸드셰이크)
-          bash -lc "printf 'GET / HTTP/1.0\r\n\r\n' | nc -w 5 127.0.0.1 9001 | head -n1 || true"
-          # VictoriaMetrics
+          # ClickHouse: /ping (403 회피)
+          curl -fsS 'http://127.0.0.1:8123/ping'
+          # QuestDB: 웹 루트 응답 확인
+          curl -fsSI 'http://127.0.0.1:9001/' | head -n1
+          # VictoriaMetrics: /health
           curl -fsS 'http://127.0.0.1:8428/health'
 
       - name: Always dump docker logs (analytical)
@@ -160,60 +163,69 @@ jobs:
         image: neo4j:5.26.13
         env:
           NEO4J_AUTH: neo4j/test1234
-        ports:
-          - 7474:7474
-          - 7687:7687
+        ports: [ "7474:7474", "7687:7687" ]
+        options: >-
+          --health-cmd="wget -qO- http://127.0.0.1:7474 || exit 1"
+          --health-interval=5s --health-retries=60 --health-timeout=4s
+          --health-start-period=15s
       arangodb:
         image: arangodb:3.11
         env:
           ARANGO_ROOT_PASSWORD: test1234
-        ports:
-          - 8529:8529
+        ports: [ "8529:8529" ]
+        options: >-
+          --health-cmd="curl -fsS http://127.0.0.1:8529/_api/version || exit 1"
+          --health-interval=5s --health-retries=60 --health-timeout=4s
+          --health-start-period=20s
       etcd:
-        image: bitnami/etcd:3.5
+        image: gcr.io/etcd-development/etcd:v3.5.13
         env:
-          ALLOW_NONE_AUTHENTICATION: "yes"
-          ETCD_ENABLE_V2: "false"
-          ETCD_ADVERTISE_CLIENT_URLS: "http://0.0.0.0:2379"
-          ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
-          ETCD_LISTEN_PEER_URLS: "http://0.0.0.0:2380"
-          ETCD_INITIAL_ADVERTISE_PEER_URLS: "http://0.0.0.0:2380"
-          ETCD_INITIAL_CLUSTER: "default=http://0.0.0.0:2380"
-          ETCD_INITIAL_CLUSTER_STATE: "new"
-          BITNAMI_DEBUG: "true"
-        ports:
-          - 2379:2379
-          - 2380:2380
+          ETCD_NAME: s1
+          ETCD_DATA_DIR: /var/lib/etcd
+          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://127.0.0.1:2380
+          ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
+          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+          ETCD_INITIAL_CLUSTER: s1=http://127.0.0.1:2380
+          ETCD_INITIAL_CLUSTER_STATE: new
+          ETCD_LOGGER: zap
+        ports: [ "2379:2379", "2380:2380" ]
+        options: >-
+          --health-cmd="sh -lc 'ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health || exit 1'"
+          --health-interval=5s --health-retries=80 --health-timeout=4s
+          --health-start-period=20s
       couchdb:
         image: couchdb:3
         env:
           COUCHDB_USER: admin
           COUCHDB_PASSWORD: test1234
           COUCHDB_SINGLE_NODE: "true"
-        ports:
-          - 5984:5984
+        ports: [ "5984:5984" ]
+        options: >-
+          --health-cmd="curl -fsS http://127.0.0.1:5984/_up || exit 1"
+          --health-interval=5s --health-retries=60 --health-timeout=4s
+          --health-start-period=15s
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure helpers exist
+      - name: Setup echo helpers (local per job)
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ ! -f /tmp/echo_helpers.sh ]; then
-            printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nwait_port(){ h=$1; p=$2; t=${3:-60}; e=$((SECONDS+t)); while [ $SECONDS -lt $e ]; do (echo >"/dev/tcp/$h/$p") >/dev/null 2>&1 && { echo "open $h:$p"; exit 0; }; sleep 1; done; echo "timeout $h:$p"; exit 1; }\n' >/tmp/echo_helpers.sh
-            chmod +x /tmp/echo_helpers.sh
-          fi
+          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
 
       - name: Wait for graph/kv services
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          wait_port 127.0.0.1 7474 240   # neo4j http
-          wait_port 127.0.0.1 7687 240   # neo4j bolt
-          wait_port 127.0.0.1 8529 300   # arango
-          wait_port 127.0.0.1 2379 300   # etcd
-          wait_port 127.0.0.1 5984 240   # couchdb
+          L="${LOG_DIR}/graphkv-wait.log"
+          run_cmd "$L" wait_port 127.0.0.1 7474 240
+          run_cmd "$L" wait_port 127.0.0.1 7687 240
+          run_cmd "$L" wait_port 127.0.0.1 8529 300
+          run_cmd "$L" wait_port 127.0.0.1 2379 300
+          run_cmd "$L" wait_port 127.0.0.1 5984 240
 
       - name: Initialize CouchDB system databases
         shell: bash
@@ -228,14 +240,10 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          # Neo4j
-          curl -fsS http://127.0.0.1:7474/ | head -n1
-          # ArangoDB (버전 확인)
-          curl -fsS http://127.0.0.1:8529/_api/version
-          # etcd v3 health
-          curl -fsS http://127.0.0.1:2379/health
-          # CouchDB
-          curl -fsS http://admin:test1234@127.0.0.1:5984/_all_dbs
+          curl -fsSI http://127.0.0.1:7474/ | head -n1
+          curl -fsS  http://127.0.0.1:8529/_api/version | jq -r '.version'
+          curl -fsS  http://127.0.0.1:2379/health
+          curl -fsS  http://127.0.0.1:5984/_all_dbs | jq -c .
 
       - name: Always dump docker logs (graph/kv)
         if: always()
@@ -252,14 +260,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Ensure helpers exist
+      - name: Setup echo helpers (local per job)
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ ! -f /tmp/echo_helpers.sh ]; then
-            printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nwait_port(){ h=$1; p=$2; t=${3:-60}; e=$((SECONDS+t)); while [ $SECONDS -lt $e ]; do (echo >"/dev/tcp/$h/$p") >/dev/null 2>&1 && { echo "open $h:$p"; exit 0; }; sleep 1; done; echo "timeout $h:$p"; exit 1; }\n' >/tmp/echo_helpers.sh
-            chmod +x /tmp/echo_helpers.sh
-          fi
+          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
 
       - name: Install DB clients
         shell: bash
