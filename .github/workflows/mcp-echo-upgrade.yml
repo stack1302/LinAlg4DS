@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mcp_npm_pkg:
-        description: "MCP CLI 패키지 (권장: @modelcontextprotocol/cli)"
+        description: "MCP CLI 패키지 (권장: mcp)"
         required: false
-        default: "@modelcontextprotocol/cli"
+        default: "mcp"           # ← 스코프 패키지 404 환경 대비 기본값을 mcp로
       mcp_version:
-        description: "MCP 버전(예: 0.3.2). 비우면 latest"
+        description: "MCP 버전(예: 1.4.2). 비우면 latest"
         required: false
         default: ""
       mcp_servers_csv:
@@ -39,7 +39,7 @@ on:
       images_with_fallback_csv:
         description: "도커 이미지 CSV (항목: img|fb1|fb2 …)"
         required: false
-        default: "bitnami/etcd:3.5|bitnami/etcd:latest|quay.io/coreos/etcd:latest"
+        default: "quay.io/coreos/etcd:v3.5.15|gcr.io/etcd-development/etcd:v3.5.15|quay.io/coreos/etcd:v3.5.0"
       create_release:
         description: "GitHub Release 생성"
         type: boolean
@@ -56,7 +56,7 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
-  RELEASE_TAG_PREFIX: "mcp-echo"  # 입력에서 제거, 내부 기본값으로 사용
+  RELEASE_TAG_PREFIX: "mcp-echo"
 
 jobs:
   mcp-echo-mega:
@@ -110,27 +110,61 @@ jobs:
             if [ $rc -eq 0 ]; then echoe "DONE (rc=$rc): $*"; else warn "FAILED (rc=$rc): $*"; fi
             return $rc
           }
+
+          # safer global bin detection for npm v10+
+          npm_global_bin(){
+            local root; root="$(npm root -g 2>/dev/null || true)"
+            if [ -n "$root" ]; then
+              # npm root -g → /opt/.../lib/node_modules → bin dir is sibling ".bin"
+              local parent; parent="$(dirname "$root")"
+              if [ -d "$parent/bin" ]; then echo "$parent/bin"; return 0; fi
+              if [ -d "$root/.bin" ]; then echo "$root/.bin"; return 0; fi
+            fi
+            # fallback common paths
+            for d in "$(npm prefix -g 2>/dev/null || true)/bin" /usr/local/bin /opt/hostedtoolcache/node/*/*/bin; do
+              [ -d "$d" ] && echo "$d" && return 0
+            done
+            echo "/usr/local/bin"
+          }
+
+          perm_dump(){ local r="$1"; ls -lR "$r" > "${r}/perm/perm.tree.txt"; find "$r" -type f -exec sha256sum {} \; > "${r}/perm/perm.sha256.txt"; printf 'umask is: %s\n' "$(umask)" > "${r}/perm/umask.txt"; cp "${r}/perm/perm.tree.txt" ".github/echo_perm/perm-${GITHUB_RUN_ID}.txt" || true; }
+          safe_tag(){ printf '%s\n' "$1" | tr -cd '[:alnum:]._-' | sed 's/^\.*//; s/\.*$//'; }
+
+          gh_release_create(){
+            local tag="$1"; shift
+            local name="$1"; shift
+            local body="$1"; shift
+            local file="$1"; shift || true
+            if [ -z "${GH_TOKEN:-}" ]; then warn "GH_TOKEN not set; skip release"; return 0; fi
+            if gh help release >/dev/null 2>&1; then
+              run_cmd gh release create "$tag" "$file" --notes "$body" --title "$name" || warn "gh release failed"
+              return 0
+            fi
+            # fallback: gh api
+            run_cmd gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -F tag_name="$tag" -F name="$name" -F body="$body" || warn "gh api release failed"
+            if [ -f "$file" ]; then
+              # upload asset via gh api (needs upload_url)
+              url="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" --jq .upload_url | sed 's/{.*}//')"
+              run_cmd gh api --method POST -H "Content-Type: text/plain" \
+                --input "$file" "$url?name=$(basename "$file")" || warn "asset upload failed"
+            fi
+          }
+
           curl_get(){ # curl_get url out [sha256]
             local url="$1"; local out="$2"; local want_sha="${3:-}"
             local allow="${ALLOW_DOMAINS_CSV:-}"; local host; host=$(printf '%s' "$url" | awk -F/ '{print $3}')
             if [ -n "$allow" ]; then
-              local ok=
-              IFS=',' read -r -a arr <<< "$allow"
+              local ok=; IFS=',' read -r -a arr <<< "$allow"
               for d in "${arr[@]}"; do [ "$host" = "$d" ] && ok=1 && break; done
               if [ -z "$ok" ]; then warn "Host $host not in allowlist; skip $url"; return 2; fi
             fi
             run_cmd curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 "$url" -o "$out"
             if [ -n "$want_sha" ] && [ -f "$out" ]; then
               local got; got=$(sha256sum "$out" | awk '{print $1}')
-              if [ "$got" != "$want_sha" ]; then
-                warn "SHA256 mismatch: want=$want_sha got=$got ($out)"
-                return 3
-              fi
+              if [ "$got" != "$want_sha" ]; then warn "SHA256 mismatch: want=$want_sha got=$got ($out)"; return 3; fi
             fi
           }
-          perm_dump(){ local r="$1"; ls -lR "$r" > "${r}/perm/perm.tree.txt"; find "$r" -type f -exec sha256sum {} \; > "${r}/perm/perm.sha256.txt"; printf 'umask is: %s\n' "$(umask)" > "${r}/perm/umask.txt"; cp "${r}/perm/perm.tree.txt" ".github/echo_perm/perm-${GITHUB_RUN_ID}.txt" || true; }
-          safe_tag(){ printf '%s\n' "$1" | tr -cd '[:alnum:]._-' | sed 's/^\.*//; s/\.*$//'; }
-          gh_release_create(){ local tag="$1"; shift; local name="$1"; shift; local body="$1"; shift; if [ -z "${GH_TOKEN:-}" ]; then warn "GH_TOKEN not set; skip release"; return 0; fi; run_cmd gh auth status || echo "Using token from env"; run_cmd gh release create "$tag" "$@" --notes "$body" --title "$name" || warn "gh release failed"; }
           SH
           chmod +x /tmp/echo_helpers.sh
           echo "helpers: ready" > ".github/echo_tools/helpers_ready.txt"
@@ -142,10 +176,9 @@ jobs:
           source /tmp/echo_helpers.sh
           run_cmd node -v
           run_cmd npm -v
-          run_cmd which npm || true
 
       # ===== MCP 설치 + 안전 실행 Shim =====
-      - name: Install MCP CLI (robust:primary→fallback npx)
+      - name: Install MCP CLI (robust: prefer global, tolerate 404)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -153,11 +186,12 @@ jobs:
           PKG="${{ inputs.mcp_npm_pkg }}"
           VER="${{ inputs.mcp_version }}"
           if [ -n "$VER" ]; then run_cmd npm i -g "${PKG}@${VER}" || true; else run_cmd npm i -g "${PKG}" || true; fi
-          echo "NPM global bin=$(npm bin -g)"
+          BIN="$(npm_global_bin)"
+          echo "NPM global bin=${BIN}"
+          ls -l "$BIN" || true
           which mcp || true
-          ls -l "$(npm bin -g)" || true
 
-      - name: Create safe MCP shim (detect broken shebang → node/python/npx)
+      - name: Create safe MCP shim (shebang/runner aware + NPX chain)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -166,30 +200,47 @@ jobs:
           cat <<'SH' | sudo tee "$SHIM" >/dev/null
           #!/usr/bin/env bash
           set -Eeuo pipefail
+
           try_exec_file() {
             local file="$1"; shift
-            if head -n1 "$file" | grep -qE '^#!'; then exec "$file" "$@"; fi
-            local head1; head1="$(head -n1 "$file")"
-            case "$head1" in
-              import\ *|from\ * ) exec python3 "$file" "$@";;
-              const\ *|import\ *|export\ *|\"use\ strict\"*|\'use\ strict\'* ) exec node "$file" "$@";;
-              * ) exec "$file" "$@";;
-            esac
+            if [ -x "$file" ]; then
+              # 명시적 shebang?
+              if head -n1 "$file" | grep -qE '^#!'; then exec "$file" "$@"; fi
+              # 첫 줄 토큰으로 JS/Py 추정
+              local head1; head1="$(head -n1 "$file")"
+              case "$head1" in
+                import\ *|from\ * ) exec python3 "$file" "$@";;
+                const\ *|import\ *|export\ *|\"use\ strict\"*|\'use\ strict\'* ) exec node "$file" "$@";;
+                * ) exec "$file" "$@";;
+              esac
+            fi
+            return 1
           }
+
+          # 1) 전역 mcp 바이너리 있으면 우선 시도
           if command -v mcp >/dev/null 2>&1; then
             MCP_BIN="$(command -v mcp)"
-            if [ -f "$MCP_BIN" ]; then try_exec_file "$MCP_BIN" "$@"; else exec mcp "$@"; fi
+            try_exec_file "$MCP_BIN" "$@" || exec mcp "$@"
           fi
-          if [ -n "${MCP_VERSION:-}" ]; then exec npx -y @modelcontextprotocol/cli@"${MCP_VERSION}" mcp "$@"; else exec npx -y @modelcontextprotocol/cli mcp "$@"; fi
+
+          # 2) NPX 후보 체인 (패키지 레지스트리 편차/404 대비)
+          for PKG in mcp @modelcontextprotocol/cli; do
+            if [ -n "${MCP_VERSION:-}" ] && [ "$PKG" != "mcp" ]; then
+              npx -y "${PKG}@${MCP_VERSION}" mcp --help >/dev/null 2>&1 && exec npx -y "${PKG}@${MCP_VERSION}" mcp "$@"
+            fi
+            # 일반 호출 (mcp는 자체 실행, 스코프 패키지는 서브커맨드 mcp)
+            npx -y "$PKG" --help >/dev/null 2>&1 && exec npx -y "$PKG" "$@"
+            npx -y "$PKG" mcp --help >/dev/null 2>&1 && exec npx -y "$PKG" mcp "$@"
+          done
+
+          echo "mcp-safe: no viable MCP runner found" >&2
+          exit 127
           SH
           sudo chmod +x "$SHIM"
           {
             echo "MCP_VERSION=${{ inputs.mcp_version }}"
             echo "MCP_CMD=$SHIM"
           } >> "$GITHUB_ENV"
-          source /tmp/echo_helpers.sh || true
-          run_cmd head -n 1 "$SHIM" || true
-          run_cmd ls -l "$SHIM" || true
 
       - name: Verify MCP (use $MCP_CMD)
         shell: bash
@@ -225,12 +276,7 @@ jobs:
             "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/ts/main/schema/mcp.json",
             "clients": { "default": { "providers": [] } },
             "servers": {
-              "files": {
-                "command": "mcp",
-                "args": ["files"],
-                "enabled": true,
-                "env": { "MCP_FILES_ROOT": "./" }
-              },
+              "files": { "command": "mcp", "args": ["files"], "enabled": true, "env": { "MCP_FILES_ROOT": "./" } },
               "shell": { "command": "mcp", "args": ["shell"], "enabled": false }
             }
           }
@@ -287,8 +333,7 @@ jobs:
           for item in "${ITEMS[@]}"; do
             [ -z "$item" ] && continue
             url="${item%%|*}"
-            sha="${item#*|}"
-            [ "$url" = "$sha" ] && sha=""  # 구분자 없으면 sha 비움
+            sha="${item#*|}"; [ "$url" = "$sha" ] && sha=""
             base=$(basename "$url")
             out="${root}/downloads/${base}"
             curl_get "$url" "$out" "$sha" || warn "download failed: $url"
@@ -342,7 +387,8 @@ jobs:
             [ "$pulled" -eq 1 ] || warn "All fallbacks failed for $img"
           done
 
-      - name: Summary & tree
+      - name: Summary & tree (always)
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -359,11 +405,12 @@ jobs:
             echo
             echo "## ${root} (top-level)"
             echo '```'
-            ls -la "${root}"
+            ls -la "${root}" || true
             echo '```'
           } > "${root}/logs/summary.md"
 
-      - name: Upload artifacts
+      - name: Upload artifacts (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mcp-echo-mega-${{ github.run_id }}
@@ -371,11 +418,11 @@ jobs:
             ${{ inputs.echo_root }}/**
             .github/echo_perm/**
             .github/echo_up/**
-            ${{ env.LOG_DIR }}**
+            ${{ env.LOG_DIR }}/**
           if-no-files-found: warn
 
-      - name: (Optional) Create GitHub Release (safe tag)
-        if: ${{ inputs.create_release }}
+      - name: (Optional) Create GitHub Release (safe tag) (always try if enabled)
+        if: ${{ inputs.create_release && always() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -387,5 +434,5 @@ jobs:
           tag="${prefix}-${ts}"
           name="MCP EchoOps MEGA ${ts}"
           body="Automated release for MCP EchoOps MEGA run ${GITHUB_RUN_ID}"
-          files="${{ inputs.echo_root }}/logs/summary.md"
-          gh_release_create "$tag" "$name" "$body" "$files" || true
+          file="${{ inputs.echo_root }}/logs/summary.md"
+          gh_release_create "$tag" "$name" "$body" "$file" || true
