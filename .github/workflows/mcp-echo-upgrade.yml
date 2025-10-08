@@ -206,7 +206,7 @@ jobs:
           run_cmd which npm || true
 
       # ============ MCP 설치 (강화판) ============
-      - name: Install MCP CLI (robust: primary→fallback npx)
+      - name: Install MCP CLI (robust:primary→fallback npx)
         shell: bash
         run: |
           set -Eeuo pipefail
