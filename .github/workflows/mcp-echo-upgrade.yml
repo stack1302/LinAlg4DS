@@ -1,41 +1,79 @@
-name: "🔧 MCP Install + Echo Files + Echo Permissions + Auto-Upgrade (ALL-ECHO)"
+name: "🧰 MCP Install + EchoOps MEGA (Safe Shim+npx) : Files/Perms/Upgrade/Dirs/Curl/Containers/Copy/Release"
 
 on:
   workflow_dispatch:
     inputs:
+      # ───── MCP & Servers ─────
       mcp_npm_pkg:
-        description: "MCP CLI 패키지 (기본: mcp, 실패시 @modelcontextprotocol/cli)"
+        description: "MCP CLI 패키지 (권장: @modelcontextprotocol/cli)"
         required: false
-        default: "mcp"
+        default: "@modelcontextprotocol/cli"
       mcp_version:
-        description: "MCP CLI 버전(선택, 예: 0.3.2). 비우면 latest"
+        description: "MCP 버전(선택, 예: 0.3.2). 비우면 latest"
         required: false
         default: ""
       mcp_servers_csv:
-        description: "추가 MCP 서버 NPM 패키지(쉼표구분, 예: @mcp/server-files,@mcp/server-shell)"
+        description: "추가 MCP 서버 NPM 패키지 CSV (예: @modelcontextprotocol/server-files,@modelcontextprotocol/server-shell)"
         required: false
         default: ""
-      allow_domains_csv:
-        description: "curl 허용 도메인(쉼표구분, 예: raw.githubusercontent.com,github.com)"
-        required: false
-        default: "raw.githubusercontent.com,github.com"
-      download_urls_csv:
-        description: "추가로 받을 파일 URL(쉼표구분). 파일명은 basename으로 저장"
-        required: false
-        default: ""
+
+      # ───── Echo/Dirs ─────
       echo_root:
-        description: "에코 아웃풋 루트 디렉토리"
+        description: "에코 루트 디렉토리"
         required: true
         default: ".github/echo_mcp"
       dirs_count:
-        description: "대량 디렉토리 생성 개수(0=건너뜀)"
+        description: "대량 에코 디렉토리 개수(0=건너뜀)"
         required: true
         default: "0"
+
+      # ───── Downloads (Allowlist + SHA256) ─────
+      allow_domains_csv:
+        description: "curl 허용 도메인 CSV"
+        required: false
+        default: "raw.githubusercontent.com,github.com"
+      download_urls_csv:
+        description: "다운로드 URL CSV (basename으로 저장)"
+        required: false
+        default: ""
+      download_sha256_csv:
+        description: "대응 SHA256 CSV(선택, 개수가 맞지 않으면 검증 생략)"
+        required: false
+        default: ""
+
+      # ───── Upgrades ─────
       do_upgrade:
-        description: "Auto Upgrade 수행 (apt/npm/pip)"
+        description: "Auto Upgrade(apt/npm/pip) 실행"
         type: boolean
         required: true
         default: true
+
+      # ───── Containers Pull Test (Optional) ─────
+      images_csv:
+        description: "테스트로 docker pull 할 이미지 CSV (예: bitnami/etcd:3.5,redis:7.2)"
+        required: false
+        default: "bitnami/etcd:3.5"
+      images_fallback_csv:
+        description: "이미지 풀 실패시 대체 태그 CSV(동일/유사 리포, 예: bitnami/etcd:latest,quay.io/coreos/etcd:latest)"
+        required: false
+        default: "bitnami/etcd:latest,quay.io/coreos/etcd:latest"
+
+      # ───── Workflow Copy (Optional) ─────
+      copy_sources:
+        description: "복사할 파일/글롭(CSV). 대상은 .github/workflows/ 로 고정"
+        required: false
+        default: ""
+
+      # ───── Release (Optional) ─────
+      create_release:
+        description: "GitHub Release 생성"
+        type: boolean
+        required: true
+        default: false
+      release_tag_prefix:
+        description: "릴리스 태그 접두사(영문/숫자/.-_)"
+        required: false
+        default: "mcp-echo"
 
 permissions:
   contents: write
@@ -49,37 +87,38 @@ env:
   ECHO_FAIL: "❌"
 
 jobs:
-  mcp-echo-upgrade:
+  mcp-echo-mega:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare echo folders
+      - name: Prepare directories
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" \
-                   "${{ inputs.echo_root }}/configs" \
-                   "${{ inputs.echo_root }}/servers" \
-                   "${{ inputs.echo_root }}/downloads" \
-                   "${{ inputs.echo_root }}/perm" \
-                   "${{ inputs.echo_root }}/logs" \
-                   ".github/echo_perm" \
-                   ".github/echo_up"
+          mkdir -p "${LOG_DIR}"
+          mkdir -p "${{ inputs.echo_root }}"/{configs,servers,downloads,perm,logs,mass}
+          mkdir -p ".github/echo_perm" ".github/echo_up" ".github/echo_tools"
 
-      - name: Install Node.js (for MCP CLI)
+      - name: Setup Node & Python
         uses: actions/setup-node@v4
         with:
           node-version: "22"
-
-      - name: (Optional) Python for pip upgrade support
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
 
-      - name: Echo helpers (run_cmd, curl_get)
+      - name: Install base tools (jq, coreutils)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq coreutils
+
+      - name: Write echo helpers (safe heredoc)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -102,13 +141,21 @@ jobs:
             return $rc
           }
 
-          # curl with allowlist + checksum(opt) support
-          curl_get(){
+          ensure_dir(){ mkdir -p "$1"; }
+
+          write_file_safe(){ # write_file_safe path <<'EOF' ... EOF
+            local f="$1"
+            shift
+            cat > "$f"
+          }
+
+          curl_get(){ # curl_get url out [sha256]
             local url="$1"; local out="$2"; local want_sha="${3:-}"
             local allow="${ALLOW_DOMAINS_CSV:-}"
             local host; host=$(printf '%s' "$url" | awk -F/ '{print $3}')
             if [ -n "$allow" ]; then
-              local ok=; IFS=',' read -r -a arr <<< "$allow"
+              local ok=
+              IFS=',' read -r -a arr <<< "$allow"
               for d in "${arr[@]}"; do [ "$host" = "$d" ] && ok=1 && break; done
               if [ -z "$ok" ]; then warn "Host $host not in allowlist; skip $url"; return 2; fi
             fi
@@ -116,14 +163,38 @@ jobs:
             if [ -n "$want_sha" ] && [ -f "$out" ]; then
               local got; got=$(sha256sum "$out" | awk '{print $1}')
               if [ "$got" != "$want_sha" ]; then
-                warn "SHA256 mismatch: want=$want_sha got=$got for $out"
+                warn "SHA256 mismatch: want=$want_sha got=$got ($out)"
                 return 3
               fi
             fi
           }
+
+          perm_dump(){ # perm_dump rootdir
+            local r="$1"
+            ls -lR "$r" > "${r}/perm/perm.tree.txt"
+            find "$r" -type f -exec sha256sum {} \; > "${r}/perm/perm.sha256.txt"
+            printf 'umask is: %s\n' "$(umask)" > "${r}/perm/umask.txt"
+            cp "${r}/perm/perm.tree.txt" ".github/echo_perm/perm-${GITHUB_RUN_ID}.txt" || true
+          }
+
+          safe_tag(){ # sanitize to [A-Za-z0-9._-]
+            printf '%s\n' "$1" | tr -cd '[:alnum:]._-' | sed 's/^\.*//; s/\.*$//'
+          }
+
+          gh_release_create(){ # gh_release_create tag name body files...
+            local tag="$1"; shift
+            local name="$1"; shift
+            local body="$1"; shift
+            if [ -z "${GH_TOKEN:-}" ]; then
+              warn "GH_TOKEN not set; skip release"
+              return 0
+            fi
+            run_cmd gh auth status || echo "Using token from env"
+            run_cmd gh release create "$tag" "$@" --notes "$body" --title "$name" || warn "gh release failed"
+          }
           SH
           chmod +x /tmp/echo_helpers.sh
-          echo "OK" > "${{ inputs.echo_root }}/logs/helpers_ready.txt"
+          echo "helpers: ready" > ".github/echo_tools/helpers_ready.txt"
 
       - name: Node/npm health (echo)
         shell: bash
@@ -134,41 +205,104 @@ jobs:
           run_cmd npm -v
           run_cmd which npm || true
 
-      - name: Install MCP CLI (primary → fallback)
+      # ============ MCP 설치 (강화판) ============
+      - name: Install MCP CLI (robust: primary→fallback npx)
         shell: bash
-        env:
-          ALLOW_DOMAINS_CSV: ${{ inputs.allow_domains_csv }}
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
+          source /tmp/echo_helpers.sh || true
           PKG="${{ inputs.mcp_npm_pkg }}"
           VER="${{ inputs.mcp_version }}"
+
+          # 1) 우선 글로벌 설치 시도
           if [ -n "$VER" ]; then
             run_cmd npm i -g "${PKG}@${VER}" || true
           else
             run_cmd npm i -g "${PKG}" || true
           fi
 
-          # fallback to @modelcontextprotocol/cli if first failed
-          if ! command -v mcp >/dev/null 2>&1; then
-            warn "Fallback: installing @modelcontextprotocol/cli"
-            if [ -n "$VER" ]; then
-              run_cmd npm i -g "@modelcontextprotocol/cli@${VER}" || true
+          # 2) PATH/바이너리 확인
+          echo "NPM global bin=$(npm bin -g)"
+          which mcp || true
+          ls -l "$(npm bin -g)" || true
+
+      - name: Create safe MCP shim (detect broken shebang → node/python/npx)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh || true
+
+          SHIM="/usr/local/bin/mcp-safe"
+
+          cat <<'SH' | sudo tee "$SHIM" >/dev/null
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+
+          try_exec_file() {
+            local file="$1"; shift
+            # 파일 헤더 분석
+            if head -n1 "$file" | grep -qE '^#!'; then
+              exec "$file" "$@"
+            fi
+            # 첫 줄이 JS/Python 소스인데 shebang이 없는 케이스 보정
+            local head1; head1="$(head -n1 "$file")"
+            case "$head1" in
+              import\ *|from\ * )  # python 스타일
+                exec python3 "$file" "$@"
+                ;;
+              const\ *|import\ *|export\ *|\"use\ strict\"*|\'use\ strict\'* ) # ESM/CommonJS
+                exec node "$file" "$@"
+                ;;
+              * )
+                # 모르면 그냥 실행 시도(권한 없는 텍스트일 수도)
+                exec "$file" "$@"
+                ;;
+            esac
+          }
+
+          # 1) 글로벌 'mcp'가 있으면 우선 사용
+          if command -v mcp >/dev/null 2>&1; then
+            MCP_BIN="$(command -v mcp)"
+            if [ -f "$MCP_BIN" ]; then
+              try_exec_file "$MCP_BIN" "$@"
             else
-              run_cmd npm i -g "@modelcontextprotocol/cli" || true
+              exec mcp "$@"
             fi
           fi
 
-          # verify
-          if command -v mcp >/dev/null 2>&1; then
-            run_cmd mcp --help || true
+          # 2) npx로 공식 CLI 직접 호출 (버전 고정 지원)
+          if [ -n "${MCP_VERSION:-}" ]; then
+            exec npx -y @modelcontextprotocol/cli@"${MCP_VERSION}" mcp "$@"
           else
-            # 일부 CLI는 'mcp' 바이너리가 아닌 경우가 있어 ls -l global bin 출력
-            run_cmd npm bin -g
-            run_cmd ls -l "$(npm bin -g)"
+            exec npx -y @modelcontextprotocol/cli mcp "$@"
           fi
+          SH
 
-      - name: (Optional) Install additional MCP servers (CSV)
+          sudo chmod +x "$SHIM"
+
+          {
+            echo "MCP_VERSION=${{ inputs.mcp_version }}"
+            echo "MCP_CMD=$SHIM"
+          } >> "$GITHUB_ENV"
+
+          # 디버깅 정보
+          source /tmp/echo_helpers.sh || true
+          run_cmd head -n 1 "$SHIM" || true
+          run_cmd ls -l "$SHIM" || true
+
+      - name: Verify MCP (use $MCP_CMD)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh || true
+          : "${MCP_CMD:?MCP_CMD not set}"
+          if ! run_cmd "$MCP_CMD" --help; then
+            warn "mcp --help failed; trying version"
+            run_cmd "$MCP_CMD" --version || true
+          fi
+      # ============ MCP 설치 (강화판) ============
+
+      - name: Install additional MCP servers (CSV)
         if: ${{ inputs.mcp_servers_csv != '' }}
         shell: bash
         run: |
@@ -180,25 +314,7 @@ jobs:
             run_cmd npm i -g "$pkg" || warn "install failed: $pkg"
           done
 
-      - name: Download extra files via curl (allowlist)
-        if: ${{ inputs.download_urls_csv != '' }}
-        shell: bash
-        env:
-          ALLOW_DOMAINS_CSV: ${{ inputs.allow_domains_csv }}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          mkdir -p "${{ inputs.echo_root }}/downloads"
-          IFS=',' read -r -a URLS <<< "${{ inputs.download_urls_csv }}"
-          for u in "${URLS[@]}"; do
-            [ -z "$u" ] && continue
-            base=$(basename "$u")
-            out="${{ inputs.echo_root }}/downloads/${base}"
-            curl_get "$u" "$out" || warn "download failed: $u"
-          done
-          run_cmd ls -l "${{ inputs.echo_root }}/downloads" || true
-
-      - name: Generate MCP config templates (echo)
+      - name: Generate MCP configs + sample server
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -207,9 +323,7 @@ jobs:
           {
             "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/ts/main/schema/mcp.json",
             "clients": {
-              "default": {
-                "providers": []
-              }
+              "default": { "providers": [] }
             },
             "servers": {
               "files": {
@@ -228,37 +342,29 @@ jobs:
           JSON
 
           cat <<'MD' > "${root}/README.md"
-          # MCP + EchoOps
-          - MCP CLI/서버 설치, 에코 파일 생성, 퍼미션 덤프, 업그레이드까지 한 번에 수행합니다.
-          - 수정 포인트: `configs/mcp.config.json`, `servers/*`, `perm/*`
+          # MCP EchoOps MEGA
+          - MCP CLI/서버 설치, 에코 파일 생성, 퍼미션 덤프, 업그레이드, 컨테이너 테스트, 릴리스까지 통합.
+          - 수정: `configs/mcp.config.json`, `servers/*`, `perm/*`, `downloads/*`
           MD
 
-          cat <<'SH' > "${root}/servers/sample-server.sh"
+          cat <<'SHX' > "${root}/servers/sample-server.sh"
           #!/usr/bin/env bash
           set -Eeuo pipefail
-          echo "Sample MCP server boot..."
-          # 실제 서버 진입점은 프로젝트/환경에 맞게 교체
-          exec sleep 10
-          SH
+          echo "[Sample] MCP server boot (placeholder)"
+          exec sleep 5
+          SHX
           chmod +x "${root}/servers/sample-server.sh"
 
-      - name: Echo permissions dump (권한 에코 파일 생성)
+      - name: Echo permissions (chmod + dump)
         shell: bash
         run: |
           set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
           root="${{ inputs.echo_root }}"
-          # 대상 디렉토리 권한, 실행 권한 설정
           chmod -R a+r "${root}" || true
           find "${root}" -type d -exec chmod a+rx {} \; || true
           find "${root}/servers" -type f -name "*.sh" -exec chmod a+rx {} \; || true
-
-          # 퍼미션/소유/해시 덤프
-          ls -lR "${root}" > "${root}/perm/perm.tree.txt"
-          find "${root}" -type f -exec sha256sum {} \; > "${root}/perm/perm.sha256.txt"
-          printf 'umask is: %s\n' "$(umask)" > "${root}/perm/umask.txt"
-
-          # 루트에도 퍼미션 요약
-          ls -lR "${root}" > ".github/echo_perm/perm-${{ github.run_id }}.txt"
+          perm_dump "${root}"
 
       - name: Massive echo directories (optional)
         if: ${{ inputs.dirs_count != '0' }}
@@ -267,29 +373,48 @@ jobs:
           set -Eeuo pipefail
           root="${{ inputs.echo_root }}"
           N="${{ inputs.dirs_count }}"
-          echo "Create ${N} echo dirs under ${root}/mass"
-          mkdir -p "${root}/mass"
+          echo "Create $N dirs under ${root}/mass"
           for i in $(seq 1 "$N"); do
             d="${root}/mass/dir$(printf '%05d' "$i")"
             mkdir -p "$d"
             printf 'echo dir %s\n' "$d" > "${d}/README.echo.txt"
           done
-          echo "Mass dir count:" $(find "${root}/mass" -maxdepth 1 -type d | wc -l) > "${root}/logs/mass.done.txt"
+          echo "Mass dir count: $(find "${root}/mass" -maxdepth 1 -type d | wc -l)" > "${root}/logs/mass.done.txt"
 
-      - name: Auto Upgrade (apt + npm + pip) — optional
+      - name: Curl downloads (allowlist + optional SHA256)
+        if: ${{ inputs.download_urls_csv != '' }}
+        shell: bash
+        env:
+          ALLOW_DOMAINS_CSV: ${{ inputs.allow_domains_csv }}
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          root="${{ inputs.echo_root }}"
+          IFS=',' read -r -a URLS <<< "${{ inputs.download_urls_csv }}"
+          IFS=',' read -r -a SHAS <<< "${{ inputs.download_sha256_csv }}"
+          for idx in "${!URLS[@]}"; do
+            u="${URLS[$idx]}"; [ -z "$u" ] && continue
+            base=$(basename "$u")
+            out="${root}/downloads/${base}"
+            want=""
+            if [ "${#SHAS[@]}" -gt "$idx" ] && [ -n "${SHAS[$idx]}" ]; then
+              want="${SHAS[$idx]}"
+            fi
+            curl_get "$u" "$out" "$want" || warn "download failed: $u"
+          done
+          ls -l "${root}/downloads" || true
+
+      - name: Auto Upgrade (apt + npm + pip)
         if: ${{ inputs.do_upgrade }}
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          # apt
           run_cmd sudo apt-get update -y
           run_cmd sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade || true
           run_cmd sudo apt-get -y autoremove || true
-          # npm
           run_cmd npm -g update || true
           run_cmd npm -g outdated || true
-          # pip
           python -V || true
           python - <<'PY' || true
           import sys, subprocess
@@ -301,37 +426,94 @@ jobs:
           if pkgs:
               subprocess.call([sys.executable, "-m", "pip", "install", "-U"] + pkgs)
           PY
-
-          # 업그레이드 로그 보존
           date '+%F %T' > ".github/echo_up/upgrade-${{ github.run_id }}.stamp"
 
-      - name: Summaries (artifact-like echo)
+      - name: Docker image pull test with fallback (optional)
+        if: ${{ inputs.images_csv != '' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          IFS=',' read -r -a IMGS <<< "${{ inputs.images_csv }}"
+          IFS=',' read -r -a FBS  <<< "${{ inputs.images_fallback_csv }}"
+          for i in "${!IMGS[@]}"; do
+            img="${IMGS[$i]}"; [ -z "$img" ] && continue
+            if run_cmd docker pull "$img"; then
+              echo "Pulled: $img"
+              continue
+            fi
+            pulled=0
+            for fb in "${FBS[@]}"; do
+              [ -z "$fb" ] && continue
+              if run_cmd docker pull "$fb"; then
+                echo "Fallback pulled: $fb (original $img failed)"
+                pulled=1
+                break
+              fi
+            done
+            [ "$pulled" -eq 1 ] || warn "All fallbacks failed for $img"
+          done
+
+      - name: (Optional) Copy sources into .github/workflows
+        if: ${{ inputs.copy_sources != '' }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          IFS=',' read -r -a LIST <<< "${{ inputs.copy_sources }}"
+          for g in "${LIST[@]}"; do
+            [ -z "$g" ] && continue
+            for f in $g; do
+              [ -f "$f" ] || { warn "skip: $f (not found)"; continue; }
+              run_cmd cp -f "$f" ".github/workflows/"
+            done
+          done
+          run_cmd ls -l ".github/workflows" || true
+
+      - name: Summary & tree
         shell: bash
         run: |
           set -Eeuo pipefail
           root="${{ inputs.echo_root }}"
           {
-            echo "# MCP/Echo/Upgrade Summary"
-            echo "- MCP NPM PKG: ${{ inputs.mcp_npm_pkg }}"
-            echo "- MCP VERSION:  ${{ inputs.mcp_version }}"
-            echo "- Servers CSV:  ${{ inputs.mcp_servers_csv }}"
-            echo "- Allowlist:    ${{ inputs.allow_domains_csv }}"
-            echo "- Dirs Count:   ${{ inputs.dirs_count }}"
-            echo "- Do Upgrade:   ${{ inputs.do_upgrade }}"
+            echo "# MCP EchoOps MEGA Summary"
+            echo "- MCP PKG: ${{ inputs.mcp_npm_pkg }}"
+            echo "- MCP VER: ${{ inputs.mcp_version }}"
+            echo "- Servers:  ${{ inputs.mcp_servers_csv }}"
+            echo "- Allow:    ${{ inputs.allow_domains_csv }}"
+            echo "- Dirs:     ${{ inputs.dirs_count }}"
+            echo "- Upgrade:  ${{ inputs.do_upgrade }}"
+            echo "- Images:   ${{ inputs.images_csv }}"
             echo
-            echo "## Tree"
+            echo "## ${root} (top-level)"
             echo '```'
             ls -la "${root}"
             echo '```'
           } > "${root}/logs/summary.md"
 
-      - name: Upload echo outputs (optional)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-            name: mcp-echo-${{ github.run_id }}
-            path: |
-              ${{ inputs.echo_root }}/**
-              .github/echo_perm/**
-              .github/echo_up/**
-              ${{ env.LOG_DIR }}/**
-            if-no-files-found: ignore
+          name: mcp-echo-mega-${{ github.run_id }}
+          path: |
+            ${{ inputs.echo_root }}/**
+            .github/echo_perm/**
+            .github/echo_up/**
+            ${{ env.LOG_DIR }}/**
+          if-no-files-found: warn
+
+      - name: (Optional) Create GitHub Release (safe tag)
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          prefix="$(safe_tag "${{ inputs.release_tag_prefix }}")"
+          ts="$(date +%Y%m%d%H%M%S)"
+          tag="${prefix}-${ts}"
+          name="MCP EchoOps MEGA ${ts}"
+          body="Automated release for MCP EchoOps MEGA run ${GITHUB_RUN_ID}"
+          files="${{ inputs.echo_root }}/logs/summary.md"
+          gh_release_create "$tag" "$name" "$body" "$files" || true
