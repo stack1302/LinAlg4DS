@@ -1,14 +1,14 @@
-name: "🐍 Python Latest Downloader (curl + official URLs + Echo + 호출용)"
+name: "🐍 Python Latest Downloader (curl + official URLs + Echo + 호출용, 대량 디렉토리 포함)"
 
 on:
   workflow_dispatch:
     inputs:
       track:
-        description: "받을 트랙: latest(최신 3.x), 3.13, 3.12 등"
+        description: "받을 트랙: latest(최신 3.x) 또는 3.13/3.12 등"
         required: false
         default: "latest"
       version_override:
-        description: "정확한 버전 강제 (예: 3.13.0). 지정 시 track 무시"
+        description: "정확한 버전 강제 (예: 3.13.2). 지정 시 track 무시"
         required: false
         default: ""
       include_installers:
@@ -21,7 +21,7 @@ on:
         required: false
         default: ".github/echo_dirs"
       dirs_count:
-        description: "생성할 디렉토리 개수(예: 2000)"
+        description: "생성할 디렉토리 개수(예: 2000, 0이면 스킵)"
         required: false
         default: "0"
   workflow_call:
@@ -60,7 +60,8 @@ env:
 jobs:
   resolve-and-download:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,7 +92,8 @@ jobs:
           echo "ECHO_HELPERS=/tmp/echo_helpers.sh" >> "$GITHUB_ENV"
           echo "helpers=/tmp/echo_helpers.sh"      >> "$GITHUB_OUTPUT"
 
-      - name: Resolve Python version (official cpython releases)
+      # ── 강건한 버전 해석: Releases → Tags → python.org ───────────────────────
+      - name: Resolve Python version (robust: Releases → Tags → python.org fallback)
         id: resolve
         env:
           INPUT_TRACK: ${{ inputs.track || github.event.inputs.track }}
@@ -103,47 +105,95 @@ jobs:
 
           TRACK="${INPUT_TRACK:-latest}"
           OVERRIDE="${INPUT_VERSION_OVERRIDE:-}"
-          API_URL="https://api.github.com/repos/python/cpython/releases?per_page=100"
+
+          UA_HDR=(-H "User-Agent: python-latest-downloader/1.0")
+          AUTH_HDR=()
+          [ -n "${GH_TOKEN:-}" ] && AUTH_HDR=(-H "Authorization: Bearer ${GH_TOKEN}")
+
+          pick_from_json(){
+            local prefix="$1"
+            jq -r --arg pfx "$prefix" '
+              # .tag_name(릴리스) / .name(태그) 모두 지원
+              map(if has("tag_name") then .tag_name else .name end)
+              | map(gsub("^v";""))
+              | map(select((. | test("^3\\.[0-9]+\\.[0-9]+$")) and (if $pfx != "" then startswith($pfx) else true end)))
+              | sort_by( split(".") | map(tonumber) ) | reverse | .[0]
+            '
+          }
+
+          choose_version_from_github(){
+            # 1) Releases API (최대 3페이지)
+            for page in 1 2 3; do
+              URL="https://api.github.com/repos/python/cpython/releases?per_page=100&page=${page}"
+              echoe "GitHub Releases 페이지 ${page} 조회: $URL"
+              RESP="$(curl -fSsL "${UA_HDR[@]}" "${AUTH_HDR[@]}" -H "Accept: application/vnd.github+json" "$URL" || true)"
+              [ -z "$RESP" ] && continue
+              RESP_STABLE="$(echo "$RESP" | jq '[.[] | select(.prerelease==false and .draft==false)]')"
+              if [ "${TRACK}" = "latest" ]; then
+                CANDIDATE="$(echo "$RESP_STABLE" | pick_from_json "")"
+              else
+                CANDIDATE="$(echo "$RESP_STABLE" | pick_from_json "${TRACK}.")"
+              fi
+              if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "null" ]; then
+                echo "$CANDIDATE"; return 0
+              fi
+            done
+            # 2) Tags API (최대 3페이지)
+            for page in 1 2 3; do
+              URL="https://api.github.com/repos/python/cpython/tags?per_page=100&page=${page}"
+              echoe "GitHub Tags 페이지 ${page} 조회: $URL"
+              RESP="$(curl -fSsL "${UA_HDR[@]}" "${AUTH_HDR[@]}" -H "Accept: application/vnd.github+json" "$URL" || true)"
+              [ -z "$RESP" ] && continue
+              if [ "${TRACK}" = "latest" ]; then
+                CANDIDATE="$(echo "$RESP" | pick_from_json "")"
+              else
+                CANDIDATE="$(echo "$RESP" | pick_from_json "${TRACK}.")"
+              fi
+              if [ -n "$CANDIDATE" ] && [ "$CANDIDATE" != "null" ]; then
+                echo "$CANDIDATE"; return 0
+              fi
+            done
+            return 1
+          }
+
+          fetch_from_python_org(){
+            # 3) python.org HTML 파싱 + ftp 파일 HEAD 확인
+            URL_DL="https://www.python.org/downloads/"
+            echoe "python.org 다운로드 페이지 조회: $URL_DL"
+            HTML="$(curl -fSsL "${UA_HDR[@]}" "$URL_DL" || true)"
+            [ -z "$HTML" ] && return 1
+
+            if [ "${TRACK}" = "latest" ]; then
+              VER="$(printf '%s' "$HTML" | grep -Po 'Latest Python 3 Release\s*-\s*Python\s*\K3\.\d+\.\d+' | head -n1)"
+            else
+              VER="$(printf '%s' "$HTML" | grep -Po "Python\s*\K${TRACK//./\\.}\.\d+" | head -n1)"
+            fi
+            [ -n "$VER" ] || return 1
+
+            FTP_BASE="https://www.python.org/ftp/python/${VER}"
+            if curl -fsI "${FTP_BASE}/Python-${VER}.tar.xz" >/dev/null 2>&1 || curl -fsI "${FTP_BASE}/Python-${VER}.tgz" >/dev/null 2>&1; then
+              echo "$VER"; return 0
+            fi
+            return 1
+          }
 
           if [ -n "$OVERRIDE" ]; then
             VERSION="$OVERRIDE"
             echoe "version_override 지정됨 → VERSION=${VERSION}"
           else
-            echoe "릴리스 목록 조회: $API_URL (사전 릴리스/드래프트 제외)"
-            CURL_AUTH=()
-            if [ -n "${GH_TOKEN:-}" ]; then
-              CURL_AUTH=(-H "Authorization: Bearer ${GH_TOKEN}")
-            fi
-            RESP="$(curl -fSsL "${CURL_AUTH[@]}" -H "Accept: application/vnd.github+json" "$API_URL")"
-
-            # 안정판만 → 태그(v3.x.y)에서 v 제거 → 3.*만 → semver 역정렬 → 첫번째
-            if [ "${TRACK}" = "latest" ]; then
-              VERSION="$(echo "$RESP" | jq -r '
-                [.[] | select(.prerelease==false and .draft==false) | .tag_name]
-                | map(gsub("^v";""))
-                | map(select(test("^3\\.[0-9]+\\.[0-9]+$")))
-                | sort_by( split(".") | map(tonumber) ) | reverse | .[0]
-              ')"
+            if VERSION="$(choose_version_from_github)"; then
+              echoe "해결된 최신 버전(GitHub): ${VERSION} (track=${TRACK})"
+            elif VERSION="$(fetch_from_python_org)"; then
+              echoe "해결된 최신 버전(python.org): ${VERSION} (track=${TRACK})"
             else
-              PREFIX="${TRACK}."
-              VERSION="$(echo "$RESP" | jq -r --arg pfx "$PREFIX" '
-                [.[] | select(.prerelease==false and .draft==false) | .tag_name]
-                | map(gsub("^v";""))
-                | map(select(startswith($pfx)))
-                | map(select(test("^3\\.[0-9]+\\.[0-9]+$")))
-                | sort_by( split(".") | map(tonumber) ) | reverse | .[0]
-              ')"
-            fi
-
-            if [ -z "${VERSION}" ] || [ "${VERSION}" = "null" ]; then
-              fail "GitHub 릴리스에서 버전을 찾지 못했습니다. track=${TRACK}"
+              fail "버전을 자동으로 찾지 못했습니다. track=${TRACK} — GitHub/Tags/python.org 모두 실패"
               exit 1
             fi
-            echoe "해결된 최신 버전: ${VERSION} (track=${TRACK})"
           fi
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      # ── 공식 URL에서만 다운로드 (curl 전용) ────────────────────────────────
       - name: Download from official python.org (source + optional installers)
         id: download
         env:
@@ -157,7 +207,6 @@ jobs:
           run_cmd "mkdir -p \"$BASE_DIR\""
 
           PY_FTP_BASE="https://www.python.org/ftp/python/${VERSION}"
-
           SRC_TGZ="${PY_FTP_BASE}/Python-${VERSION}.tgz"
           SRC_TXZ="${PY_FTP_BASE}/Python-${VERSION}.tar.xz"
 
@@ -167,7 +216,7 @@ jobs:
 
           if [ "${INCLUDE_INSTALLERS}" = "true" ]; then
             echoe "설치 파일(공식) 추가 다운로드:"
-            curl_get "${PY_FTP_BASE}/python-${VERSION}-amd64.exe"      "$BASE_DIR/python-${VERSION}-amd64.exe"      || warn "Windows exe 미제공"
+            curl_get "${PY_FTP_BASE}/python-${VERSION}-amd64.exe"       "$BASE_DIR/python-${VERSION}-amd64.exe"       || warn "Windows exe 미제공"
             curl_get "${PY_FTP_BASE}/python-${VERSION}-embed-amd64.zip" "$BASE_DIR/python-${VERSION}-embed-amd64.zip" || warn "Windows embed 미제공"
             curl_get "${PY_FTP_BASE}/python-${VERSION}-macos11.pkg"     "$BASE_DIR/python-${VERSION}-macos11.pkg"     || warn "macOS pkg 미제공"
           fi
@@ -175,11 +224,12 @@ jobs:
           echoe "다운로드 목록:"
           run_cmd "ls -al \"$BASE_DIR\" || true"
 
-          # 0바이트 파일 제거
+          # 0바이트 파일 정리
           find "$BASE_DIR" -type f -size 0 -print -delete | tee -a "${LOG_DIR}/python-download.log" || true
 
           echo "base_dir=${BASE_DIR}" >> "$GITHUB_OUTPUT"
 
+      # ── (옵션) 대량 디렉토리 생성 ──────────────────────────────────────────
       - name: (옵션) 대량 디렉토리 생성 (echo logged)
         if: ${{ (inputs.dirs_count || github.event.inputs.dirs_count) != '0' }}
         env:
@@ -208,6 +258,7 @@ jobs:
             run_cmd "ls -al \"${TARGET_ROOT}\" | head -n 50"
           fi
 
+      # ── 아티팩트 업로드 ────────────────────────────────────────────────────
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -218,7 +269,10 @@ jobs:
           if-no-files-found: warn
           compression-level: 6
 
+      # ── 요약 ──────────────────────────────────────────────────────────────
       - name: Summary
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
         run: |
           set -Eeuo pipefail
           source "$ECHO_HELPERS"
