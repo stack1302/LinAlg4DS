@@ -178,7 +178,7 @@ jobs:
           run_cmd npm -v
 
       # ===== MCP 설치 + 안전 실행 Shim =====
-      - name: Install MCP CLI (robust: prefer global, tolerate 404)
+      - name: Install MCP CLI (robust:prefer global, tolerate 404)
         shell: bash
         run: |
           set -Eeuo pipefail
