@@ -63,16 +63,16 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - name: Checkout
+      - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: Install tools (jq, coreutils)
+      - name: "Install tools (jq, coreutils)"
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: Init echo helpers (export to env)
+      - name: "Init echo helpers (export to env)"
         id: echo_init
         run: |
           set -Eeuo pipefail
@@ -93,7 +93,7 @@ jobs:
           echo "helpers=/tmp/echo_helpers.sh"      >> "$GITHUB_OUTPUT"
 
       # ── 강건한 버전 해석: Releases → Tags → python.org ───────────────────────
-      - name: Resolve Python version (robust: Releases → Tags → python.org fallback)
+      - name: "Resolve Python version (robust: Releases → Tags → python.org fallback)"
         id: resolve
         env:
           INPUT_TRACK: ${{ inputs.track || github.event.inputs.track }}
@@ -113,7 +113,6 @@ jobs:
           pick_from_json(){
             local prefix="$1"
             jq -r --arg pfx "$prefix" '
-              # .tag_name(릴리스) / .name(태그) 모두 지원
               map(if has("tag_name") then .tag_name else .name end)
               | map(gsub("^v";""))
               | map(select((. | test("^3\\.[0-9]+\\.[0-9]+$")) and (if $pfx != "" then startswith($pfx) else true end)))
@@ -122,7 +121,6 @@ jobs:
           }
 
           choose_version_from_github(){
-            # 1) Releases API (최대 3페이지)
             for page in 1 2 3; do
               URL="https://api.github.com/repos/python/cpython/releases?per_page=100&page=${page}"
               echoe "GitHub Releases 페이지 ${page} 조회: $URL"
@@ -138,7 +136,6 @@ jobs:
                 echo "$CANDIDATE"; return 0
               fi
             done
-            # 2) Tags API (최대 3페이지)
             for page in 1 2 3; do
               URL="https://api.github.com/repos/python/cpython/tags?per_page=100&page=${page}"
               echoe "GitHub Tags 페이지 ${page} 조회: $URL"
@@ -157,19 +154,16 @@ jobs:
           }
 
           fetch_from_python_org(){
-            # 3) python.org HTML 파싱 + ftp 파일 HEAD 확인
             URL_DL="https://www.python.org/downloads/"
             echoe "python.org 다운로드 페이지 조회: $URL_DL"
             HTML="$(curl -fSsL "${UA_HDR[@]}" "$URL_DL" || true)"
             [ -z "$HTML" ] && return 1
-
             if [ "${TRACK}" = "latest" ]; then
               VER="$(printf '%s' "$HTML" | grep -Po 'Latest Python 3 Release\s*-\s*Python\s*\K3\.\d+\.\d+' | head -n1)"
             else
               VER="$(printf '%s' "$HTML" | grep -Po "Python\s*\K${TRACK//./\\.}\.\d+" | head -n1)"
             fi
             [ -n "$VER" ] || return 1
-
             FTP_BASE="https://www.python.org/ftp/python/${VER}"
             if curl -fsI "${FTP_BASE}/Python-${VER}.tar.xz" >/dev/null 2>&1 || curl -fsI "${FTP_BASE}/Python-${VER}.tgz" >/dev/null 2>&1; then
               echo "$VER"; return 0
@@ -190,11 +184,10 @@ jobs:
               exit 1
             fi
           fi
-
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       # ── 공식 URL에서만 다운로드 (curl 전용) ────────────────────────────────
-      - name: Download from official python.org (source + optional installers)
+      - name: "Download from official python.org (source + optional installers)"
         id: download
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
@@ -224,13 +217,12 @@ jobs:
           echoe "다운로드 목록:"
           run_cmd "ls -al \"$BASE_DIR\" || true"
 
-          # 0바이트 파일 정리
           find "$BASE_DIR" -type f -size 0 -print -delete | tee -a "${LOG_DIR}/python-download.log" || true
 
           echo "base_dir=${BASE_DIR}" >> "$GITHUB_OUTPUT"
 
       # ── (옵션) 대량 디렉토리 생성 ──────────────────────────────────────────
-      - name: (옵션) 대량 디렉토리 생성 (echo logged)
+      - name: "(옵션) 대량 디렉토리 생성 (echo logged)"
         if: ${{ (inputs.dirs_count || github.event.inputs.dirs_count) != '0' }}
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
@@ -259,7 +251,7 @@ jobs:
           fi
 
       # ── 아티팩트 업로드 ────────────────────────────────────────────────────
-      - name: Upload artifacts
+      - name: "Upload artifacts"
         uses: actions/upload-artifact@v4
         with:
           name: python-${{ steps.resolve.outputs.version }}-official
@@ -270,7 +262,7 @@ jobs:
           compression-level: 6
 
       # ── 요약 ──────────────────────────────────────────────────────────────
-      - name: Summary
+      - name: "Summary"
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: |
