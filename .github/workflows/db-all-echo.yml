@@ -1,123 +1,64 @@
-name: "🗄️ DB Services + Echo Healthchecks + EchoDirs/Files + DockerLogs (Noble-Fix)"
+name: DB Infrastructure CI
 
 on:
   workflow_dispatch:
-    inputs:
-      enable_heavy:
-        description: "무거운 DB(Cassandra/Scylla)도 포함 실행"
-        type: boolean
-        required: false
-        default: false
-      allow_domains_csv:
-        description: "curl 허용 도메인 CSV (예: raw.githubusercontent.com,downloads.mariadb.org)"
-        required: false
-        default: "raw.githubusercontent.com"
-      extra_files:
-        description: "curl로 받을 파일들 (공백/줄바꿈/쉼표 구분)"
-        required: false
-        default: ""
-      echo_root:
-        description: "에코 대량 디렉토리 루트 경로"
-        required: false
-        default: ".github/echo_mass"
-      echo_count:
-        description: "에코 디렉토리 개수"
-        required: false
-        default: "2000"
-
-permissions:
-  contents: read
+  push:
+    paths:
+      - ".github/workflows/db-workflow.yml"
+      - "infra/**"
 
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
   DOCKER_LOG_DIR: .github/echo_logs/docker-logs
-  DOWNLOAD_DIR: .github/echo_downloads  # ← 고정 다운로드 경로
+  DOWNLOAD_DIR: .github/echo_downloads   # ⬅️ 고정 다운로드 경로
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
+  # 필요시 외부 다운로드 허용 도메인 화이트리스트(콤마로 구분)
+  ALLOW_DOMAINS_CSV: "github.com,storage.googleapis.com,repo1.maven.org,dlcdn.apache.org"
 
 jobs:
-  # ─────────────────────────────────────────────────────────────
-  # 0) 공통 준비 + 에코 대량 디렉토리/파일 생성 + 권한 설정 + 고정 다운로드
-  # ─────────────────────────────────────────────────────────────
   prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      allow: ${{ steps.export-allow.outputs.allow }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare echo helpers (global)
+      # 모든 job에서 동일하게 /tmp/echo_helpers.sh 를 "로컬에서 즉시 생성"
+      - name: Setup echo helpers (local per job)
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}"
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
           cat > /tmp/echo_helpers.sh <<'SH'
           set -Eeuo pipefail
           : "${LOG_DIR:=.github/echo_logs}"
           : "${DOCKER_LOG_DIR:=.github/echo_logs/docker-logs}"
-          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}"
+          : "${DOWNLOAD_DIR:=.github/echo_downloads}"
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
 
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
+
           logf(){  printf '%s\n' "$*" | tee -a "$1"; }
 
-          # run_cmd "LOG_FILE" cmd args...
-          run_cmd(){
-            local LOG_FILE="$1"; shift
-            logf "$LOG_FILE" "▶ $*"
-            "$@" 2>&1 | tee -a "$LOG_FILE"
-            local rc=${PIPESTATUS[0]}
-            if [ $rc -eq 0 ]; then echoe "DONE: $*"; else warn "RC=$rc ← $*"; fi
-            return $rc
-          }
+          run_cmd(){ local L="$1"; shift; logf "$L" "▶ $*"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
 
-          # curl_get url out [sha256] (allowlist enforced)
+          wait_port(){ local host="$1" port="$2" t="${3:-60}"; local end=$((SECONDS+t)); while [ $SECONDS -lt $end ]; do (echo >"/dev/tcp/$host/$port") >/dev/null 2>&1 && { echoe "port $host:$port open"; return 0; }; sleep 1; done; warn "timeout waiting for $host:$port"; return 1; }
+
           curl_get(){
-            local url="$1"; local out="$2"; local want_sha="${3:-}"
-            local allow="${ALLOW_DOMAINS_CSV:-}"
-            local host; host=$(printf '%s' "$url" | awk -F/ '{print $3}')
-            if [ -n "$allow" ] && ! printf '%s\n' "$allow" | tr ',' '\n' | tr -d ' ' | grep -Fxq "$host"; then
-              echo "Blocked host: $host (allow=$allow)"; return 2
+            local u="$1" o="$2" s="${3:-}"; local a="${ALLOW_DOMAINS_CSV:-}"; local h
+            h=$(printf '%s' "$u" | awk -F/ '{print $3}')
+            if [ -n "$a" ] && ! printf '%s\n' "$a" | tr ',' '\n' | tr -d ' ' | grep -Fxq "$h"; then
+              echo "Blocked host: $h (allow=$a)"; return 2
             fi
-            curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 180 "$url" -o "$out"
-            if [ -n "$want_sha" ]; then
-              echo "$want_sha  $out" | sha256sum -c -
-            fi
+            curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 180 "$u" -o "$o"
+            [ -n "$s" ] && echo "$s  $o" | sha256sum -c -
           }
 
-          # wait_port host port [timeout=60]
-          wait_port(){
-            local host="$1" port="$2" wait="${3:-60}"
-            local end=$((SECONDS+wait))
-            while [ $SECONDS -lt $end ]; do
-              if (echo >"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
-                echoe "port ${host}:${port} open"
-                return 0
-              fi
-              sleep 1
-            done
-            warn "timeout waiting for ${host}:${port}"
-            return 1
-          }
-
-          # dump_all_docker_logs [name_filter...]
-          # - 모든 컨테이너 목록/상태를 ${DOCKER_LOG_DIR}/docker-ps.log 저장
-          # - name_filter 가 주어지면 해당 이름 포함 컨테이너 우선 저장
           dump_all_docker_logs(){
-            local PS_LOG="${DOCKER_LOG_DIR}/docker-ps.log"
-            docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}' | tee "$PS_LOG" || true
-            local ids names
-            if [ "$#" -gt 0 ]; then
-              for nf in "$@"; do
-                ids="$(docker ps -a --format '{{.ID}} {{.Names}}' | awk '/'"$nf"'/ {print $1}')"
-                for id in $ids; do
-                  docker logs --details "$id" > "${DOCKER_LOG_DIR}/${nf}-${id}.log" 2>&1 || true
-                done
-              done
-            fi
-            # 나머지 전부도 저장(중복 피하려 단건당 2MB 제한 tail)
+            local PS="${DOCKER_LOG_DIR}/docker-ps.log"
+            docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}' | tee "$PS" || true
             while read -r id img name status; do
               [ -z "$id" ] && continue
               docker logs --details "$id" 2>&1 | tail -c 2000000 > "${DOCKER_LOG_DIR}/${name}-${id}.log" || true
@@ -125,365 +66,262 @@ jobs:
           }
           SH
           chmod +x /tmp/echo_helpers.sh
-          echo "✅ echo helpers ready → /tmp/echo_helpers.sh"
 
-      - name: Install DB client tools (APT) — noble fix (no mariadb-client/mongodb-clients)
+      # 에코 기능: 대량 디렉토리/파일 생성 + 권한 + 고정 다운로드 경로
+      - name: Create echo directory tree & files with permissions
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/clients-install.log"
-          run_cmd "$LOG" sudo apt-get update
-          run_cmd "$LOG" sudo apt-get install -y --no-install-recommends \
-            postgresql-client \
-            mysql-client \
-            redis-tools \
-            clickhouse-client \
-            curl jq netcat-traditional
-          echoe "Clients installed (MariaDB는 mysql CLI 사용, Mongo는 컨테이너 mongosh 사용)."
+          L="${LOG_DIR}/echo-init.log"
 
-      - name: Export allow domains
-        id: export-allow
-        run: |
-          echo "allow=${{ github.event.inputs.allow_domains_csv }}" >> "$GITHUB_OUTPUT"
+          # 대량 디렉토리 생성
+          for d in core/{pg,mysql,mariadb,redis,mongo} analytical/{clickhouse,questdb,vm} graphkv/{neo4j,arangodb,etcd,couchdb} tmp/tools; do
+            run_cmd "$L" mkdir -p "${LOG_DIR}/${d}" "${DOCKER_LOG_DIR}/${d}" "${DOWNLOAD_DIR}/${d}"
+          done
 
-      - name: Create fixed download dir + download extra files with allowlist
-        if: ${{ inputs.extra_files != '' }}
-        env:
-          ALLOW_DOMAINS_CSV: ${{ steps.export-allow.outputs.allow }}
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/curl-downloads.log"
-          run_cmd "$LOG" mkdir -p "${DOWNLOAD_DIR}"
-          printf '%s\n' "${{ github.event.inputs.extra_files }}" \
-            | tr ',\n' '  ' \
-            | xargs -n1 -I{} bash -lc '
-              f={}; [ -z "$f" ] && exit 0
-              base=$(basename "$f")
-              /bin/bash -lc "source /tmp/echo_helpers.sh; run_cmd \"'"$LOG"'\" curl_get \"$f\" \"${DOWNLOAD_DIR}/$base\""
-            '
-          echoe "All files downloaded to ${DOWNLOAD_DIR}"
+          # 대량 에코 파일 생성 (샘플 20개)
+          for i in $(seq 1 20); do
+            f="${LOG_DIR}/echo_file_${i}.log"
+            run_cmd "$L" bash -c "echo '[echo] file ${i}' > '${f}'"
+            run_cmd "$L" chmod 0644 "${f}"
+          done
 
-      - name: Echo directories/files massive creation + permissions
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          ROOT="${{ github.event.inputs.echo_root }}"
-          COUNT="${{ github.event.inputs.echo_count }}"
-          LOG="${LOG_DIR}/echo-mass-create.log"
-          [ -z "$ROOT" ] && ROOT=".github/echo_mass"
-          [ -z "$COUNT" ] && COUNT="2000"
-
-          run_cmd "$LOG" mkdir -p "$ROOT"
-          run_cmd "$LOG" mkdir -p "${ROOT}/scripts" "${ROOT}/configs" "${ROOT}/logs" "${ROOT}/data" "${ROOT}/db" "${ROOT}/tmp"
-          seq -f "dir-%06g" 1 "$COUNT" | xargs -P 8 -I{} bash -lc '
-            d="'"$ROOT"'/{}"
-            mkdir -p "$d"/{inbox,outbox,work,done,fail}
-          '
-          cat > "${ROOT}/scripts/echo_helpers_local.sh" <<'EOSH'
+          # 에코 스크립트 자체(에코 실행 테스트)
+          E="${LOG_DIR}/echo.sh"
+          cat > "$E" <<'BASH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
-          echoe(){ printf '✅ %s\n' "$*"; }
-          warn(){  printf '⚠️  %s\n' "$*"; }
-          fail(){  printf '❌ %s\n' "$*"; }
-          EOSH
-          cat > "${ROOT}/README.md" <<'EOMD'
-          # Echo Mass Root
-          - Auto-generated by GitHub Actions.
-          - inbox/outbox/work/done/fail subfolders per dir-NNNNNN.
-          - Logs live in .github/echo_logs.
-          EOMD
-          cat > "${ROOT}/configs/permissions.policy" <<'EOP'
-          # Directory permission policy
-          # - dirs: 755
-          # - files: 644
-          # - scripts (*.sh, *.bash, *.py): 755
-          EOP
-          run_cmd "$LOG" bash -lc 'find "'"$ROOT"'" -type d -print0 | xargs -0 chmod 755'
-          run_cmd "$LOG" bash -lc 'find "'"$ROOT"'" -type f -print0 | xargs -0 chmod 644'
-          run_cmd "$LOG" chmod 755 "${ROOT}/scripts/echo_helpers_local.sh"
-          cat > "${ROOT}/scripts/run_echo.sh" <<'EOSH'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-          LOG_DIR="${ROOT_DIR}/../echo_logs"
-          mkdir -p "${LOG_DIR}"
-          echo "[$(date +%F_%T)] run_echo start" | tee -a "${LOG_DIR}/run_echo.log"
-          EOSH
-          run_cmd "$LOG" chmod 755 "${ROOT}/scripts/run_echo.sh"
-          echoe "Permissions applied: dirs=755, files=644, scripts=755."
-          echoe "Echo mass structure is ready at ${ROOT}."
+          echo "echo:: $*"
+          BASH
+          chmod 0755 "$E"
+          run_cmd "$L" "$E" "echo subsystem ready"
 
-  # ─────────────────────────────────────────────────────────────
-  # 1) 핵심 DB 묶음 (PostgreSQL, MySQL, MariaDB, MongoDB, Redis)
-  # ─────────────────────────────────────────────────────────────
-  core-dbs:
-    runs-on: ubuntu-latest
-    needs: [prepare]
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: app
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd="pg_isready -U test"
-          --health-interval=5s --health-timeout=3s --health-retries=30
-      mysql:
-        image: mysql:8.4
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: app
-          MYSQL_USER: app
-          MYSQL_PASSWORD: app
-        ports: ["3306:3306"]
-        options: >-
-          --health-cmd="mysqladmin ping -h localhost -proot"
-          --health-interval=5s --health-timeout=3s --health-retries=30
-      mariadb:
-        image: mariadb:11
-        env:
-          MARIADB_ROOT_PASSWORD: root
-          MARIADB_DATABASE: app
-          MARIADB_USER: app
-          MARIADB_PASSWORD: app
-        ports: ["3307:3306"]
-      mongo:
-        image: mongo:7
-        ports: ["27017:27017"]
-      redis:
-        image: redis:7
-        ports: ["6379:6379"]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Copy echo helpers from prepare
-        run: cp -f /tmp/echo_helpers.sh /tmp/echo_helpers.sh || true
-      - name: Wait ports
+      # 업그레이드 훅(옵셔널): OS 캐시/패키지 메타 업그레이드
+      - name: Upgrade base packages (optional)
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/core-wait.log"
-          run_cmd "$LOG" wait_port 127.0.0.1 5432 90
-          run_cmd "$LOG" wait_port 127.0.0.1 3306 90
-          run_cmd "$LOG" wait_port 127.0.0.1 3307 90
-          run_cmd "$LOG" wait_port 127.0.0.1 27017 90
-          run_cmd "$LOG" wait_port 127.0.0.1 6379 60
-      - name: Health & smoke tests (psql/mysql/redis + MariaDB via mysql + Mongo via container mongosh)
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/core-smoke.log"
-          run_cmd "$LOG" psql "postgresql://test:test@127.0.0.1:5432/app" -c "SELECT version();"
-          run_cmd "$LOG" psql "postgresql://test:test@127.0.0.1:5432/app" -c "CREATE TABLE IF NOT EXISTS t(id serial primary key, v text); INSERT INTO t(v) VALUES('ok'); SELECT count(*) FROM t;"
-          run_cmd "$LOG" mysql -h 127.0.0.1 -P 3306 -uroot -proot -e "SELECT VERSION(); CREATE DATABASE IF NOT EXISTS smoke; USE smoke; CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(50)); INSERT INTO t(v) VALUES('ok'); SELECT COUNT(*) FROM t;"
-          run_cmd "$LOG" mysql -h 127.0.0.1 -P 3307 -uroot -proot -e "SELECT VERSION(); CREATE DATABASE IF NOT EXISTS smoke; USE smoke; CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY AUTO_INCREMENT, v VARCHAR(50)); INSERT INTO t(v) VALUES('ok'); SELECT COUNT(*) FROM t;"
-          run_cmd "$LOG" bash -lc 'docker run --rm --network=host mongo:7 mongosh --host 127.0.0.1 --eval "db.runCommand({ ping: 1 })"'
-          run_cmd "$LOG" bash -lc 'docker run --rm --network=host mongo:7 mongosh --host 127.0.0.1 --eval "db.getSiblingDB(\"smoke\").t.insertOne({v:\"ok\"}); db.getSiblingDB(\"smoke\").t.countDocuments()"'
-          run_cmd "$LOG" redis-cli -h 127.0.0.1 PING
-          run_cmd "$LOG" redis-cli -h 127.0.0.1 SET foo bar
-          run_cmd "$LOG" redis-cli -h 127.0.0.1 GET foo
-      - name: Dump service logs (core-dbs)
-        if: always()
-        run: |
-          set -Eeuo pipefail || true
-          source /tmp/echo_helpers.sh || true
-          dump_all_docker_logs postgres mysql mariadb mongo redis || true
+          L="${LOG_DIR}/upgrade.log"
+          run_cmd "$L" sudo apt-get update
+          run_cmd "$L" sudo apt-get -y dist-upgrade
+          run_cmd "$L" sudo apt-get -y autoremove --purge
 
-  # ─────────────────────────────────────────────────────────────
-  # 2) 분석/시계열 묶음 (ClickHouse, QuestDB, InfluxDB, VictoriaMetrics)
-  # ─────────────────────────────────────────────────────────────
   analytical-dbs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [prepare]
     services:
       clickhouse:
         image: clickhouse/clickhouse-server:24.8
-        ports: ["9000:9000", "8123:8123"]
+        ports:
+          - 9000:9000    # native
+          - 8123:8123    # http
+        options: >-
+          --health-cmd="clickhouse-client --query='SELECT 1'" 
+          --health-interval=5s --health-retries=30 --health-timeout=3s
       questdb:
         image: questdb/questdb:latest
-        ports: ["9009:9009","8812:8812","9000:9000"]
-      influx:
-        image: influxdb:2
-        ports: ["8086:8086"]
+        # 내부 9000 → 호스트 9001 로 매핑해서 ClickHouse(9000)와 충돌 방지
+        ports:
+          - 9009:9009    # influx
+          - 8812:8812    # pg-wire
+          - 9001:9000    # web/native
+        options: >-
+          --health-cmd="sh -c 'nc -z 127.0.0.1 9000 || exit 1'"
+          --health-interval=5s --health-retries=30 --health-timeout=3s
       victoriametrics:
-        image: victoriametrics/victoria-metrics:latest
-        ports: ["8428:8428"]
+        image: victoriametrics/victoria-metrics:v1.103.0
+        ports:
+          - 8428:8428
+        options: >-
+          --health-cmd="wget -qO- http://127.0.0.1:8428/health"
+          --health-interval=5s --health-retries=30 --health-timeout=3s
+
     steps:
       - uses: actions/checkout@v4
-      - name: Copy echo helpers
-        run: cp -f /tmp/echo_helpers.sh /tmp/echo_helpers.sh || true
-      - name: Wait ports
+
+      - name: Setup echo helpers (local per job)
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
+          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
+
+      - name: Wait for analytical services
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/anal-wait.log"
-          run_cmd "$LOG" wait_port 127.0.0.1 8123 120
-          run_cmd "$LOG" wait_port 127.0.0.1 9000 120
-          run_cmd "$LOG" wait_port 127.0.0.1 8812 120
-          run_cmd "$LOG" wait_port 127.0.0.1 8086 120
-          run_cmd "$LOG" wait_port 127.0.0.1 8428 120
-      - name: Health & smoke tests
+          L="${LOG_DIR}/analytical-wait.log"
+          run_cmd "$L" wait_port 127.0.0.1 8123 180
+          run_cmd "$L" wait_port 127.0.0.1 9000 180
+          run_cmd "$L" wait_port 127.0.0.1 8812 180
+          run_cmd "$L" wait_port 127.0.0.1 9001 180
+          run_cmd "$L" wait_port 127.0.0.1 8428 180
+
+      - name: Smoke test (analytical)
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/anal-smoke.log"
-          run_cmd "$LOG" bash -lc 'curl -fsS http://127.0.0.1:8123/ping'
-          if command -v clickhouse-client >/dev/null 2>&1; then
-            run_cmd "$LOG" clickhouse-client --host 127.0.0.1 --query "SELECT version();"
-          fi
-          if command -v psql >/dev/null 2>&1; then
-            run_cmd "$LOG" psql "postgresql://admin:quest@127.0.0.1:8812/qdb?sslmode=disable" -c "SELECT 1;" || true
-          fi
-          run_cmd "$LOG" curl -fsS http://127.0.0.1:8086/health
-          run_cmd "$LOG" curl -fsS http://127.0.0.1:8428/metrics | head -n 5
-      - name: Dump service logs (analytical-dbs)
+          L="${LOG_DIR}/analytical-smoke.log"
+          run_cmd "$L" bash -lc "curl -fsS http://127.0.0.1:9001/ | head -n1"
+          run_cmd "$L" bash -lc "curl -fsS http://127.0.0.1:8123/?query=SELECT%201"
+
+      - name: Always dump docker logs (analytical)
         if: always()
         run: |
-          set -Eeuo pipefail || true
-          source /tmp/echo_helpers.sh || true
-          dump_all_docker_logs clickhouse questdb influx victoriametrics || true
+          set -Eeuo pipefail
+          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; else
+            dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
+          fi
+          dump_all_docker_logs
 
-  # ─────────────────────────────────────────────────────────────
-  # 3) 그래프/멀티모델/키값 묶음 (Neo4j, ArangoDB, etcd, CouchDB)
-  #   - CouchDB의 "_users 없음" 반복 에러를 방지하기 위해 시스템 DB 생성 추가
-  # ─────────────────────────────────────────────────────────────
   graph-kv-dbs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [prepare]
     services:
       neo4j:
-        image: neo4j:5
+        image: neo4j:5.26.13
         env:
-          NEO4J_AUTH: neo4j/testpass
-        ports: ["7687:7687","7474:7474"]
-      arango:
+          NEO4J_AUTH: neo4j/test1234
+        ports:
+          - 7474:7474
+          - 7687:7687
+        options: >-
+          --health-cmd="wget -qO- http://127.0.0.1:7474 || exit 1"
+          --health-interval=5s --health-retries=40 --health-timeout=3s
+
+      arangodb:
         image: arangodb:3.11
         env:
-          ARANGO_ROOT_PASSWORD: root
-        ports: ["8529:8529"]
+          ARANGO_ROOT_PASSWORD: test1234
+        ports:
+          - 8529:8529
+        options: >-
+          --health-cmd="curl -fsS http://127.0.0.1:8529/_api/version"
+          --health-interval=5s --health-retries=40 --health-timeout=3s
+
       etcd:
         image: gcr.io/etcd-development/etcd:v3.5.13
         env:
-          ALLOW_NONE_AUTHENTICATION: "yes"
-        ports: ["2379:2379","2380:2380"]
+          ETCDCTL_API: "3"
+        ports:
+          - 2379:2379
+          - 2380:2380
+        # 단일 노드용 명시적 설정 + 실동작 헬스체크 적용
+        command: >
+          /usr/local/bin/etcd
+          --name s1
+          --data-dir /var/lib/etcd
+          --initial-advertise-peer-urls http://127.0.0.1:2380
+          --listen-peer-urls http://0.0.0.0:2380
+          --advertise-client-urls http://127.0.0.1:2379
+          --listen-client-urls http://0.0.0.0:2379
+          --initial-cluster s1=http://127.0.0.1:2380
+          --initial-cluster-state new
+          --logger=zap
         options: >-
-          --health-cmd="etcdctl endpoint health || exit 1"
-          --health-interval=10s --health-timeout=5s --health-retries=20
+          --health-cmd="sh -c 'ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint status || exit 1'"
+          --health-interval=5s --health-retries=60 --health-timeout=4s
+
       couchdb:
         image: couchdb:3
         env:
           COUCHDB_USER: admin
-          COUCHDB_PASSWORD: admin
-        ports: ["5984:5984"]
-    steps:
-      - uses: actions/checkout@v4
-      - name: Copy echo helpers
-        run: cp -f /tmp/echo_helpers.sh /tmp/echo_helpers.sh || true
-      - name: Wait ports
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/gkv-wait.log"
-          run_cmd "$LOG" wait_port 127.0.0.1 7687 120
-          run_cmd "$LOG" wait_port 127.0.0.1 7474 120
-          run_cmd "$LOG" wait_port 127.0.0.1 8529 120
-          run_cmd "$LOG" wait_port 127.0.0.1 2379 120
-          run_cmd "$LOG" wait_port 127.0.0.1 5984 120
-
-      # ★ CouchDB 시스템 DB 생성으로 "_users 없음" 에러 사전 차단 ★
-      - name: CouchDB bootstrap system databases
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/couch-bootstrap.log"
-          BASE="http://admin:admin@127.0.0.1:5984"
-
-          # health/노드 정보 수집
-          run_cmd "$LOG" curl -fsS "${BASE}/" || true
-
-          # _users / _replicator 존재 확인 후 생성
-          for db in _users _replicator; do
-            status=$(curl -s -o /dev/null -w '%{http_code}' "${BASE}/${db}")
-            if [ "$status" != "200" ]; then
-              run_cmd "$LOG" curl -fsS -X PUT "${BASE}/${db}"
-            else
-              echo "DB ${db} already exists" | tee -a "$LOG"
-            fi
-          done
-
-          # _users 디자인/시큐리티 문서(있으면 건너뜀)
-          run_cmd "$LOG" curl -fsS -X PUT "${BASE}/_users/_security" \
-            --header "Content-Type: application/json" \
-            --data '{"admins":{"names":["admin"],"roles":[]},"members":{"names":["admin"],"roles":[]}}' || true
-
-      - name: Health & smoke tests
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/gkv-smoke.log"
-
-          # Neo4j (HTTP UI 노출 확인)
-          run_cmd "$LOG" curl -fsS http://127.0.0.1:7474/ || true
-
-          # ArangoDB
-          run_cmd "$LOG" curl -fsS http://127.0.0.1:8529/_api/version
-          run_cmd "$LOG" curl -fsS -u root:root --header 'Content-Type: application/json' \
-            --data '{"name":"smoke"}' http://127.0.0.1:8529/_api/database || true
-
-          # etcd
-          run_cmd "$LOG" curl -fsS http://127.0.0.1:2379/health || true
-
-          # CouchDB (부트스트랩 이후 재확인)
-          run_cmd "$LOG" curl -fsS http://admin:admin@127.0.0.1:5984/_all_dbs
-      - name: Dump service logs (graph-kv-dbs)
-        if: always()
-        run: |
-          set -Eeuo pipefail || true
-          source /tmp/echo_helpers.sh || true
-          # 사용자가 공유하신 로그 패턴(neo4j/arango/etcd/couchdb) 우선 수집
-          dump_all_docker_logs neo4j arango etcd couchdb || true
-
-  # ─────────────────────────────────────────────────────────────
-  # 4) 무거운 DB (옵션): Cassandra, ScyllaDB
-  # ─────────────────────────────────────────────────────────────
-  heavy-dbs:
-    if: ${{ inputs.enable_heavy == true }}
-    runs-on: ubuntu-latest
-    needs: [prepare]
-    services:
-      cassandra:
-        image: cassandra:4.1
-        ports: ["9042:9042"]
+          COUCHDB_PASSWORD: test1234
+          COUCHDB_SINGLE_NODE: "true"
+        ports:
+          - 5984:5984
         options: >-
-          --health-cmd="cqlsh -e 'DESCRIBE CLUSTER' || exit 1"
-          --health-interval=20s --health-timeout=10s --health-retries=30
-      scylla:
-        image: scylladb/scylla:5.4
-        ports: ["9142:9042"]
+          --health-cmd="curl -fsS http://127.0.0.1:5984/_up"
+          --health-interval=5s --health-retries=40 --health-timeout=3s
+
     steps:
       - uses: actions/checkout@v4
-      - name: Copy echo helpers
-        run: cp -f /tmp/echo_helpers.sh /tmp/echo_helpers.sh || true
-      - name: Wait ports (느림 주의)
+
+      - name: Setup echo helpers (local per job)
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
+          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
+
+      - name: Wait for graph/kv services
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/heavy-wait.log"
-          run_cmd "$LOG" wait_port 127.0.0.1 9042 300
-          run_cmd "$LOG" wait_port 127.0.0.1 9142 300
-      - name: Health & smoke tests (Cassandra/Scylla)
+          L="${LOG_DIR}/graphkv-wait.log"
+          run_cmd "$L" wait_port 127.0.0.1 7474 180
+          run_cmd "$L" wait_port 127.0.0.1 7687 180
+          run_cmd "$L" wait_port 127.0.0.1 8529 180
+          run_cmd "$L" wait_port 127.0.0.1 2379 240
+          run_cmd "$L" wait_port 127.0.0.1 5984 180
+
+      # CouchDB _users DB 생성(로그의 반복 경고 및 에러를 사전 차단)
+      - name: Initialize CouchDB system databases
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          LOG="${LOG_DIR}/heavy-smoke.log"
-          run_cmd "$LOG" bash -lc 'docker ps'
-          run_cmd "$LOG" bash -lc 'echo | nc -vz 127.0.0.1 9042'
-          run_cmd "$LOG" bash -lc 'echo | nc -vz 127.0.0.1 9142'
-      - name: Dump service logs (heavy-dbs)
+          L="${LOG_DIR}/couchdb-init.log"
+          base="http://admin:test1234@127.0.0.1:5984"
+
+          run_cmd "$L" bash -lc "curl -fsS ${base}/_users     || curl -fsS -X PUT ${base}/_users"
+          run_cmd "$L" bash -lc "curl -fsS ${base}/_replicator || curl -fsS -X PUT ${base}/_replicator"
+          run_cmd "$L" bash -lc "curl -fsS ${base}/_global_changes || curl -fsS -X PUT ${base}/_global_changes"
+
+      - name: Smoke test (graph/kv)
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          L="${LOG_DIR}/graphkv-smoke.log"
+          run_cmd "$L" bash -lc "curl -fsS http://127.0.0.1:7474/ | head -n1"
+          run_cmd "$L" bash -lc "curl -fsS http://127.0.0.1:5984/_all_dbs"
+
+      - name: Always dump docker logs (graph/kv)
         if: always()
         run: |
-          set -Eeuo pipefail || true
-          source /tmp/echo_helpers.sh || true
-          dump_all_docker_logs cassandra scylla || true
+          set -Eeuo pipefail
+          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; else
+            dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
+          fi
+          dump_all_docker_logs
+
+  core-dbs:
+    runs-on: ubuntu-24.04
+    needs: [prepare]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup echo helpers (local per job)
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
+          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
+
+      # 클라이언트 툴 설치 (mongodb-clients 제외, maria/mysql 충돌 회피)
+      - name: Install DB clients with echo
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          L="${LOG_DIR}/clients-install.log"
+          run_cmd "$L" sudo apt-get update
+          # mysql-client & mariadb-client 충돌 방지: mysql만 설치(이미 최신이면 스킵)
+          run_cmd "$L" sudo apt-get install -y --no-install-recommends \
+            postgresql-client mysql-client redis-tools clickhouse-client \
+            curl jq netcat-traditional
+
+      # 포트 대기(옵션: 실제 core DB 컨테이너를 띄우지 않는 경우 스킵 가능)
+      - name: Wait (optional ports)
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          L="${LOG_DIR}/core-wait.log"
+          # 사용 안 하는 포트는 필요시 주석
+          run_cmd "$L" wait_port 127.0.0.1 5432 5 || true
+          run_cmd "$L" wait_port 127.0.0.1 3306 5 || true
+          run_cmd "$L" wait_port 127.0.0.1 6379 5 || true
+
+      - name: Always dump docker logs (core)
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          if [ -f /tmp/echo_helpers.sh ]; then source /tmp/echo_helpers.sh; else
+            dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
+          fi
+          dump_all_docker_logs
