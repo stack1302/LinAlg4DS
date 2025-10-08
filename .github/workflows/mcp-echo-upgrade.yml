@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mcp_npm_pkg:
-        description: "MCP CLI 패키지 (기본: mcp)"
+        description: "MCP CLI 후보 패키지(npx 기본 대상). 기본: mcp"
         required: false
         default: "mcp"
       mcp_version:
-        description: "MCP 버전(예: 1.4.2). 비우면 latest"
+        description: "MCP 버전(선택, 예: 1.4.2). 비우면 latest"
         required: false
         default: ""
       mcp_servers_csv:
@@ -28,7 +28,7 @@ on:
         required: false
         default: "raw.githubusercontent.com,github.com"
       downloads_manifest:
-        description: "다운로드 매니페스트 CSV (항목: URL|SHA256) — SHA256 생략 가능"
+        description: "다운로드 매니페스트 CSV (URL|SHA256 형식, SHA256 생략 가능)"
         required: false
         default: ""
       do_upgrade:
@@ -37,9 +37,9 @@ on:
         required: true
         default: true
       images_with_fallback_csv:
-        description: "도커 이미지 CSV (항목: img|fb1|fb2 …)"
+        description: "도커 이미지 CSV (img|fb1|fb2 …). 기본값은 존재하는 태그로 구성"
         required: false
-        default: "quay.io/coreos/etcd:v3.5.15|gcr.io/etcd-development/etcd:v3.5.15|quay.io/coreos/etcd:v3.5.0,alpine:3.19|alpine:latest"
+        default: "quay.io/coreos/etcd:v3.5.15|gcr.io/etcd-development/etcd:v3.5.15,alpine:3.19|alpine:latest"
       create_release:
         description: "GitHub Release 생성"
         type: boolean
@@ -83,12 +83,12 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: Install base tools (jq, coreutils, file)
+      - name: Install base tools (jq, coreutils, file, gh)
         shell: bash
         run: |
           set -Eeuo pipefail
           sudo apt-get update -y
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq coreutils file
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y jq coreutils file gh
 
       - name: Write echo helpers (safe heredoc)
         shell: bash
@@ -102,7 +102,6 @@ jobs:
           logf(){ printf '%s\n' "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
-          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"; }
           run_cmd(){
             logf "▶ $*"
             eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo-${SAFE_SERVICE}.log"
@@ -110,7 +109,6 @@ jobs:
             if [ $rc -eq 0 ]; then echoe "DONE (rc=$rc): $*"; else warn "FAILED (rc=$rc): $*"; fi
             return $rc
           }
-          # npm v10+ 호환: bin 경로 탐색(명령 'npm bin -g' 미지원 환경 대응)
           npm_global_bin(){
             local root; root="$(npm root -g 2>/dev/null || true)"
             if [ -n "$root" ]; then
@@ -125,23 +123,31 @@ jobs:
           }
           perm_dump(){ local r="$1"; ls -lR "$r" > "${r}/perm/perm.tree.txt"; find "$r" -type f -exec sha256sum {} \; > "${r}/perm/perm.sha256.txt"; printf 'umask is: %s\n' "$(umask)" > "${r}/perm/umask.txt"; cp "${r}/perm/perm.tree.txt" ".github/echo_perm/perm-${GITHUB_RUN_ID}.txt" || true; }
           safe_tag(){ printf '%s\n' "$1" | tr -cd '[:alnum:]._-' | sed 's/^\.*//; s/\.*$//'; }
+          # gh release: 없으면 gh api 로 폴백 (이번엔 폴백을 반드시 실행)
           gh_release_create(){
-            local tag="$1"; shift
-            local name="$1"; shift
-            local body="$1"; shift
-            local file="$1"; shift || true
+            local tag="$1"; local name="$2"; local body="$3"; local file="$4"
             if [ -z "${GH_TOKEN:-}" ]; then warn "GH_TOKEN not set; skip release"; return 0; fi
             if gh help release >/dev/null 2>&1; then
-              run_cmd gh release create "$tag" "$file" --notes "$body" --title "$name" || warn "gh release failed"
-              return 0
+              if gh release create "$tag" "$file" --notes "$body" --title "$name"; then
+                echoe "gh release created"
+                return 0
+              else
+                warn "gh release create failed; falling back to gh api"
+              fi
             fi
-            run_cmd gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" -F tag_name="$tag" -F name="$name" -F body="$body" || warn "gh api release failed"
-            if [ -f "$file" ]; then
-              url="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" --jq .upload_url | sed 's/{.*}//')"
-              run_cmd gh api --method POST -H "Content-Type: text/plain" --input "$file" "$url?name=$(basename "$file")" || warn "asset upload failed"
+            # 폴백: gh api 로 릴리스 생성
+            if gh api -X POST "repos/${GITHUB_REPOSITORY}/releases" -f tag_name="$tag" -f name="$name" -f body="$body" >/tmp/rel.json 2>/dev/null; then
+              echoe "gh api release created"
+              # 에셋 업로드 (optional)
+              if [ -f "$file" ]; then
+                url="$(jq -r .upload_url </tmp/rel.json | sed 's/{.*}//')"
+                gh api --method POST -H "Content-Type: text/plain" --input "$file" "$url?name=$(basename "$file")" || warn "asset upload failed"
+              fi
+            else
+              warn "gh api release failed"
             fi
           }
-          curl_get(){ # curl_get url out [sha256]
+          curl_get(){
             local url="$1"; local out="$2"; local want_sha="${3:-}"
             local allow="${ALLOW_DOMAINS_CSV:-}"; local host; host=$(printf '%s' "$url" | awk -F/ '{print $3}')
             if [ -n "$allow" ]; then
@@ -166,79 +172,112 @@ jobs:
           source /tmp/echo_helpers.sh
           run_cmd node -v
           run_cmd npm -v
+          command -v npx || true
 
       # ===== MCP 설치 + 안전 실행 Shim =====
-      - name: Install MCP CLI (robust:tolerate 404; no hard-fail)
+      # (중요) npx 경로를 1순위로 이용하여 'mcp-safe'가 항상 동작하도록 설계
+      - name: Install MCP CLI (best-effort; no hard fail)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh || true
           PKG="${{ inputs.mcp_npm_pkg }}"
           VER="${{ inputs.mcp_version }}"
+          # 전역 설치는 '있으면 좋음' 수준으로만 시도 (npx가 1순위)
           if [ -n "$VER" ]; then run_cmd npm i -g "${PKG}@${VER}" || true; else run_cmd npm i -g "${PKG}" || true; fi
           BIN="$(npm_global_bin)"
           echo "NPM global bin=${BIN}"
           ls -l "$BIN" || true
           which mcp || true
 
-      - name: Create safe MCP shim (Node-first ESM; preflight; npx-chain)
+      - name: Create safe MCP shim (NPX-first + 다중 후보 + Node/exec 보조)
         shell: bash
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh || true
           SHIM="/usr/local/bin/mcp-safe"
           sudo tee "$SHIM" >/dev/null <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
 
-          preflight_node() { command -v node >/dev/null 2>&1 || return 1; node "$1" --help >/dev/null 2>&1; }
-          preflight_py()   { command -v python3 >/dev/null 2>&1 || return 1; python3 "$1" --help >/dev/null 2>&1; }
-          preflight_exec() { "$1" --help >/dev/null 2>&1; }
-          preflight_npx()  { command -v npx >/dev/null 2>&1 || return 1; npx -y "$@" --help >/dev/null 2>&1; }
-
-          run_mcp() {
-            local bin="$1"; shift
-            local ver="${MCP_VERSION:-}"
-
-            # 1) 전역 mcp가 파일이면: Node → Python → 직접 실행 순으로 안전 시도
-            if [ -n "$bin" ] && [ -e "$bin" ] && [ -f "$bin" ]; then
-              # 텍스트/JS면 Node 우선
-              if file -b --mime-type "$bin" | grep -qE '^(text/|application/javascript)'; then
-                if preflight_node "$bin"; then exec node "$bin" "$@"; fi
-                if preflight_py "$bin";   then exec python3 "$bin" "$@"; fi
-              fi
-              # 실행 파일이면 직접 실행
-              if [ -x "$bin" ] && preflight_exec "$bin"; then exec "$bin" "$@"; fi
+          # npx 사전검증/사전헬프 없이 '직접 실행' 우선: 일부 패키지의 --help/--version 반환코드가 일정치 않음
+          try_npx() {
+            # $1: spec(예: mcp / @mintlify/mcp / @modelcontextprotocol/cli@x.y.z mcp)
+            # 나머지 인자 그대로 전달
+            local spec="$1"; shift || true
+            if command -v npx >/dev/null 2>&1; then
+              # shellcheck disable=SC2086
+              exec npx -y $spec "$@"
             fi
-
-            # 2) NPX 체인 폴백: mcp → @modelcontextprotocol/cli[@ver] mcp
-            if preflight_npx mcp; then exec npx -y mcp "$@"; fi
-            if [ -n "$ver" ] && preflight_npx "@modelcontextprotocol/cli@${ver}" mcp; then exec npx -y "@modelcontextprotocol/cli@${ver}" mcp "$@"; fi
-            if preflight_npx @modelcontextprotocol/cli mcp; then exec npx -y @modelcontextprotocol/cli mcp "$@"; fi
-
-            echo "mcp-safe: no viable MCP runner found (node/python/exec + npx chain failed)" >&2
-            exit 127
+            return 127
           }
 
-          MCP_BIN="$(command -v mcp || true)"
-          run_mcp "$MCP_BIN" "$@"
+          try_node_file() {
+            # $1: file path
+            local f="$1"; shift || true
+            if command -v node >/dev/null 2>&1 && [ -f "$f" ]; then
+              exec node "$f" "$@"
+            fi
+            return 127
+          }
+
+          try_exec() {
+            local f="$1"; shift || true
+            if [ -x "$f" ]; then
+              exec "$f" "$@"
+            fi
+            return 127
+          }
+
+          main() {
+            local user_spec="${MCP_NPX_SPEC:-mcp}"   # 기본 npx 대상
+            local ver="${MCP_VERSION:-}"
+            local global_bin="$(command -v mcp || true)"
+
+            # 1) NPX 1차: 사용자가 지정한 spec (기본 mcp)
+            try_npx "$user_spec" "$@" || true
+
+            # 2) NPX 2차: @mintlify/mcp (일부 환경에서 전역 mcp 바이너리가 이 소스 기준)
+            try_npx "@mintlify/mcp" "$@" || true
+
+            # 3) NPX 3차: @modelcontextprotocol/cli (버전 고정 → latest)
+            if [ -n "$ver" ]; then
+              try_npx "@modelcontextprotocol/cli@${ver} mcp" "$@" || true
+            fi
+            try_npx "@modelcontextprotocol/cli mcp" "$@" || true
+
+            # 4) 전역 설치본이 있으면 Node로 직접 실행(ESM 텍스트 바이너리 보정)
+            if [ -n "$global_bin" ] && [ -f "$global_bin" ]; then
+              # 텍스트/JS면 Node로, 아니면 직접 실행
+              if file -b --mime-type "$global_bin" | grep -qE '^(text/|application/javascript)'; then
+                try_node_file "$global_bin" "$@" || true
+              fi
+              try_exec "$global_bin" "$@" || true
+            fi
+
+            echo "mcp-safe: no viable MCP runner found (npx chain + node/exec fallback failed)" >&2
+            exit 127
+          }
+          main "$@"
           SH
           sudo chmod +x "$SHIM"
           {
             echo "MCP_VERSION=${{ inputs.mcp_version }}"
+            # 사용자가 지정한 후보 패키지를 npx 1순위로 사용
+            echo "MCP_NPX_SPEC=${{ inputs.mcp_npm_pkg }}"
             echo "MCP_CMD=$SHIM"
           } >> "$GITHUB_ENV"
 
-      - name: Verify MCP (help/version + files subcommand)
+      - name: Verify MCP (run help/version and files subcommand; tolerant)
         shell: bash
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh || true
           : "${MCP_CMD:?MCP_CMD not set}"
-          "$MCP_CMD" --help || "$MCP_CMD" --version || true
+          # 다양한 플래그 조합 시도 (일부 패키지의 반환코드가 일정치 않음)
+          "$MCP_CMD" --help || true
+          "$MCP_CMD" --version || true
           "$MCP_CMD" files --help || true
-      # ===== MCP 설치 + 안전 실행 Shim =====
 
+      # ===== MCP 서버 설치(선택) =====
       - name: Install additional MCP servers (CSV)
         if: ${{ inputs.mcp_servers_csv != '' }}
         shell: bash
@@ -251,6 +290,7 @@ jobs:
             run_cmd npm i -g "$pkg" || warn "install failed: $pkg"
           done
 
+      # ===== 에코/권한/구성/대량생성 =====
       - name: Generate MCP configs + sample server
         shell: bash
         run: |
@@ -275,7 +315,7 @@ jobs:
           #!/usr/bin/env bash
           set -Eeuo pipefail
           echo "[Sample] MCP server boot (placeholder)"
-          exec sleep 5
+          exec sleep 2
           SHX
           chmod +x "${root}/servers/sample-server.sh"
 
@@ -305,6 +345,7 @@ jobs:
           done
           echo "Mass dir count: $(find "${root}/mass" -maxdepth 1 -type d | wc -l)" > "${root}/logs/mass.done.txt"
 
+      # ===== 다운로드(허용도메인/선택적 SHA) =====
       - name: Curl downloads (allowlist + optional SHA256 via manifest)
         if: ${{ inputs.downloads_manifest != '' }}
         shell: bash
@@ -325,6 +366,7 @@ jobs:
           done
           ls -l "${root}/downloads" || true
 
+      # ===== 시스템/런타임 업그레이드 =====
       - name: Auto Upgrade (apt + npm + pip)
         if: ${{ inputs.do_upgrade }}
         shell: bash
@@ -349,6 +391,7 @@ jobs:
           PY
           date '+%F %T' > ".github/echo_up/upgrade-${{ github.run_id }}.stamp"
 
+      # ===== 컨테이너 이미지 풀(존재 태그 + per-item 폴백) =====
       - name: Docker image pull test with per-item fallbacks
         if: ${{ inputs.images_with_fallback_csv != '' }}
         shell: bash
@@ -372,6 +415,7 @@ jobs:
             [ "$pulled" -eq 1 ] || warn "All fallbacks failed for $img"
           done
 
+      # ===== 요약/아티팩트/릴리스 =====
       - name: Summary & tree (always)
         if: always()
         shell: bash
@@ -380,7 +424,7 @@ jobs:
           root="${{ inputs.echo_root }}"
           {
             echo "# MCP EchoOps MEGA Summary"
-            echo "- MCP PKG: ${{ inputs.mcp_npm_pkg }}"
+            echo "- MCP_NPX_SPEC: ${{ inputs.mcp_npm_pkg }}"
             echo "- MCP VER: ${{ inputs.mcp_version }}"
             echo "- Servers:  ${{ inputs.mcp_servers_csv }}"
             echo "- Allow:    ${{ inputs.allow_domains_csv }}"
@@ -406,7 +450,7 @@ jobs:
             ${{ env.LOG_DIR }}/**
           if-no-files-found: warn
 
-      - name: (Optional) Create GitHub Release (safe tag) (always if enabled)
+      - name: (Optional) Create GitHub Release (safe tag, forced fallback) (always if enabled)
         if: ${{ inputs.create_release && always() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
