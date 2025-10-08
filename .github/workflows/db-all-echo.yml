@@ -117,7 +117,7 @@ jobs:
         run: |
           echo "allow=${{ github.event.inputs.allow_domains_csv }}" >> "$GITHUB_OUTPUT"
 
-      - name: Optional: curl download extra files (allowlist enforced)
+      - name: Optional:curl download extra files (allowlist enforced)
         if: ${{ inputs.extra_files != '' }}
         env:
           ALLOW_DOMAINS_CSV: ${{ steps.export-allow.outputs.allow }}
