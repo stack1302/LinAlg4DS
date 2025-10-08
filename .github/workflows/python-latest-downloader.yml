@@ -16,40 +16,26 @@ on:
         type: boolean
         required: false
         default: false
-
-      # 대량 디렉토리 생성
-      dirs_root:
-        description: "대량 디렉토리 생성 루트(예: .github/echo_dirs)"
+      dirs:
+        description: "대량 디렉토리: root=경로,count=숫자 (예: root=.github/echo_dirs,count=2000)"
         required: false
-        default: ".github/echo_dirs"
-      dirs_count:
-        description: "생성할 디렉토리 개수(예: 2000, 0이면 스킵)"
-        required: false
-        default: "0"
-
-      # ISO 생성/주입
+        default: "root=.github/echo_dirs,count=0"
       iso_name:
-        description: "생성할 ISO 파일 이름(확장자 제외). 공백/특수문자 지양"
+        description: "생성할 ISO 파일 이름(확장자 제외)"
         required: false
         default: "python-latest"
       iso_label:
-        description: "ISO 볼륨 라벨(대문자/숫자/언더스코어 권장, 최대 32)"
+        description: "ISO 볼륨 라벨(최대 32)"
         required: false
         default: "PYTHON_LATEST"
-      iso_inject_dir:
-        description: "ISO에 통째로 넣을 디렉토리 경로(리포 내)"
+      iso_inject:
+        description: "ISO 주입: dir=경로,glob=패턴 (예: dir=docs,glob=docs/**/*.md)"
         required: false
-        default: ""
-      iso_inject_glob:
-        description: "ISO에 추가할 파일 글롭(예: docs/**/*.md)"
-        required: false
-        default: ""
+        default: "dir=,glob="
       iso_extra_text:
-        description: "ISO 내부에 README.txt로 추가할 자유 텍스트"
+        description: "ISO 내부 README.txt에 넣을 텍스트"
         required: false
         default: ""
-
-      # 운영/보안·배포
       retention_days:
         description: "아티팩트 보관일수"
         required: false
@@ -62,59 +48,20 @@ on:
 
   workflow_call:
     inputs:
-      track:
-        required: false
-        type: string
-        default: "latest"
-      version_override:
-        required: false
-        type: string
-        default: ""
-      include_installers:
-        required: false
-        type: boolean
-        default: false
-      dirs_root:
-        required: false
-        type: string
-        default: ".github/echo_dirs"
-      dirs_count:
-        required: false
-        type: string
-        default: "0"
-      iso_name:
-        required: false
-        type: string
-        default: "python-latest"
-      iso_label:
-        required: false
-        type: string
-        default: "PYTHON_LATEST"
-      iso_inject_dir:
-        required: false
-        type: string
-        default: ""
-      iso_inject_glob:
-        required: false
-        type: string
-        default: ""
-      iso_extra_text:
-        required: false
-        type: string
-        default: ""
-      retention_days:
-        required: false
-        type: string
-        default: "14"
-      create_release:
-        required: false
-        type: boolean
-        default: false
+      track:           { required: false, type: string,  default: "latest" }
+      version_override:{ required: false, type: string,  default: "" }
+      include_installers:{ required: false, type: boolean, default: false }
+      dirs:            { required: false, type: string,  default: "root=.github/echo_dirs,count=0" }
+      iso_name:        { required: false, type: string,  default: "python-latest" }
+      iso_label:       { required: false, type: string,  default: "PYTHON_LATEST" }
+      iso_inject:      { required: false, type: string,  default: "dir=,glob=" }
+      iso_extra_text:  { required: false, type: string,  default: "" }
+      retention_days:  { required: false, type: string,  default: "14" }
+      create_release:  { required: false, type: boolean, default: false }
 
 permissions:
   contents: read
 
-# 동시 실행 제어(중복 방지)
 concurrency:
   group: python-dl-${{ github.ref }}
   cancel-in-progress: false
@@ -140,7 +87,6 @@ jobs:
           set -Eeuo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils gnupg genisoimage xorriso
-          # node는 SBOM용 cyclonedx-npm 설치에 사용(실패 무시)
           sudo apt-get install -y nodejs npm || true
 
       - name: "Init echo helpers (stderr logging + resumable curl)"
@@ -150,7 +96,6 @@ jobs:
           mkdir -p "${LOG_DIR}"
           cat > /tmp/echo_helpers.sh <<'SH'
           set -Eeuo pipefail
-          # 모든 로그는 stdout 오염 방지 위해 stderr로 보냄
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "${LOG_DIR}/python-download.log" 1>&2; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "${LOG_DIR}/python-download.log" 1>&2; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "${LOG_DIR}/python-download.log" 1>&2; }
@@ -158,13 +103,13 @@ jobs:
             printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/python-download.log" 1>&2
             eval "$@" 2> >(tee -a "${LOG_DIR}/python-download.log" 1>&2)
           }
-          # 백오프 래퍼(최대 5회, 2^n 초 대기)
           try(){ local n=0; until "$@"; do n=$((n+1)); [ $n -ge 5 ] && return 1; sleep $((2**n)); done; }
-          # 재개 가능한 curl (-C -) + 튼튼한 옵션
           curl_get(){
             local url="$1"; local out="$2"
             run_cmd "curl -C - -fSsvL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 1200 \"$url\" -o \"$out\""
           }
+          # 간단한 key=value 파서 (콤마 구분, 키 대소문자 무시)
+          kv_get(){ echo "$1" | tr ',' '\n' | awk -F= -v k="$2" 'BEGIN{IGNORECASE=1} $1==k{ $1=""; sub(/^=/,""); print $0 }'; }
           SH
           chmod +x /tmp/echo_helpers.sh
           echo "ECHO_HELPERS=/tmp/echo_helpers.sh" >> "$GITHUB_ENV"
@@ -282,9 +227,7 @@ jobs:
 
       - name: "Cache key warm"
         if: always()
-        run: |
-          set -Eeuo pipefail
-          mkdir -p downloads
+        run: mkdir -p downloads
 
       # ── 공식 URL에서만 다운로드 ───────────────────────────────────────────
       - name: "Download from official python.org (sources + optional installers)"
@@ -298,7 +241,6 @@ jobs:
 
           BASE_DIR="downloads/python-${VERSION}"
           run_cmd "mkdir -p \"$BASE_DIR\""
-          # 남아있을 수 있는 partial 제거
           find downloads -name "*.part" -delete || true
 
           PY_FTP_BASE="https://www.python.org/ftp/python/${VERSION}"
@@ -330,21 +272,15 @@ jobs:
           source "$ECHO_HELPERS"
           BASE="downloads/python-${VERSION}"
           FTP="https://www.python.org/ftp/python/${VERSION}"
-
-          # 관련 파일 가져오기(있을 때만)
           for f in tgz tar.xz; do
             curl_get "${FTP}/Python-${VERSION}.${f}.sha256" "${BASE}/Python-${VERSION}.${f}.sha256" || true
             curl_get "${FTP}/Python-${VERSION}.${f}.asc"    "${BASE}/Python-${VERSION}.${f}.asc"    || true
           done
-
-          # sha256 검증
           for f in tgz tar.xz; do
             if [ -s "${BASE}/Python-${VERSION}.${f}" ] && [ -s "${BASE}/Python-${VERSION}.${f}.sha256" ]; then
               echo "($(cut -d' ' -f1 ${BASE}/Python-${VERSION}.${f}.sha256))  ${BASE}/Python-${VERSION}.${f}" | sha256sum -c -
             fi
           done
-
-          # GPG 키 수집 및 검증(있을 때)
           curl_get "https://www.python.org/static/files/pubkeys.txt" "${BASE}/python_pubkeys.txt" || true
           if [ -s "${BASE}/python_pubkeys.txt" ]; then
             gpg --batch --import "${BASE}/python_pubkeys.txt" || true
@@ -378,25 +314,19 @@ jobs:
 
       # ── (옵션) 대량 디렉토리 생성 ─────────────────────────────────────────
       - name: "(옵션) 대량 디렉토리 생성 (echo logged)"
-        if: ${{ (inputs.dirs_count || github.event.inputs.dirs_count) != '0' }}
+        if: ${{ (inputs.dirs || github.event.inputs.dirs) != '' }}
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
-          DIRS_ROOT: ${{ inputs.dirs_root || github.event.inputs.dirs_root }}
-          DIRS_COUNT: ${{ inputs.dirs_count || github.event.inputs.dirs_count }}
+          DIRS_SPEC: ${{ inputs.dirs || github.event.inputs.dirs }}
         run: |
           set -Eeuo pipefail
           source "$ECHO_HELPERS"
-
-          ROOT="${DIRS_ROOT:-.github/echo_dirs}"
-          COUNT="${DIRS_COUNT:-0}"
+          ROOT="$(kv_get "${DIRS_SPEC}" root)"; [ -n "$ROOT" ] || ROOT=".github/echo_dirs"
+          COUNT="$(kv_get "${DIRS_SPEC}" count)"; [ -n "$COUNT" ] || COUNT="0"
           TARGET_ROOT="${ROOT}/python/${VERSION}"
           run_cmd "mkdir -p \"$TARGET_ROOT\""
-
           if ! [[ "$COUNT" =~ ^[0-9]+$ ]]; then
-            warn "dirs_count 값이 숫자가 아닙니다: $COUNT → 스킵"
-            exit 0
-          fi
-
+            warn "dirs.count가 숫자가 아닙니다: $COUNT → 스킵"; exit 0; fi
           if [ "$COUNT" -gt 0 ]; then
             echoe "대량 디렉토리 생성: ${TARGET_ROOT} 에 ${COUNT}개"
             seq -w 1 "$COUNT" | while read -r i; do
@@ -410,14 +340,17 @@ jobs:
         id: iso
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
-          ISO_NAME: ${{ inputs.iso_name || github.event.inputs.iso_name }}
+          ISO_NAME:  ${{ inputs.iso_name  || github.event.inputs.iso_name }}
           ISO_LABEL: ${{ inputs.iso_label || github.event.inputs.iso_label }}
-          ISO_INJECT_DIR: ${{ inputs.iso_inject_dir || github.event.inputs.iso_inject_dir }}
-          ISO_INJECT_GLOB: ${{ inputs.iso_inject_glob || github.event.inputs.iso_inject_glob }}
+          INJECT_SPEC: ${{ inputs.iso_inject || github.event.inputs.iso_inject }}
           ISO_EXTRA_TEXT: ${{ inputs.iso_extra_text || github.event.inputs.iso_extra_text }}
         run: |
           set -Eeuo pipefail
           source "$ECHO_HELPERS"
+
+          # iso_inject 파싱 (dir, glob)
+          INJECT_DIR="$(kv_get "${INJECT_SPEC}" dir)";  INJECT_DIR="${INJECT_DIR:-}"
+          INJECT_GLOB="$(kv_get "${INJECT_SPEC}" glob)"; INJECT_GLOB="${INJECT_GLOB:-}"
 
           DL_DIR="downloads/python-${VERSION}"
           ISO_ROOT="iso_root/python-${VERSION}"
@@ -428,26 +361,20 @@ jobs:
           run_cmd "cp -a ${DL_DIR}/* ${ISO_ROOT}/ 2>/dev/null || true"
 
           # 2) 주입: 디렉토리
-          if [ -n "${ISO_INJECT_DIR}" ] && [ -d "${ISO_INJECT_DIR}" ]; then
-            echoe "주입(디렉토리): ${ISO_INJECT_DIR} → ${ISO_ROOT}/extras/"
+          if [ -n "${INJECT_DIR}" ] && [ -d "${INJECT_DIR}" ]; then
+            echoe "주입(디렉토리): ${INJECT_DIR} → ${ISO_ROOT}/extras/"
             run_cmd "mkdir -p ${ISO_ROOT}/extras"
-            run_cmd "cp -a \"${ISO_INJECT_DIR}\" \"${ISO_ROOT}/extras/\""
+            run_cmd "cp -a \"${INJECT_DIR}\" \"${ISO_ROOT}/extras/\""
           fi
 
           # 3) 주입: 글롭
-          if [ -n "${ISO_INJECT_GLOB}" ]; then
-            echoe "주입(글롭): ${ISO_INJECT_GLOB} → ${ISO_ROOT}/extras/"
+          if [ -n "${INJECT_GLOB}" ]; then
+            echoe "주입(글롭): ${INJECT_GLOB} → ${ISO_ROOT}/extras/"
             run_cmd "mkdir -p ${ISO_ROOT}/extras"
-            # 글롭을 safe eval로 확장
             shopt -s globstar nullglob
-            for f in ${ISO_INJECT_GLOB}; do
-              if [ -e "$f" ]; then
-                if [ -d "$f" ]; then
-                  run_cmd "cp -a \"$f\" \"${ISO_ROOT}/extras/\""
-                else
-                  run_cmd "cp -a \"$f\" \"${ISO_ROOT}/extras/\""
-                fi
-              fi
+            for f in ${INJECT_GLOB}; do
+              [ -e "$f" ] || continue
+              run_cmd "cp -a \"$f\" \"${ISO_ROOT}/extras/\""
             done
             shopt -u globstar || true
           fi
@@ -470,18 +397,14 @@ jobs:
           ISO_PATH="${OUT_DIR}/${NAME}.iso"
 
           # 6) ISO 생성 (Joliet + Rock Ridge)
-          run_cmd "genisoimage -quiet -V \"${LABEL}\" -J -R -o \"${ISO_PATH}\" \"${ISO_ROOT}\""
-          # xorriso 대체명령 (genisoimage 없거나 실패 시)
+          run_cmd "genisoimage -quiet -V \"${LABEL}\" -J -R -o \"${ISO_PATH}\" \"${ISO_ROOT}\"" || true
           if [ ! -s "${ISO_PATH}" ]; then
             warn "genisoimage 실패 또는 0바이트 → xorriso로 재시도"
             run_cmd "xorriso -as mkisofs -quiet -volid \"${LABEL}\" -J -R -o \"${ISO_PATH}\" \"${ISO_ROOT}\""
           fi
-
           [ -s "${ISO_PATH}" ] || { fail "ISO 생성 실패"; exit 1; }
 
-          # ISO 체크섬
           sha256sum "${ISO_PATH}" | tee "${ISO_PATH}.sha256" 1>&2
-
           printf 'iso_path=%s\n' "${ISO_PATH}" >> "$GITHUB_OUTPUT"
 
       # ── 아티팩트 업로드 ────────────────────────────────────────────────────
@@ -501,7 +424,7 @@ jobs:
           retention-days: ${{ inputs.retention_days || github.event.inputs.retention_days }}
           compression-level: 6
 
-      # ── Provenance(선택) & Release(선택) ──────────────────────────────────
+      # ── Provenance & Release(옵션) ────────────────────────────────────────
       - name: "Attest build provenance (SLSA-ish)"
         if: always()
         uses: actions/attest-build-provenance@v1
@@ -534,11 +457,10 @@ jobs:
           echo "### ISO root tree" >> $GITHUB_STEP_SUMMARY
           { echo '```'; find iso_root -maxdepth 4 -type f -printf '%P\n' | sort || true; echo '```'; } >> $GITHUB_STEP_SUMMARY
 
-      # ── 요약 ──────────────────────────────────────────────────────────────
       - name: "Summary"
         env:
           VERSION: ${{ steps.resolve.outputs.version }}
         run: |
           set -Eeuo pipefail
           source "$ECHO_HELPERS"
-          echoe "✅ 완료: Python ${VERSION} 다운로드 및 검증, ISO 생성/주입까지 완료."
+          echoe "✅ 완료: Python ${VERSION} 다운로드/검증 + ISO 생성/주입 + 아티팩트 업로드 완료."
