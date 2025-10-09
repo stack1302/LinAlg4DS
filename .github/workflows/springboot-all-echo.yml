@@ -1,20 +1,41 @@
-name: "🚀 Spring Boot ALL-ECHO CI (Maven + Curl Downloads + 5-min Cron + Optional Docker)"
+name: "🚀 Spring Boot ALL-ECHO CI (Maven/Gradle Auto, Curl Downloads, 5-min Cron, Optional Docker)"
 
 on:
   push:
     branches: [ "main" ]
   pull_request:
   schedule:
-    # GitHub cron 은 UTC 기준입니다. (Asia/Seoul = UTC+9)
-    - cron: "*/5 * * * *"   # 5분마다
+    - cron: "*/5 * * * *"   # (UTC 기준) 5분마다
   workflow_dispatch:
     inputs:
+      project_path:
+        description: "프로젝트 루트 경로 (예: ., app, server)"
+        required: true
+        default: "."
       java_version:
         description: "JDK version"
         type: choice
         required: true
         default: "21"
         options: ["17", "21"]
+      build_tool_hint:
+        description: "강제 지정 (auto | maven | gradle)"
+        required: true
+        default: "auto"
+      pom_url:
+        description: "원격 pom.xml URL (없으면 로컬 파일 사용)"
+        required: false
+        default: ""
+      dockerfile_url:
+        description: "원격 Dockerfile URL (없으면 로컬 파일 사용)"
+        required: false
+        default: ""
+      additional_downloads:
+        description: |-
+          추가 다운로드(줄바꿈 구분):
+          url=https://..,dest=src/main/resources/app.yml,sha256=<옵션>
+        required: false
+        default: ""
       skip_tests:
         description: "Skip unit tests"
         type: boolean
@@ -26,29 +47,15 @@ on:
         required: true
         default: false
       image_name:
-        description: "Image name (ghcr.io/<owner>/<repo> or docker.io/<user>/<repo>)"
-        required: false
-        default: ""
-      dockerfile_url:
-        description: "Dockerfile 공식 URL (비워두면 현재 리포의 Dockerfile 사용)"
-        required: false
-        default: ""
-      pom_url:
-        description: "pom.xml 공식 URL (비워두면 현재 리포의 pom.xml 사용)"
-        required: false
-        default: ""
-      additional_downloads:
-        description: |-
-          추가 다운로드(줄바꿈 구분) 예:
-          url=https://example.com/app.yml,dest=src/main/resources/application.yml,sha256=<옵션>
+        description: "ghcr.io/<owner>/<repo> 또는 docker.io/<user>/<repo>"
         required: false
         default: ""
 
 permissions:
-  contents: write         # 아티팩트/릴리즈 등의 파일 접근
-  packages: write         # GHCR 푸시 시 필요
+  contents: write
+  packages: write
   actions: read
-  id-token: write         # (옵션) OIDC 필요 시
+  id-token: write
 
 env:
   TZ: Asia/Seoul
@@ -58,7 +65,6 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
-  # 허용 도메인 화이트리스트(쉼표 구분). 필요 시 확장
   ALLOW_DOMAINS_CSV: "github.com,raw.githubusercontent.com,repo1.maven.org,dlcdn.apache.org,ghcr.io,docker.io,storage.googleapis.com"
 
 jobs:
@@ -70,7 +76,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create log dirs & Echo helpers
+      - name: Prepare echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -79,8 +85,7 @@ jobs:
           #!/usr/bin/env bash
           set -Eeuo pipefail
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"
-          mkdir -p "${LOG_DIR}"
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "${LOG_DIR}"
           SAFE_LOG="${LOG_DIR}/echo-$(date +%Y%m%d%H%M%S).log"
 
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
@@ -90,7 +95,6 @@ jobs:
 
           run_cmd(){
             logf "▶ $*"
-            # shellcheck disable=SC2086
             eval $* 2>&1 | tee -a "${SAFE_LOG}"
             local rc=${PIPESTATUS[0]}
             if [ $rc -eq 0 ]; then echoe "DONE ($rc): $*"; else warn "RC=$rc ← $*"; fi
@@ -105,90 +109,53 @@ jobs:
             local host; host=$(_host_from_url "$url")
             local allow="${ALLOW_DOMAINS_CSV:-}"
             if [ -n "$allow" ]; then
-              local ok="no"
-              IFS=',' read -r -a arr <<< "$allow"
+              local ok="no"; IFS=',' read -r -a arr <<< "$allow"
               for d in "${arr[@]}"; do
                 d="${d## }"; d="${d%% }"
                 if [[ "$host" == "$d" || "$host" == *".$d" ]]; then ok="yes"; break; fi
               done
-              if [ "$ok" != "yes" ]; then
-                fail "BLOCKED DOMAIN: $host (ALLOW_DOMAINS_CSV=$allow)"
-                return 2
-              fi
+              if [ "$ok" != "yes" ]; then fail "BLOCKED DOMAIN: $host"; return 2; fi
             fi
             mkdir -p "$(dirname "$out")"
             run_cmd curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 "$url" -o "$out"
             if [ -n "$want_sha" ] && [ -f "$out" ]; then
               local got; got=$(sha256sum "$out" | awk '{print $1}')
-              if [ "$got" != "$want_sha" ]; then
-                fail "SHA256 mismatch for $out : got=$got want=$want_sha"
-                return 3
-              fi
-              echoe "SHA256 OK for $out"
+              if [ "$got" != "$want_sha" ]; then fail "SHA256 mismatch $out"; return 3; fi
+              echoe "SHA256 OK: $out"
             fi
           }
 
           parse_kv_line(){
-            # 입력: "url=...,dest=...,sha256=..."
-            # 출력: 3개의 전역 변수 p_url, p_dest, p_sha
-            local line="$1"
-            p_url=""; p_dest=""; p_sha=""
+            local line="$1"; p_url=""; p_dest=""; p_sha=""
             IFS=',' read -r -a kvs <<< "$line"
             for kv in "${kvs[@]}"; do
-              kv="${kv## }"; kv="${kv%% }"
-              k="${kv%%=*}"; v="${kv#*=}"
-              case "$k" in
-                url) p_url="$v" ;;
-                dest) p_dest="$v" ;;
-                sha256) p_sha="$v" ;;
-              esac
+              kv="${kv## }"; kv="${kv%% }"; k="${kv%%=*}"; v="${kv#*=}"
+              case "$k" in url) p_url="$v";; dest) p_dest="$v";; sha256) p_sha="$v";; esac
             done
           }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
-          echoe "Echo helpers ready at /tmp/echo_helpers.sh"
-          echoe "LOG_DIR=${LOG_DIR} DOWNLOAD_DIR=${DOWNLOAD_DIR} DOCKER_LOG_DIR=${DOCKER_LOG_DIR}"
+          echoe "Echo helpers ready."
 
-      - name: Show inputs (only manual runs)
+      - name: Show inputs (manual only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          echoe "Inputs:"
-          echo "java_version=${{ inputs.java_version }}"
-          echo "skip_tests=${{ inputs.skip_tests }}"
-          echo "build_docker=${{ inputs.build_docker }}"
-          echo "image_name=${{ inputs.image_name }}"
-          echo "dockerfile_url=${{ inputs.dockerfile_url }}"
-          echo "pom_url=${{ inputs.pom_url }}"
-          printf '%s\n' "${{ inputs.additional_downloads }}" | sed '/^$/d' || true
+          echoe "project_path=${{ inputs.project_path }}"
+          echoe "java_version=${{ inputs.java_version }}"
+          echoe "build_tool_hint=${{ inputs.build_tool_hint }}"
+          echoe "pom_url=${{ inputs.pom_url }}"
+          echoe "dockerfile_url=${{ inputs.dockerfile_url }}"
+          echoe "skip_tests=${{ inputs.skip_tests }}"
+          echoe "build_docker=${{ inputs.build_docker }}"
+          echoe "image_name=${{ inputs.image_name }}"
 
-      - name: Set up Temurin JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ inputs.java_version || '21' }}
-          cache: maven
-
-      - name: Ensure Maven available (prefer wrapper)
-        id: mvnwrap
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          if [ -x "./mvnw" ]; then
-            echo "use_wrapper=true" >> "$GITHUB_OUTPUT"
-            echoe "Using ./mvnw"
-          else
-            echo "use_wrapper=false" >> "$GITHUB_OUTPUT"
-            echoe "mvnw not found; installing maven from apt"
-            run_cmd sudo apt-get update -y
-            run_cmd sudo apt-get install -y maven
-            run_cmd mvn -v
-          fi
-
-      - name: (Optional) Download pom.xml via curl
+      # --- 1) (선택) 원격 파일 선다운로드: pom.xml / Dockerfile / 기타 ---
+      - name: (Optional) Download pom.xml via curl (before detection)
         if: ${{ inputs.pom_url != '' }}
+        working-directory: ${{ inputs.project_path }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -196,6 +163,7 @@ jobs:
 
       - name: (Optional) Download Dockerfile via curl
         if: ${{ inputs.dockerfile_url != '' }}
+        working-directory: ${{ inputs.project_path }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -203,52 +171,142 @@ jobs:
 
       - name: (Optional) Additional downloads via curl
         if: ${{ inputs.additional_downloads != '' }}
+        working-directory: ${{ inputs.project_path }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           printf '%s\n' "${{ inputs.additional_downloads }}" | sed '/^$/d' | while IFS= read -r line; do
             parse_kv_line "$line"
             if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
-              warn "Skip line (missing url or dest): $line"
-              continue
+              warn "Skip(line lacks url or dest): $line"; continue
             fi
             curl_get "$p_url" "$p_dest" "$p_sha"
           done
 
-      - name: Maven Build (verify or package)
+      # --- 2) 빌드도구 자동 탐지 (project_path 기준) ---
+      - name: Detect build tool (maven/gradle)
+        id: detect
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          HINT="${{ inputs.build_tool_hint }}"
+          if [ "$HINT" = "maven" ]; then BT="maven"
+          elif [ "$HINT" = "gradle" ]; then BT="gradle"
+          else
+            if [ -f "pom.xml" ] || ls -1 **/pom.xml >/dev/null 2>&1; then BT="maven"
+            elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || ls -1 **/build.gradle* >/dev/null 2>&1; then BT="gradle"
+            else BT="none"
+            fi
+          fi
+          echo "tool=$BT" >> "$GITHUB_OUTPUT"
+          echoe "Detected build tool: $BT"
+
+      # --- 3) setup-java: Maven/Gradle 별로 'cache' 분기 ---
+      - name: Set up Temurin JDK (Maven cache)
+        if: ${{ steps.detect.outputs.tool == 'maven' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+          overwrite-settings: true
+
+      - name: Set up Temurin JDK (Gradle cache)
+        if: ${{ steps.detect.outputs.tool == 'gradle' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: gradle
+          overwrite-settings: true
+
+      - name: Set up Temurin JDK (no cache)
+        if: ${{ steps.detect.outputs.tool == 'none' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          overwrite-settings: true
+
+      # --- 4) Maven/Gradle 빌드 ---
+      - name: Ensure Maven or Gradle available
+        id: toolprep
+        working-directory: ${{ inputs.project_path }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          BT="${{ steps.detect.outputs.tool }}"
+          if [ "$BT" = "maven" ]; then
+            if [ -x "./mvnw" ]; then echo "cmd=./mvnw" >> "$GITHUB_OUTPUT"; echoe "Using mvnw"
+            else
+              echo "cmd=mvn" >> "$GITHUB_OUTPUT"
+              echoe "Installing maven via apt"
+              run_cmd sudo apt-get update -y
+              run_cmd sudo apt-get install -y maven
+              run_cmd mvn -v
+            fi
+          elif [ "$BT" = "gradle" ]; then
+            if [ -x "./gradlew" ]; then echo "cmd=./gradlew" >> "$GITHUB_OUTPUT"; echoe "Using gradlew"
+            else
+              echo "cmd=gradle" >> "$GITHUB_OUTPUT"
+              echoe "Installing gradle via apt"
+              run_cmd sudo apt-get update -y
+              run_cmd sudo apt-get install -y gradle
+              run_cmd gradle -v
+            fi
+          else
+            fail "No pom.xml or build.gradle(.kts) found in '${{ inputs.project_path }}'. Provide 'pom_url' or correct 'project_path'."
+            exit 1
+          fi
+
+      - name: Build (verify/package or gradle build)
+        working-directory: ${{ inputs.project_path }}
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          if [ "${{ steps.mvnwrap.outputs.use_wrapper }}" = "true" ]; then MVN="./mvnw"; else MVN="mvn"; fi
-          if [ "${{ inputs.skip_tests || false }}" = "true" ]; then
-            run_cmd "$MVN" -B -DskipTests package
+          CMD="${{ steps.toolprep.outputs.cmd }}"
+          BT="${{ steps.detect.outputs.tool }}"
+          if [ "$BT" = "maven" ]; then
+            if [ "${{ inputs.skip_tests }}" = "true" ]; then run_cmd "$CMD" -B -DskipTests package
+            else run_cmd "$CMD" -B verify
+            fi
           else
-            run_cmd "$MVN" -B verify
+            if [ "${{ inputs.skip_tests }}" = "true" ]; then run_cmd "$CMD" build -x test
+            else run_cmd "$CMD" build
+            fi
           fi
 
-      - name: Locate JAR
-        id: findjar
+      # --- 5) JAR/배포물 수집 (Maven/Gradle 모두 지원) ---
+      - name: Locate build artifacts
+        id: findart
+        working-directory: ${{ inputs.project_path }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          JAR=$(ls -1 target/*-SNAPSHOT.jar 2>/dev/null || ls -1 target/*.jar 2>/dev/null || true)
-          if [ -z "$JAR" ]; then
-            fail "No JAR found in target/"
-            exit 1
+          BT="${{ steps.detect.outputs.tool }}"
+          if [ "$BT" = "maven" ]; then
+            JAR=$(ls -1 **/target/*.jar 2>/dev/null | head -n1 || true)
+          else
+            JAR=$(ls -1 **/build/libs/*.jar 2>/dev/null | head -n1 || true)
           fi
-          echo "jar_path=$JAR" >> "$GITHUB_OUTPUT"
+          if [ -z "$JAR" ]; then fail "No JAR found"; exit 1; fi
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
           echoe "Found JAR: $JAR"
 
       - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
           name: spring-boot-jar
-          path: ${{ steps.findjar.outputs.jar_path }}
+          path: ${{ steps.findart.outputs.jar }}
           if-no-files-found: error
           retention-days: 10
 
-      # -------- Optional Docker build & push --------
+      # --- 6) (선택) Docker 이미지 빌드/푸시 ---
       - name: Login GHCR
         if: ${{ inputs.build_docker && startsWith(inputs.image_name, 'ghcr.io/') }}
         uses: docker/login-action@v3
@@ -267,6 +325,7 @@ jobs:
 
       - name: Build & Push Image
         if: ${{ inputs.build_docker && inputs.image_name != '' }}
+        working-directory: ${{ inputs.project_path }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
