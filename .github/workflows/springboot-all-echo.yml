@@ -69,7 +69,6 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
-  # ✅ 다운로드 화이트리스트 (필요 시 추가)
   ALLOW_DOMAINS_CSV: "github.com,raw.githubusercontent.com,repo1.maven.org,dlcdn.apache.org,ghcr.io,docker.io,storage.googleapis.com,start.spring.io,repo.spring.io,docs.spring.io"
 
 jobs:
@@ -81,7 +80,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare echo helpers
+      - name: Prepare echo helpers (no eval; safe args)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -92,35 +91,54 @@ jobs:
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "${LOG_DIR}"
           SAFE_LOG="${LOG_DIR}/echo-$(date +%Y%m%d%H%M%S).log"
+
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           logf(){  printf '%s\n' "$*" | tee -a "${SAFE_LOG}"; }
-          run_cmd(){ logf "▶ $*"; eval $* 2>&1 | tee -a "${SAFE_LOG}"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE ($rc)" || warn "RC=$rc"; return $rc; }
+
+          # ✅ 핵심 수정: eval 제거, 인자 배열 그대로 실행
+          run_cmd(){
+            logf "▶ $*"
+            "$@" 2>&1 | tee -a "${SAFE_LOG}"
+            local rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then echoe "DONE ($rc)"; else warn "RC=$rc"; fi
+            return $rc
+          }
+
           _host_from_url(){ printf '%s' "$1" | awk -F/ '{print $3}'; }
+
           curl_get(){
             # curl_get URL OUT [SHA256]
             local url="$1" out="$2" want_sha="${3:-}" host allow ok="no"
             host=$(_host_from_url "$url"); allow="${ALLOW_DOMAINS_CSV:-}"
-            if [ -n "$allow" ]; then IFS=',' read -r -a A <<< "$allow"; for d in "${A[@]}"; do d="${d## }"; d="${d%% }"; [[ "$host" == "$d" || "$host" == *".$d" ]] && ok="yes" && break; done; [ "$ok" != "yes" ] && fail "BLOCKED DOMAIN: $host" && return 2; fi
+            if [ -n "$allow" ]; then
+              IFS=',' read -r -a A <<< "$allow"
+              for d in "${A[@]}"; do
+                d="${d## }"; d="${d%% }"
+                if [[ "$host" == "$d" || "$host" == *".$d" ]]; then ok="yes"; break; fi
+              done
+              if [ "$ok" != "yes" ]; then fail "BLOCKED DOMAIN: $host"; return 2; fi
+            fi
             mkdir -p "$(dirname "$out")"
             run_cmd curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 "$url" -o "$out"
-            if [ -n "$want_sha" ] && [ -f "$out" ]; then got=$(sha256sum "$out" | awk '{print $1}'); [ "$got" != "$want_sha" ] && fail "SHA256 mismatch $out" && return 3 || echoe "SHA256 OK: $out"; fi
+            if [ -n "$want_sha" ] && [ -f "$out" ]; then
+              local got; got=$(sha256sum "$out" | awk '{print $1}')
+              if [ "$got" != "$want_sha" ]; then fail "SHA256 mismatch $out"; return 3; else echoe "SHA256 OK: $out"; fi
+            fi
           }
+
           parse_kv_line(){
-            # 입력 라인: url=...,dest=...,sha256=...
             local line="$1"; p_url=""; p_dest=""; p_sha=""
             IFS=',' read -r -a kvs <<< "$line"
             for kv in "${kvs[@]}"; do
-              kv="${kv## }"; kv="${kv%% }"; k="${kv%%=*}"; v="${kv#*=}"; case "$k" in
-                url) p_url="$v";;
-                dest) p_dest="$v";;
-                sha256) p_sha="$v";;
-              esac
+              kv="${kv## }"; kv="${kv%% }"
+              k="${kv%%=*}"; v="${kv#*=}"
+              case "$k" in url) p_url="$v";; dest) p_dest="$v";; sha256) p_sha="$v";; esac
             done
           }
+
           dl_list_from_file(){
-            # 파일(있으면) 내용을 출력
             local f="$1"
             if [ -f "$f" ]; then
               sed '/^$/d;/^[[:space:]]*#/d' "$f"
@@ -154,7 +172,6 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
 
-          # 1) 필수 다운로드(must_downloads) — 하나라도 실패 시 즉시 실패
           MUST_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.must_downloads || '' }}"
           if [ -n "$MUST_LIST" ]; then
             echoe "Processing MUST downloads..."
@@ -169,7 +186,6 @@ jobs:
             warn "No MUST downloads provided (ok)."
           fi
 
-          # 2) (선택) 추가 다운로드(extra_downloads) — 실패해도 계속
           EXTRA_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.extra_downloads || '' }}"
           if [ -n "$EXTRA_LIST" ]; then
             echoe "Processing EXTRA downloads..."
@@ -184,7 +200,6 @@ jobs:
             warn "No EXTRA downloads provided."
           fi
 
-          # 3) 리포 매니페스트 병합 처리(항상 시도): .github/downloads.manifest → MUST로 취급
           if [ -f ".github/downloads.manifest" ]; then
             echoe "Processing repository manifest: .github/downloads.manifest"
             dl_list_from_file ".github/downloads.manifest" | while IFS= read -r line; do
