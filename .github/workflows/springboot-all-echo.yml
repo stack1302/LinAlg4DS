@@ -1,0 +1,277 @@
+name: "🚀 Spring Boot ALL-ECHO CI (Maven + Curl Downloads + 5-min Cron + Optional Docker)"
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  schedule:
+    # GitHub cron 은 UTC 기준입니다. (Asia/Seoul = UTC+9)
+    - cron: "*/5 * * * *"   # 5분마다
+  workflow_dispatch:
+    inputs:
+      java_version:
+        description: "JDK version"
+        type: choice
+        required: true
+        default: "21"
+        options: ["17", "21"]
+      skip_tests:
+        description: "Skip unit tests"
+        type: boolean
+        required: true
+        default: false
+      build_docker:
+        description: "Build & push Docker image"
+        type: boolean
+        required: true
+        default: false
+      image_name:
+        description: "Image name (ghcr.io/<owner>/<repo> or docker.io/<user>/<repo>)"
+        required: false
+        default: ""
+      dockerfile_url:
+        description: "Dockerfile 공식 URL (비워두면 현재 리포의 Dockerfile 사용)"
+        required: false
+        default: ""
+      pom_url:
+        description: "pom.xml 공식 URL (비워두면 현재 리포의 pom.xml 사용)"
+        required: false
+        default: ""
+      additional_downloads:
+        description: |-
+          추가 다운로드(줄바꿈 구분) 예:
+          url=https://example.com/app.yml,dest=src/main/resources/application.yml,sha256=<옵션>
+        required: false
+        default: ""
+
+permissions:
+  contents: write         # 아티팩트/릴리즈 등의 파일 접근
+  packages: write         # GHCR 푸시 시 필요
+  actions: read
+  id-token: write         # (옵션) OIDC 필요 시
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_logs
+  DOWNLOAD_DIR: .github/echo_downloads
+  DOCKER_LOG_DIR: .github/echo_logs/docker
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
+  # 허용 도메인 화이트리스트(쉼표 구분). 필요 시 확장
+  ALLOW_DOMAINS_CSV: "github.com,raw.githubusercontent.com,repo1.maven.org,dlcdn.apache.org,ghcr.io,docker.io,storage.googleapis.com"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create log dirs & Echo helpers
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}" "${DOWNLOAD_DIR}" "${DOCKER_LOG_DIR}"
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"
+          mkdir -p "${LOG_DIR}"
+          SAFE_LOG="${LOG_DIR}/echo-$(date +%Y%m%d%H%M%S).log"
+
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
+          logf(){  printf '%s\n' "$*" | tee -a "${SAFE_LOG}"; }
+
+          run_cmd(){
+            logf "▶ $*"
+            # shellcheck disable=SC2086
+            eval $* 2>&1 | tee -a "${SAFE_LOG}"
+            local rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then echoe "DONE ($rc): $*"; else warn "RC=$rc ← $*"; fi
+            return $rc
+          }
+
+          _host_from_url(){ printf '%s' "$1" | awk -F/ '{print $3}'; }
+
+          curl_get(){
+            # curl_get URL OUT [SHA256]
+            local url="$1"; local out="$2"; local want_sha="${3:-}"
+            local host; host=$(_host_from_url "$url")
+            local allow="${ALLOW_DOMAINS_CSV:-}"
+            if [ -n "$allow" ]; then
+              local ok="no"
+              IFS=',' read -r -a arr <<< "$allow"
+              for d in "${arr[@]}"; do
+                d="${d## }"; d="${d%% }"
+                if [[ "$host" == "$d" || "$host" == *".$d" ]]; then ok="yes"; break; fi
+              done
+              if [ "$ok" != "yes" ]; then
+                fail "BLOCKED DOMAIN: $host (ALLOW_DOMAINS_CSV=$allow)"
+                return 2
+              fi
+            fi
+            mkdir -p "$(dirname "$out")"
+            run_cmd curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 "$url" -o "$out"
+            if [ -n "$want_sha" ] && [ -f "$out" ]; then
+              local got; got=$(sha256sum "$out" | awk '{print $1}')
+              if [ "$got" != "$want_sha" ]; then
+                fail "SHA256 mismatch for $out : got=$got want=$want_sha"
+                return 3
+              fi
+              echoe "SHA256 OK for $out"
+            fi
+          }
+
+          parse_kv_line(){
+            # 입력: "url=...,dest=...,sha256=..."
+            # 출력: 3개의 전역 변수 p_url, p_dest, p_sha
+            local line="$1"
+            p_url=""; p_dest=""; p_sha=""
+            IFS=',' read -r -a kvs <<< "$line"
+            for kv in "${kvs[@]}"; do
+              kv="${kv## }"; kv="${kv%% }"
+              k="${kv%%=*}"; v="${kv#*=}"
+              case "$k" in
+                url) p_url="$v" ;;
+                dest) p_dest="$v" ;;
+                sha256) p_sha="$v" ;;
+              esac
+            done
+          }
+          SH
+          chmod +x /tmp/echo_helpers.sh
+          source /tmp/echo_helpers.sh
+          echoe "Echo helpers ready at /tmp/echo_helpers.sh"
+          echoe "LOG_DIR=${LOG_DIR} DOWNLOAD_DIR=${DOWNLOAD_DIR} DOCKER_LOG_DIR=${DOCKER_LOG_DIR}"
+
+      - name: Show inputs (only manual runs)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          echoe "Inputs:"
+          echo "java_version=${{ inputs.java_version }}"
+          echo "skip_tests=${{ inputs.skip_tests }}"
+          echo "build_docker=${{ inputs.build_docker }}"
+          echo "image_name=${{ inputs.image_name }}"
+          echo "dockerfile_url=${{ inputs.dockerfile_url }}"
+          echo "pom_url=${{ inputs.pom_url }}"
+          printf '%s\n' "${{ inputs.additional_downloads }}" | sed '/^$/d' || true
+
+      - name: Set up Temurin JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version || '21' }}
+          cache: maven
+
+      - name: Ensure Maven available (prefer wrapper)
+        id: mvnwrap
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          if [ -x "./mvnw" ]; then
+            echo "use_wrapper=true" >> "$GITHUB_OUTPUT"
+            echoe "Using ./mvnw"
+          else
+            echo "use_wrapper=false" >> "$GITHUB_OUTPUT"
+            echoe "mvnw not found; installing maven from apt"
+            run_cmd sudo apt-get update -y
+            run_cmd sudo apt-get install -y maven
+            run_cmd mvn -v
+          fi
+
+      - name: (Optional) Download pom.xml via curl
+        if: ${{ inputs.pom_url != '' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          curl_get "${{ inputs.pom_url }}" "pom.xml"
+
+      - name: (Optional) Download Dockerfile via curl
+        if: ${{ inputs.dockerfile_url != '' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          curl_get "${{ inputs.dockerfile_url }}" "Dockerfile"
+
+      - name: (Optional) Additional downloads via curl
+        if: ${{ inputs.additional_downloads != '' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          printf '%s\n' "${{ inputs.additional_downloads }}" | sed '/^$/d' | while IFS= read -r line; do
+            parse_kv_line "$line"
+            if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
+              warn "Skip line (missing url or dest): $line"
+              continue
+            fi
+            curl_get "$p_url" "$p_dest" "$p_sha"
+          done
+
+      - name: Maven Build (verify or package)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          if [ "${{ steps.mvnwrap.outputs.use_wrapper }}" = "true" ]; then MVN="./mvnw"; else MVN="mvn"; fi
+          if [ "${{ inputs.skip_tests || false }}" = "true" ]; then
+            run_cmd "$MVN" -B -DskipTests package
+          else
+            run_cmd "$MVN" -B verify
+          fi
+
+      - name: Locate JAR
+        id: findjar
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          JAR=$(ls -1 target/*-SNAPSHOT.jar 2>/dev/null || ls -1 target/*.jar 2>/dev/null || true)
+          if [ -z "$JAR" ]; then
+            fail "No JAR found in target/"
+            exit 1
+          fi
+          echo "jar_path=$JAR" >> "$GITHUB_OUTPUT"
+          echoe "Found JAR: $JAR"
+
+      - name: Upload JAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-boot-jar
+          path: ${{ steps.findjar.outputs.jar_path }}
+          if-no-files-found: error
+          retention-days: 10
+
+      # -------- Optional Docker build & push --------
+      - name: Login GHCR
+        if: ${{ inputs.build_docker && startsWith(inputs.image_name, 'ghcr.io/') }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login Docker Hub
+        if: ${{ inputs.build_docker && startsWith(inputs.image_name, 'docker.io/') }}
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build & Push Image
+        if: ${{ inputs.build_docker && inputs.image_name != '' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          TAG="${{ inputs.image_name }}:$(date +%Y%m%d%H%M%S)"
+          echoe "Building image: $TAG"
+          run_cmd docker build -t "$TAG" .
+          run_cmd docker push "$TAG"
+          echoe "Pushed: $TAG"
