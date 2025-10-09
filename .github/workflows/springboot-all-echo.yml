@@ -22,18 +22,11 @@ on:
         description: "강제 지정 (auto | maven | gradle)"
         required: true
         default: "auto"
-      pom_url:
-        description: "원격 pom.xml URL(비워두면 스킵, 단계는 실행)"
-        required: false
-        default: ""
-      dockerfile_url:
-        description: "원격 Dockerfile URL(비워두면 스킵, 단계는 실행)"
-        required: false
-        default: ""
       must_downloads:
         description: |
           ✅ 필수 다운로드(줄바꿈 구분, 하나라도 실패 시 워크플로우 실패)
           포맷: url=...,dest=...,sha256=<옵션>
+          (pom.xml/Dockerfile도 여기에 넣으세요)
         required: false
         default: ""
       extra_downloads:
@@ -119,8 +112,11 @@ jobs:
             local line="$1"; p_url=""; p_dest=""; p_sha=""
             IFS=',' read -r -a kvs <<< "$line"
             for kv in "${kvs[@]}"; do
-              kv="${kv## }"; kv="${kv%% }"; k="${kv%%=*}"; v="${kv#*=}"
-              case "$k" in url) p_url="$v";; dest) p_dest="$v";; sha256) p_sha="$v";; esac
+              kv="${kv## }"; kv="${kv%% }"; k="${kv%%=*}"; v="${kv#*=}"; case "$k" in
+                url) p_url="$v";;
+                dest) p_dest="$v";;
+                sha256) p_sha="$v";;
+              esac
             done
           }
           dl_list_from_file(){
@@ -141,7 +137,6 @@ jobs:
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          # manual 이면 선택값, 그 외엔 21 고정
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.java_version }}" ]; then
             JV="${{ inputs.java_version }}"
           else
@@ -151,7 +146,7 @@ jobs:
           echoe "Resolved Java version: $JV"
 
       # ==== 다운로드 단계 (항상 실행) ====
-      - name: Always-run downloads (pom/dockerfile/must/extra/manifest)
+      - name: Always-run downloads (must/extra/manifest)
         id: downloads
         working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
         shell: bash
@@ -159,21 +154,7 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
 
-          # 1) 개별 URL: pom.xml / Dockerfile — 비어있으면 건너뛰되 단계는 실행
-          POM_URL="${{ github.event_name == 'workflow_dispatch' && inputs.pom_url || '' }}"
-          DOCKERFILE_URL="${{ github.event_name == 'workflow_dispatch' && inputs.dockerfile_url || '' }}"
-          if [ -n "$POM_URL" ]; then
-            curl_get "$POM_URL" "pom.xml" || exit $?
-          else
-            warn "pom_url not provided; skip file but downloads step continues."
-          fi
-          if [ -n "$DOCKERFILE_URL" ]; then
-            curl_get "$DOCKERFILE_URL" "Dockerfile" || exit $?
-          else
-            warn "dockerfile_url not provided; skip file but downloads step continues."
-          fi
-
-          # 2) 필수 다운로드(must_downloads) — 하나라도 실패 시 즉시 실패
+          # 1) 필수 다운로드(must_downloads) — 하나라도 실패 시 즉시 실패
           MUST_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.must_downloads || '' }}"
           if [ -n "$MUST_LIST" ]; then
             echoe "Processing MUST downloads..."
@@ -188,7 +169,7 @@ jobs:
             warn "No MUST downloads provided (ok)."
           fi
 
-          # 3) (선택) 추가 다운로드(extra_downloads) — 실패해도 계속
+          # 2) (선택) 추가 다운로드(extra_downloads) — 실패해도 계속
           EXTRA_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.extra_downloads || '' }}"
           if [ -n "$EXTRA_LIST" ]; then
             echoe "Processing EXTRA downloads..."
@@ -203,8 +184,7 @@ jobs:
             warn "No EXTRA downloads provided."
           fi
 
-          # 4) 리포 매니페스트 병합 처리(항상 시도): .github/downloads.manifest
-          #    - 이 파일은 MUST처럼 동작(실패 시 종료)하도록 설정
+          # 3) 리포 매니페스트 병합 처리(항상 시도): .github/downloads.manifest → MUST로 취급
           if [ -f ".github/downloads.manifest" ]; then
             echoe "Processing repository manifest: .github/downloads.manifest"
             dl_list_from_file ".github/downloads.manifest" | while IFS= read -r line; do
@@ -240,7 +220,7 @@ jobs:
           echo "tool=$BT" >> "$GITHUB_OUTPUT"
           echoe "Detected (pass1): $BT"
 
-      # --- (핵심) 없으면 스프링부트 최소 프로젝트 자동 생성 ---
+      # --- 없으면 스프링부트 최소 프로젝트 자동 생성 ---
       - name: Auto-bootstrap Spring Boot project if missing
         if: ${{ steps.detect1.outputs.tool == 'none' }}
         working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
