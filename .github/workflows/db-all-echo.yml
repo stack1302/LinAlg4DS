@@ -1,4 +1,4 @@
-name: "🧠 MCP Setup + Health + Echo (5m Cron, Secure, Non-Interactive v2)"
+name: "🧠 MCP Setup + Health + Echo (v3: Inspector safe-pin + CLI fallback)"
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ on:
         required: true
         default: true
   schedule:
-    - cron: "*/5 * * * *"  # 5분 주기
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
@@ -33,19 +33,19 @@ env:
   OUT_DIR: .github/mcp_out
   MCP_DIR: .github/mcp
   NPM_REGISTRY: "https://registry.npmjs.org/"
-  # 최근 악성 사례: 발견 시 실패 처리(필요 시 목록 확장)
+  # 공급망 가드 예시
   BLOCKED_NPM: "postmark-mcp@1.0.16"
 
 jobs:
   mcp-all-in-one:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare directories & echo helpers
+      - name: Prepare dirs & echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -55,32 +55,34 @@ jobs:
           set -Eeuo pipefail
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "${LOG_DIR}"
-          logf(){ printf '%s\n' "$*" | tee -a "${LOG_DIR}/mcp.log"; }
-          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
-          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
-          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          log(){ printf '%s\n' "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          ok(){  printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          warn(){printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          fail(){printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
           run_cmd(){
-            logf "▶ $*"
-            # shellcheck disable=SC2086
+            log "▶ $*"
             eval $* 2>&1 | tee -a "${LOG_DIR}/mcp.log"
             local rc=${PIPESTATUS[0]}
-            if [ $rc -eq 0 ]; then echoe "DONE ($rc): $*"; else warn "RC=$rc ← $*"; fi
+            if [ $rc -eq 0 ]; then ok "DONE ($rc): $*"; else warn "RC=$rc ← $*"; fi
             return $rc
           }
-          npm_retry(){
-            # npm 명령 재시도 래퍼(3회)
-            local cmd="$*"; local tries=0; local rc=0
-            until [ $tries -ge 3 ]; do
-              run_cmd "$cmd" && return 0
-              rc=$?; tries=$((tries+1))
-              warn "npm retry $tries (rc=$rc) → 2s 대기"
-              sleep 2
-            done
-            return $rc
+          npm_retry(){ local cmd="$*"; for i in 1 2 3; do run_cmd "$cmd" && return 0; warn "npm retry $i"; sleep 2; done; return 1; }
+          # Inspector 런처(안전한 버전 핀 + 폴백 체인)
+          run_inspector(){
+            local args="$*"
+            # 1) npx with safe-pin (0.16.x)
+            if command -v npx >/dev/null; then
+              npx -y @modelcontextprotocol/inspector@0.16.5 $args && return 0
+              # 2) 글로벌 설치본 직접 호출
+              if [ -n "$(npm root -g 2>/dev/null)" ] && [ -f "$(npm root -g)/@modelcontextprotocol/inspector/cli/build/index.js" ]; then
+                node "$(npm root -g)/@modelcontextprotocol/inspector/cli/build/index.js" $args && return 0
+              fi
+            fi
+            return 1
           }
           SH
           chmod +x /tmp/echo_helpers.sh
-          echo "${ECHO_OK} Echo helpers ready."
+          echo "${ECHO_OK} Helpers ready."
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -98,57 +100,48 @@ jobs:
           source /tmp/echo_helpers.sh
           run_cmd "node -v && npm -v && python -V && pip -V"
 
-      - name: Configure npm registry (explicit)
+      - name: npm registry & audit baseline
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           run_cmd "npm config set registry '${NPM_REGISTRY}'"
           run_cmd "npm ping"
 
-      - name: Install MCP tooling (SDK + Inspector) with fallbacks
+      - name: Install JS SDK + (safe) Inspector
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
+          # 올바른 SDK 패키지명
+          # https://www.npmjs.com/package/@modelcontextprotocol/sdk
+          npm_retry "npm i -g @modelcontextprotocol/sdk@latest"
+          # Inspector 0.17.0 계열 CLI 버그 회피 → 0.16.x 고정
+          # https://github.com/modelcontextprotocol/inspector/issues/834
+          npm_retry "npm i -g @modelcontextprotocol/inspector@0.16.5" || warn "global inspector install failed; npx fallback will be used"
 
-          # ---- JS: SDK (@modelcontextprotocol/sdk) ----
-          # 최신 버전을 조회해 정확히 핀고정 설치. 실패 시 npx 사용으로 폴백. :contentReference[oaicite:6]{index=6}
-          SDK_VER="$(npm view @modelcontextprotocol/sdk version || true)"
-          if [ -n "${SDK_VER}" ]; then
-            npm_retry "npm i -g @modelcontextprotocol/sdk@${SDK_VER}"
-          else
-            warn "SDK version lookup failed → npx 사용으로 폴백 예정"
-          fi
-
-          # ---- JS: Inspector (@modelcontextprotocol/inspector) ----
-          # Inspector는 글로벌 설치 불필요 — npx 실행 권장. 단, list 시 빠르게 쓰기 위해 글로벌 설치도 시도. :contentReference[oaicite:7]{index=7}
-          INS_VER="$(npm view @modelcontextprotocol/inspector version || true)"
-          if [ -n "${INS_VER}" ]; then
-            npm_retry "npm i -g @modelcontextprotocol/inspector@${INS_VER}" || warn "global inspector install failed — will use npx"
-          else
-            warn "Inspector version lookup failed — will use npx"
-          fi
-
-          # ---- PY: Python SDK (mcp[server]) ---- :contentReference[oaicite:8]{index=8}
-          run_cmd "python -m pip install --upgrade pip"
-          run_cmd "python -m pip install 'mcp[server]'"
-
-          # ---- (옵션) 파일시스템 서버(있으면 설치) ---- :contentReference[oaicite:9]{index=9}
+          # (옵션) filesystem 서버가 레지스트리에 있으면 설치
           FS_VER="$(npm view @modelcontextprotocol/server-filesystem version || true)"
-          if [ -n "${FS_VER}" ]; then
-            npm_retry "npm i -g @modelcontextprotocol/server-filesystem@${FS_VER}" || warn "server-filesystem install failed — skip (optional)"
+          if [ -n "$FS_VER" ]; then
+            npm_retry "npm i -g @modelcontextprotocol/server-filesystem@${FS_VER}" || warn "server-filesystem install failed (optional)"
           else
-            warn "server-filesystem not found — skip (optional)"
+            warn "server-filesystem not found (optional)"
           fi
 
-          # ---- Supply-chain guard: known-bad package blocklist ---- :contentReference[oaicite:10]{index=10}
+          # 공급망 가드
           if npm ls -g --depth=0 | grep -F "${BLOCKED_NPM}" >/dev/null 2>&1; then
-            fail "차단된 MCP 서버 패키지 발견: ${BLOCKED_NPM} — 즉시 중단합니다."
-            exit 1
-          else
-            echoe "차단 패키지 없음 (OK)"
+            fail "차단된 MCP 서버 패키지 발견: ${BLOCKED_NPM}"; exit 1
           fi
+          ok "No blocked packages."
 
-      - name: Generate sample MCP server (Python, stdio)
+      - name: Install Python MCP (SDK + CLI)
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          # 최신 mcp (PyPI 1.16.0, 2025-10-02 기준) — CLI 포함
+          # https://pypi.org/project/mcp/
+          run_cmd "python -m pip install --upgrade pip"
+          run_cmd "python -m pip install 'mcp[cli]'"
+
+      - name: Generate sample MCP server (Python stdio)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -167,10 +160,11 @@ jobs:
           @app.resource("readme")
           def readme() -> str:
             return "MCP sample server is running."
+
           if __name__ == "__main__":
             asyncio.run(app.run_stdio())
           PY
-          echo "${ECHO_OK} Sample MCP server generated."
+          ok "Sample server generated."
 
       - name: Create MCP config (JSON)
         shell: bash
@@ -186,46 +180,38 @@ jobs:
             }
           }
           JSON
-          echo "${ECHO_OK} MCP config created."
+          ok "MCP config created."
 
-      - name: MCP health checks (Inspector via npx, non-interactive)
+      - name: Health check via Inspector (safe-pin) → fallback to Python CLI
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           set -Eeuo pipefail
-          INS="npx -y @modelcontextprotocol/inspector"
-          run_cmd "$INS --cli --config ${MCP_DIR}/mcp.config.json list servers       | tee ${OUT_DIR}/servers.txt"
-          run_cmd "$INS --cli --config ${MCP_DIR}/mcp.config.json list tools         | tee ${OUT_DIR}/tools.txt"
-          run_cmd "$INS --cli --config ${MCP_DIR}/mcp.config.json list resources     | tee ${OUT_DIR}/resources.txt"
-          run_cmd "$INS --cli --config ${MCP_DIR}/mcp.config.json call-tool ping-python:ping --args '{\"message\":\"hello\"}' | tee ${OUT_DIR}/call_ping.json"
-          grep -q '"ok": true' "${OUT_DIR}/call_ping.json" && echoe "MCP ping tool OK" || { fail "MCP ping tool failed"; exit 1; }
 
-      - name: Archive artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: mcp-outputs
-          path: |
-            .github/mcp_out/**
-            .github/mcp/**
-            .github/echo_logs/**
-          if-no-files-found: warn
-          retention-days: 7
+          # 1) Inspector --cli 시도 (0.16.5)
+          if run_inspector "--cli --config ${MCP_DIR}/mcp.config.json list servers" | tee "${OUT_DIR}/servers.txt"; then
+            ok "Inspector list servers OK"
+          else
+            warn "Inspector failed — will fallback to Python CLI (mcp client)"
+          fi
 
-      - name: Create PR with generated files (optional)
-        if: ${{ inputs.create_pr == true }}
-        uses: peter-evans/create-pull-request@v6
-        with:
-          commit-message: "feat(mcp): setup + inspector(npx) + sample server + echo logs (v2)"
-          title: "🧠 MCP Setup + Health + Echo — v2 (auto)"
-          body: |
-            - npm 패키지명/버전 정정: @modelcontextprotocol/sdk, @modelcontextprotocol/inspector (npx)
-            - Python SDK(mcp[server]) 설치
-            - server-filesystem(옵션): 최신 버전 자동 조회 후 설치
-            - npm 레지스트리 명시 + 재시도 래퍼 + 폴백
-            - 악성 MCP 서버 차단 리스트 검사(예: postmark-mcp@1.0.16)
-            - 5분 주기 cron 유지
-          add-paths: |
-            .github/mcp/**
-            .github/echo_logs/**
-            .github/mcp_out/**
-          branch: "ci/mcp-setup-auto-v2"
+          if run_inspector "--cli --config ${MCP_DIR}/mcp.config.json list tools" | tee "${OUT_DIR}/tools.txt"; then
+            ok "Inspector list tools OK"
+          fi
+
+          if run_inspector "--cli --config ${MCP_DIR}/mcp.config.json list resources" | tee "${OUT_DIR}/resources.txt"; then
+            ok "Inspector list resources OK"
+          fi
+
+          if run_inspector "--cli --config ${MCP_DIR}/mcp.config.json call-tool ping-python:ping --args '{\"message\":\"hello\"}'" | tee "${OUT_DIR}/call_ping.json"; then
+            ok "Inspector call-tool OK"
+          fi
+
+          # 2) 폴백: Python MCP CLI로 동일 헬스체크 수행 (Inspector가 전부/일부 실패했을 때만)
+          need_py_fallback="false"
+          for f in servers.txt tools.txt resources.txt call_ping.json; do
+            [ -s "${OUT_DIR}/${f}" ] || need_py_fallback="true"
+          done
+
+          if [ "$need_py_fallback" = "true" ]; then
+            warn "Running Python MCP CLI fallback…"
