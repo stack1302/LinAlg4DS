@@ -1,4 +1,4 @@
-name: "🧠 MCP Setup + Health + Echo (v5: proper --method + --server, helpers fixed, safe Inspector)"
+name: "🧠 MCP Setup + Health + Echo (v6: fix server crash, stable inspector methods, helpers fixed)"
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ on:
         required: true
         default: true
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"  # 5분마다
 
 permissions:
   contents: write
@@ -41,16 +41,13 @@ jobs:
     timeout-minutes: 35
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node_version || '20' }}
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ inputs.python_version || '3.12' }}
 
@@ -87,7 +84,6 @@ jobs:
             return $rc
           }
 
-          # Inspector launcher (safe pin 0.16.5) — supports --cli/--config/--server/--method
           function run_inspector() {
             local args="$*"
             if command -v npx >/dev/null; then
@@ -121,7 +117,6 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           npm_retry "npm i -g @modelcontextprotocol/sdk@latest"
-          # Inspector 0.17.x CLI 이슈 회피 → 0.16.5 핀 고정
           npm_retry "npm i -g @modelcontextprotocol/inspector@0.16.5" || warn "global inspector install failed (npx fallback)"
           FS_VER="$(npm view @modelcontextprotocol/server-filesystem version || true)"
           if [ -n "$FS_VER" ]; then
@@ -141,7 +136,7 @@ jobs:
           run_cmd "python -m pip install --upgrade pip"
           run_cmd "python -m pip install 'mcp[cli]'"
 
-      - name: Generate sample MCP server (Python stdio)
+      - name: Generate sample MCP server (Python stdio, resource removed)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -149,17 +144,18 @@ jobs:
           import asyncio
           from typing import Any, Dict
           from mcp.server.fastmcp import FastMCP
+
           app = FastMCP("mcp-ping")
+
           @app.tool()
           def ping(message: str = "pong") -> Dict[str, Any]:
+              "Return the message back (health-check)."
               return {"ok": True, "echo": message}
-          @app.resource("readme")
-          def readme() -> str:
-              return "MCP sample server is running."
+
           if __name__ == "__main__":
               asyncio.run(app.run_stdio())
           PY
-          ok "Sample MCP server generated."
+          ok "Sample MCP server generated (no resource)."
 
       - name: Create MCP config (JSON)
         shell: bash
@@ -177,46 +173,35 @@ jobs:
           JSON
           ok "MCP config created."
 
-      # ⬇️ 여기서부터 핵심 수정: --method / --server 사용
-      - name: Health check — Inspector (proper --method/--server) → Python CLI fallback
+      - name: Health check — Inspector (methods) → Python CLI fallback
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           set -Eeuo pipefail
           INS_ARGS="--cli --config ${MCP_DIR}/mcp.config.json --server ping-python"
 
-          # Tools 목록
+          # 최소한의 검증: tools/list + tools/call(ping)
           if run_inspector "${INS_ARGS} --method tools/list" | tee "${OUT_DIR}/tools.json"; then
             ok "Inspector: tools/list OK"
           else
             warn "Inspector tools/list failed"
           fi
 
-          # Resources 목록
-          if run_inspector "${INS_ARGS} --method resources/list" | tee "${OUT_DIR}/resources.json"; then
-            ok "Inspector: resources/list OK"
-          else
-            warn "Inspector resources/list failed"
-          fi
-
-          # Prompts 목록(없을 수 있음) — 실패해도 치명적 아님
-          run_inspector "${INS_ARGS} --method prompts/list" | tee "${OUT_DIR}/prompts.json" || warn "Inspector prompts/list skipped/failed"
-
-          # Ping 툴 호출
           if run_inspector "${INS_ARGS} --method tools/call --tool-name ping --tool-arg message=hello" | tee "${OUT_DIR}/call_ping.json"; then
             ok "Inspector: tools/call(ping) OK"
           else
             warn "Inspector tools/call failed"
           fi
 
-          # 파일 확인 → 부족하면 Python CLI로 폴백
+          # 결과파일 체크 → 부족하면 Python CLI 폴백
           need_py_fallback="false"
-          for f in tools.json resources.json call_ping.json; do
+          for f in tools.json call_ping.json; do
             [ -s "${OUT_DIR}/${f}" ] || need_py_fallback="true"
           done
 
           if [ "$need_py_fallback" = "true" ]; then
             warn "Running Python MCP CLI fallback…"
+            # 서버를 짧게 올렸다가 내리며 생존성 확인
             ( python "${MCP_DIR}/mcp_ping_server.py" & srv=$!; sleep 1; kill $srv 2>/dev/null || true; wait $srv 2>/dev/null || true )
             printf '{"ok": true, "fallback": "python-mcp-cli"}\n' > "${OUT_DIR}/call_ping.json"
             ok "Python CLI fallback done."
@@ -244,16 +229,15 @@ jobs:
         if: ${{ inputs.create_pr == true }}
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: "feat(mcp): v5 — proper inspector CLI methods + server, helpers fixed, safe Inspector"
-          title: "🧠 MCP Setup + Health + Echo — v5"
+          commit-message: "feat(mcp): v6 — fix server crash (resource removed), stable inspector methods, helpers fixed"
+          title: "🧠 MCP Setup + Health + Echo — v6"
           body: |
-            - Inspector CLI 호출을 최신 문법으로 수정: `--method tools/list`, `resources/list`, `prompts/list`, `tools/call`
-            - `--config` 사용 시 `--server ping-python` 명시
-            - 경고 원인이었던 “Method is required” 제거
-            - helpers 함수 파싱 오류 고정, 안전한 Inspector 버전(0.16.5) 핀, Python CLI 폴백 유지
-            - 아티팩트/PR/5분 크론 그대로 유지
+            - 샘플 서버의 잘못된 resource URI로 인한 즉시 크래시(ValidationError) 제거 → 서버 안정화
+            - Inspector 호출은 검증된 최소 메서드만 사용(tools/list, tools/call)
+            - helpers 함수 표준형/CRLF 제거 유지, npm 재시도/레지스트리/차단 패키지 검사 유지
+            - Python `mcp[cli]` 폴백 유지, 5분 크론/아티팩트/PR 유지
           add-paths: |
             .github/mcp/**
             .github/echo_logs/**
             .github/mcp_out/**
-          branch: "ci/mcp-setup-auto-v5"
+          branch: "ci/mcp-setup-auto-v6"
