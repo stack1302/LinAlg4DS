@@ -2,7 +2,7 @@
   "mcpServers": {
     "ping-python": {
       "command": "python",
-      "args": [".github/mcp/mcp_ping_server.py"]
+      "args": ["-u", ".github/mcp/mcp_ping_server.py"]
     }
   }
 }
