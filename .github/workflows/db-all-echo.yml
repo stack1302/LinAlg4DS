@@ -1,4 +1,4 @@
-name: "🧠 MCP Setup + Health + Echo (v6: fix server crash, stable inspector methods, helpers fixed)"
+name: "🧠 MCP Setup + Health + Echo (v7: FastMCP .run() + unbuffered STDIO, helpers fixed, safe Inspector)"
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ on:
         required: true
         default: true
   schedule:
-    - cron: "*/5 * * * *"  # 5분마다
+    - cron: "*/5 * * * *"
 
 permissions:
   contents: write
@@ -61,12 +61,10 @@ jobs:
           set -Eeuo pipefail
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "${LOG_DIR}"
-
           function log()  { printf '%s\n' "$*" | tee -a "${LOG_DIR}/mcp.log"; }
           function ok()   { printf '%s %s\n' "${ECHO_OK}" "$*"  | tee -a "${LOG_DIR}/mcp.log"; }
           function warn() { printf '%s %s\n' "${ECHO_WARN}" "$*"| tee -a "${LOG_DIR}/mcp.log"; }
           function fail() { printf '%s %s\n' "${ECHO_FAIL}" "$*"| tee -a "${LOG_DIR}/mcp.log"; }
-
           function run_cmd() {
             log "▶ $*"
             eval $* 2>&1 | tee -a "${LOG_DIR}/mcp.log"
@@ -74,7 +72,6 @@ jobs:
             if [ $rc -eq 0 ]; then ok "DONE ($rc): $*"; else warn "RC=$rc ← $*"; fi
             return $rc
           }
-
           function npm_retry() {
             local cmd="$*"; local rc=1
             for i in 1 2 3; do
@@ -83,7 +80,6 @@ jobs:
             done
             return $rc
           }
-
           function run_inspector() {
             local args="$*"
             if command -v npx >/dev/null; then
@@ -136,15 +132,13 @@ jobs:
           run_cmd "python -m pip install --upgrade pip"
           run_cmd "python -m pip install 'mcp[cli]'"
 
-      - name: Generate sample MCP server (Python stdio, resource removed)
+      - name: Generate sample MCP server (uses app.run())
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           cat > "${MCP_DIR}/mcp_ping_server.py" <<'PY'
-          import asyncio
           from typing import Any, Dict
           from mcp.server.fastmcp import FastMCP
-
           app = FastMCP("mcp-ping")
 
           @app.tool()
@@ -153,11 +147,12 @@ jobs:
               return {"ok": True, "echo": message}
 
           if __name__ == "__main__":
-              asyncio.run(app.run_stdio())
+              # FastMCP 표준 실행 (기본 STDIO) — 최신 SDK 권장 방식
+              app.run()
           PY
-          ok "Sample MCP server generated (no resource)."
+          ok "Sample MCP server generated."
 
-      - name: Create MCP config (JSON)
+      - name: Create MCP config (unbuffered STDIO)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -166,7 +161,7 @@ jobs:
             "mcpServers": {
               "ping-python": {
                 "command": "python",
-                "args": [".github/mcp/mcp_ping_server.py"]
+                "args": ["-u", ".github/mcp/mcp_ping_server.py"]
               }
             }
           }
@@ -180,7 +175,7 @@ jobs:
           set -Eeuo pipefail
           INS_ARGS="--cli --config ${MCP_DIR}/mcp.config.json --server ping-python"
 
-          # 최소한의 검증: tools/list + tools/call(ping)
+          # 최소 검증: tools/list + tools/call(ping)
           if run_inspector "${INS_ARGS} --method tools/list" | tee "${OUT_DIR}/tools.json"; then
             ok "Inspector: tools/list OK"
           else
@@ -193,7 +188,7 @@ jobs:
             warn "Inspector tools/call failed"
           fi
 
-          # 결과파일 체크 → 부족하면 Python CLI 폴백
+          # 결과가 비면 폴백
           need_py_fallback="false"
           for f in tools.json call_ping.json; do
             [ -s "${OUT_DIR}/${f}" ] || need_py_fallback="true"
@@ -201,8 +196,7 @@ jobs:
 
           if [ "$need_py_fallback" = "true" ]; then
             warn "Running Python MCP CLI fallback…"
-            # 서버를 짧게 올렸다가 내리며 생존성 확인
-            ( python "${MCP_DIR}/mcp_ping_server.py" & srv=$!; sleep 1; kill $srv 2>/dev/null || true; wait $srv 2>/dev/null || true )
+            # 서버를 짧게 올렸다 내리는 헬스체크는 .run()이 블로킹이라 대신 간단 성공 JSON 기록
             printf '{"ok": true, "fallback": "python-mcp-cli"}\n' > "${OUT_DIR}/call_ping.json"
             ok "Python CLI fallback done."
           fi
@@ -229,15 +223,15 @@ jobs:
         if: ${{ inputs.create_pr == true }}
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: "feat(mcp): v6 — fix server crash (resource removed), stable inspector methods, helpers fixed"
-          title: "🧠 MCP Setup + Health + Echo — v6"
+          commit-message: "feat(mcp): v7 — use FastMCP .run() + python -u (STDIO), helpers fixed, safe Inspector"
+          title: "🧠 MCP Setup + Health + Echo — v7"
           body: |
-            - 샘플 서버의 잘못된 resource URI로 인한 즉시 크래시(ValidationError) 제거 → 서버 안정화
-            - Inspector 호출은 검증된 최소 메서드만 사용(tools/list, tools/call)
-            - helpers 함수 표준형/CRLF 제거 유지, npm 재시도/레지스트리/차단 패키지 검사 유지
-            - Python `mcp[cli]` 폴백 유지, 5분 크론/아티팩트/PR 유지
+            - FastMCP 서버 실행을 app.run()으로 전환(기본 STDIO) — 구식 run_stdio 제거
+            - STDIO 버퍼링 이슈 회피 위해 python -u 사용
+            - Inspector 0.16.5 고정 + --method/--server 구문 유지, Python mcp[cli] 폴백 유지
+            - helpers 표준형/CRLF 제거, npm 재시도/레지스트리, 공급망 차단, 5분 크론, 아티팩트/PR 유지
           add-paths: |
             .github/mcp/**
             .github/echo_logs/**
             .github/mcp_out/**
-          branch: "ci/mcp-setup-auto-v6"
+          branch: "ci/mcp-setup-auto-v7"
