@@ -1,294 +1,205 @@
-name: DB Infrastructure CI
+name: "🧠 MCP Setup + Health + Echo (5m Cron, Secure, No-Interactive)"
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - ".github/workflows/db-all-echo.yml"
-      - "infra/**"
+    inputs:
+      node_version:
+        description: "Node.js version"
+        required: true
+        default: "20"
+      python_version:
+        description: "Python version"
+        required: true
+        default: "3.12"
+      create_pr:
+        description: "산출물(mcp 설정/스크립트/로그) PR 생성"
+        type: boolean
+        required: true
+        default: true
+  schedule:
+    - cron: "*/5 * * * *"  # 5분마다
+
+permissions:
+  contents: write
+  actions: read
+  pull-requests: write
 
 env:
   TZ: Asia/Seoul
-  LOG_DIR: .github/echo_logs
-  DOCKER_LOG_DIR: .github/echo_logs/docker-logs
-  DOWNLOAD_DIR: .github/echo_downloads
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
-  ALLOW_DOMAINS_CSV: "github.com,storage.googleapis.com,repo1.maven.org,dlcdn.apache.org"
+  LOG_DIR: .github/echo_logs
+  OUT_DIR: .github/mcp_out
+  MCP_DIR: .github/mcp
+  # 보안: 알려진 악성/차단 패키지 버전(예시)
+  BLOCKED_NPM: "postmark-mcp@1.0.16"  # 최근 악성 사례 대응 (존재 시 실패) :contentReference[oaicite:2]{index=2}
 
 jobs:
-  prepare:
+  mcp-all-in-one:
     runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 30
 
-      - name: Setup echo helpers (local per job)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare directories & echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
+          mkdir -p "${LOG_DIR}" "${OUT_DIR}" "${MCP_DIR}"
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
-          : "${LOG_DIR:=.github/echo_logs}"
-          : "${DOCKER_LOG_DIR:=.github/echo_logs/docker-logs}"
-          : "${DOWNLOAD_DIR:=.github/echo_downloads}"
-          : "${ECHO_OK:=OK}"; : "${ECHO_WARN:=WARN}"; : "${ECHO_FAIL:=FAIL}"
-          mkdir -p "${LOG_DIR}" "${DOCKER_LOG_DIR}" "${DOWNLOAD_DIR}"
-          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
-          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
-          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
-          logf(){  printf '%s\n' "$*" | tee -a "$1"; }
-          run_cmd(){ local L="$1"; shift; logf "$L" "▶ $*"; "$@" 2>&1 | tee -a "$L"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE: $*" || warn "RC=$rc ← $*"; return $rc; }
-          wait_port(){ local host="$1" port="$2" t="${3:-60}"; local end=$((SECONDS+t)); while [ $SECONDS -lt $end ]; do (echo >"/dev/tcp/$host/$port") >/dev/null 2>&1 && { echoe "port $host:$port open"; return 0; }; sleep 1; done; warn "timeout waiting for $host:$port"; return 1; }
-          dump_all_docker_logs(){
-            mkdir -p "${DOCKER_LOG_DIR}"
-            docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}' | tee "${DOCKER_LOG_DIR}/docker-ps.log" || true
-            while read -r id img name status; do
-              [ -z "$id" ] && continue
-              docker logs --details "$id" 2>&1 | tail -c 2000000 > "${DOCKER_LOG_DIR}/${name:-container}-${id}.log" || true
-            done < <(docker ps -a --format '{{.ID}} {{.Image}} {{.Names}} {{.Status}}')
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "${LOG_DIR}"
+          logf(){ printf '%s\n' "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*" | tee -a "${LOG_DIR}/mcp.log"; }
+          run_cmd(){
+            logf "▶ $*"
+            # shellcheck disable=SC2086
+            eval $* 2>&1 | tee -a "${LOG_DIR}/mcp.log"
+            local rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then echoe "DONE ($rc): $*"; else warn "RC=$rc ← $*"; fi
+            return $rc
           }
           SH
           chmod +x /tmp/echo_helpers.sh
+          echo "${ECHO_OK} Echo helpers ready."
 
-      - name: Create echo directory tree & files with permissions
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version || '20' }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version || '3.12' }}
+
+      - name: Install MCP tooling (pinned)
         shell: bash
         run: |
-          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          L="${LOG_DIR}/echo-init.log"
-          for d in core/{pg,mysql,mariadb,redis,mongo} analytical/{clickhouse,questdb,vm} graphkv/{neo4j,arangodb,etcd,couchdb} tmp/tools; do
-            run_cmd "$L" mkdir -p "${LOG_DIR}/${d}" "${DOCKER_LOG_DIR}/${d}" "${DOWNLOAD_DIR}/${d}"
-          done
-          for i in $(seq 1 20); do
-            f="${LOG_DIR}/echo_file_${i}.log"
-            run_cmd "$L" bash -lc "echo '[echo] file ${i}' > '${f}'"
-            run_cmd "$L" chmod 0644 "${f}"
-          done
-          E="${LOG_DIR}/echo.sh"
-          cat > "$E" <<'BASH'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          echo "echo:: $*"
-          BASH
-          chmod 0755 "$E"
-          run_cmd "$L" "$E" "echo subsystem ready"
+          run_cmd "node -v && npm -v && python -V && pip -V"
 
-      - name: Upgrade base packages (optional)
+          # 1) TypeScript SDK & Inspector( CLI 모드 ) - 버전 고정
+          # 공식 문서 및 리포 참고: modelcontextprotocol.io / inspector :contentReference[oaicite:3]{index=3}
+          run_cmd "npm i -g @modelcontextprotocol/inspector-cli@0.16.5 @modelcontextprotocol/typescript-sdk@1.0.0"
+
+          # 2) Python SDK - 버전 고정
+          # 공식 Python SDK :contentReference[oaicite:4]{index=4}
+          run_cmd "python -m pip install --upgrade pip"
+          run_cmd "python -m pip install 'mcp[server]'==0.3.0"
+
+          # 3) (옵션) 레퍼런스 파일시스템 서버(NPM) — 존재 시만 설치 시도
+          # 서버 패키지는 시점/네임스페이스에 따라 달라질 수 있으므로 실패해도 워크플로우 진행
+          # 참조: 서버 카탈로그/예시 페이지 :contentReference[oaicite:5]{index=5}
+          if npm view @modelcontextprotocol/server-filesystem@2025.3.28 version >/dev/null 2>&1; then
+            run_cmd "npm i -g @modelcontextprotocol/server-filesystem@2025.3.28"
+          else
+            warn "filesystem server (npm) 고정버전 미발견 — Python 샘플 서버로 헬스체크를 진행합니다."
+          fi
+
+          # 4) Supply-chain 가드: 차단 패키지 탐지(최근 악성 MCP 서버 사례) :contentReference[oaicite:6]{index=6}
+          if npm ls -g --depth=0 | grep -F "${BLOCKED_NPM}" >/dev/null 2>&1; then
+            fail "차단된 MCP 서버 패키지 발견: ${BLOCKED_NPM} — 즉시 중단합니다."
+            exit 1
+          else
+            echoe "차단 패키지 없음 (OK)"
+          fi
+
+      - name: Generate sample MCP server (Python, non-interactive)
         shell: bash
         run: |
-          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          L="${LOG_DIR}/upgrade.log"
-          run_cmd "$L" sudo apt-get update
-          run_cmd "$L" sudo apt-get -y dist-upgrade
-          run_cmd "$L" sudo apt-get -y autoremove --purge
+          cat > "${MCP_DIR}/mcp_ping_server.py" <<'PY'
+          # Minimal Python MCP server exposing a simple 'ping' tool and 'readme' resource
+          # Uses python SDK (mcp[server]) — CLI mode execution via Inspector :contentReference[oaicite:7]{index=7}
+          import asyncio
+          from typing import Any, Dict
+          from mcp.server.fastmcp import FastMCP
 
-  analytical-dbs:
-    runs-on: ubuntu-24.04
-    needs: [prepare]
-    services:
-      clickhouse:
-        image: clickhouse/clickhouse-server:24.8
-        ports: [ "9000:9000", "8123:8123" ]
-        options: >-
-          --health-cmd="curl -fsS http://127.0.0.1:8123/ping || exit 1"
-          --health-interval=5s --health-retries=60 --health-timeout=4s
-          --health-start-period=20s
-      questdb:
-        image: questdb/questdb:latest
-        ports:
-          - 9009:9009   # ILP
-          - 8812:8812   # PG-wire
-          - 9001:9000   # Web (Host 9001 → Container 9000)
-        options: >-
-          --health-cmd="sh -lc 'wget -qO- http://127.0.0.1:9000/ || exit 1'"
-          --health-interval=5s --health-retries=80 --health-timeout=4s
-          --health-start-period=25s
-      victoriametrics:
-        image: victoriametrics/victoria-metrics:v1.103.0
-        ports: [ "8428:8428" ]
-        options: >-
-          --health-cmd="wget -qO- http://127.0.0.1:8428/health"
-          --health-interval=5s --health-retries=60 --health-timeout=4s
-          --health-start-period=10s
-    steps:
-      - uses: actions/checkout@v4
+          app = FastMCP("mcp-ping")
 
-      - name: Setup echo helpers (local per job)
+          @app.tool()
+          def ping(message: str = "pong") -> Dict[str, Any]:
+            "Return the message back (health-check)."
+            return {"ok": True, "echo": message}
+
+          @app.resource("readme")
+          def readme() -> str:
+            return "MCP sample server is running."
+
+          if __name__ == "__main__":
+            asyncio.run(app.run_stdio())
+          PY
+          echo "${ECHO_OK} Sample MCP server generated: ${MCP_DIR}/mcp_ping_server.py"
+
+      - name: Create MCP config (JSON) for CLI runs
         shell: bash
         run: |
-          set -Eeuo pipefail
-          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
-
-      - name: Wait for analytical services
-        shell: bash
-        run: |
-          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          L="${LOG_DIR}/analytical-wait.log"
-          run_cmd "$L" wait_port 127.0.0.1 8123 240
-          run_cmd "$L" wait_port 127.0.0.1 9001 300
-          run_cmd "$L" wait_port 127.0.0.1 8812 300
-          run_cmd "$L" wait_port 127.0.0.1 9009 240
-          run_cmd "$L" wait_port 127.0.0.1 8428 240
+          cat > "${MCP_DIR}/mcp.config.json" <<'JSON'
+          {
+            "mcpServers": {
+              "ping-python": {
+                "command": "python",
+                "args": [".github/mcp/mcp_ping_server.py"]
+              }
+            }
+          }
+          JSON
+          echo "${ECHO_OK} MCP config created: ${MCP_DIR}/mcp.config.json"
 
-      - name: Smoke test (analytical)
+      - name: Run MCP health checks (Inspector CLI, non-interactive)
         shell: bash
         run: |
-          set -Eeuo pipefail
-          # ClickHouse: /ping (403 회피)
-          curl -fsS 'http://127.0.0.1:8123/ping'
-          # QuestDB: 웹 루트 응답 확인
-          curl -fsSI 'http://127.0.0.1:9001/' | head -n1
-          # VictoriaMetrics: /health
-          curl -fsS 'http://127.0.0.1:8428/health'
-
-      - name: Always dump docker logs (analytical)
-        if: always()
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh || true
-          type dump_all_docker_logs >/dev/null 2>&1 || dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
-          dump_all_docker_logs || true
-
-  graph-kv-dbs:
-    runs-on: ubuntu-24.04
-    needs: [prepare]
-    services:
-      neo4j:
-        image: neo4j:5.26.13
-        env:
-          NEO4J_AUTH: neo4j/test1234
-        ports: [ "7474:7474", "7687:7687" ]
-        options: >-
-          --health-cmd="wget -qO- http://127.0.0.1:7474 || exit 1"
-          --health-interval=5s --health-retries=60 --health-timeout=4s
-          --health-start-period=15s
-      arangodb:
-        image: arangodb:3.11
-        env:
-          ARANGO_ROOT_PASSWORD: test1234
-        ports: [ "8529:8529" ]
-        options: >-
-          --health-cmd="curl -fsS http://127.0.0.1:8529/_api/version || exit 1"
-          --health-interval=5s --health-retries=60 --health-timeout=4s
-          --health-start-period=20s
-      etcd:
-        image: gcr.io/etcd-development/etcd:v3.5.13
-        env:
-          ETCD_NAME: s1
-          ETCD_DATA_DIR: /var/lib/etcd
-          ETCD_INITIAL_ADVERTISE_PEER_URLS: http://127.0.0.1:2380
-          ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
-          ETCD_ADVERTISE_CLIENT_URLS: http://127.0.0.1:2379
-          ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
-          ETCD_INITIAL_CLUSTER: s1=http://127.0.0.1:2380
-          ETCD_INITIAL_CLUSTER_STATE: new
-          ETCD_LOGGER: zap
-        ports: [ "2379:2379", "2380:2380" ]
-        options: >-
-          --health-cmd="sh -lc 'ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health || exit 1'"
-          --health-interval=5s --health-retries=80 --health-timeout=4s
-          --health-start-period=20s
-      couchdb:
-        image: couchdb:3
-        env:
-          COUCHDB_USER: admin
-          COUCHDB_PASSWORD: test1234
-          COUCHDB_SINGLE_NODE: "true"
-        ports: [ "5984:5984" ]
-        options: >-
-          --health-cmd="curl -fsS http://127.0.0.1:5984/_up || exit 1"
-          --health-interval=5s --health-retries=60 --health-timeout=4s
-          --health-start-period=15s
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup echo helpers (local per job)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
-
-      - name: Wait for graph/kv services
-        shell: bash
-        run: |
-          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          L="${LOG_DIR}/graphkv-wait.log"
-          run_cmd "$L" wait_port 127.0.0.1 7474 240
-          run_cmd "$L" wait_port 127.0.0.1 7687 240
-          run_cmd "$L" wait_port 127.0.0.1 8529 300
-          run_cmd "$L" wait_port 127.0.0.1 2379 300
-          run_cmd "$L" wait_port 127.0.0.1 5984 240
-
-      - name: Initialize CouchDB system databases
-        shell: bash
-        run: |
           set -Eeuo pipefail
-          base="http://admin:test1234@127.0.0.1:5984"
-          curl -fsS "${base}/_users"          || curl -fsS -X PUT "${base}/_users"
-          curl -fsS "${base}/_replicator"     || curl -fsS -X PUT "${base}/_replicator"
-          curl -fsS "${base}/_global_changes" || curl -fsS -X PUT "${base}/_global_changes"
+          # 1) List Tools/Resources/Prompts via Inspector CLI (non-interactive)
+          run_cmd "npx -y @modelcontextprotocol/inspector --cli --config ${MCP_DIR}/mcp.config.json list servers       | tee ${OUT_DIR}/servers.txt"
+          run_cmd "npx -y @modelcontextprotocol/inspector --cli --config ${MCP_DIR}/mcp.config.json list tools         | tee ${OUT_DIR}/tools.txt"
+          run_cmd "npx -y @modelcontextprotocol/inspector --cli --config ${MCP_DIR}/mcp.config.json list resources     | tee ${OUT_DIR}/resources.txt"
+          run_cmd "npx -y @modelcontextprotocol/inspector --cli --config ${MCP_DIR}/mcp.config.json call-tool ping-python:ping --args '{\"message\":\"hello\"}' | tee ${OUT_DIR}/call_ping.json"
 
-      - name: Smoke test (graph/kv)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          curl -fsSI http://127.0.0.1:7474/ | head -n1
-          curl -fsS  http://127.0.0.1:8529/_api/version | jq -r '.version'
-          curl -fsS  http://127.0.0.1:2379/health
-          curl -fsS  http://127.0.0.1:5984/_all_dbs | jq -c .
+          # 간단한 결과 검증
+          if grep -q '"ok": true' "${OUT_DIR}/call_ping.json"; then
+            echoe "MCP ping tool OK"
+          else
+            fail "MCP ping tool failed"
+            exit 1
+          fi
 
-      - name: Always dump docker logs (graph/kv)
-        if: always()
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh || true
-          type dump_all_docker_logs >/dev/null 2>&1 || dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
-          dump_all_docker_logs || true
+      - name: Archive artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-outputs
+          path: |
+            .github/mcp_out/**
+            .github/mcp/**
+            .github/echo_logs/**
+          if-no-files-found: warn
+          retention-days: 7
 
-  core-dbs:
-    runs-on: ubuntu-24.04
-    needs: [prepare]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup echo helpers (local per job)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cat /tmp/echo_helpers.sh >/tmp/echo_helpers.sh || true
-
-      - name: Install DB clients
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            postgresql-client mysql-client redis-tools clickhouse-client \
-            curl jq netcat-traditional
-
-      - name: (optional) Probe common ports
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          wait_port 127.0.0.1 5432 5 || true
-          wait_port 127.0.0.1 3306 5 || true
-          wait_port 127.0.0.1 6379 5 || true
-
-      - name: Always dump docker logs (core)
-        if: always()
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh || true
-          type dump_all_docker_logs >/dev/null 2>&1 || dump_all_docker_logs(){ docker ps -a; for i in $(docker ps -aq); do docker logs --details "$i" || true; done; }
-          dump_all_docker_logs || true
+      - name: Create PR with generated files (optional)
+        if: ${{ inputs.create_pr == true }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: "feat(mcp): add MCP sample server, config, logs (auto)"
+          title: "🧠 MCP Setup + Health + Echo — auto generated"
+          body: |
+            - Node/Python runners installed
+            - MCP Inspector CLI (pinned) & Python SDK installed
+            - Sample MCP server (python) + config added
+            - Non-interactive health checks passed
+            - Echo logs & outputs included
+            - 5m cron enabled
+          add-paths: |
+            .github/mcp/**
+            .github/echo_logs/**
+            .github/mcp_out/**
+          branch: "ci/mcp-setup-auto"
