@@ -1,4 +1,4 @@
-name: "🚀 Spring Boot ALL-ECHO CI (Auto Bootstrap + Maven/Gradle + Curl + 5-min Cron + Docker)"
+name: "🚀 Spring Boot ALL-ECHO CI (Always-Download + Auto Bootstrap + Maven/Gradle + 5-min Cron + Docker)"
 
 on:
   push:
@@ -23,21 +23,27 @@ on:
         required: true
         default: "auto"
       pom_url:
-        description: "원격 pom.xml URL(선택)"
+        description: "원격 pom.xml URL(비워두면 스킵, 단계는 실행)"
         required: false
         default: ""
       dockerfile_url:
-        description: "원격 Dockerfile URL(선택)"
+        description: "원격 Dockerfile URL(비워두면 스킵, 단계는 실행)"
         required: false
         default: ""
-      additional_downloads:
+      must_downloads:
         description: |
-          추가 다운로드(줄바꿈 구분) 예:
-          url=https://..,dest=src/main/resources/app.yml,sha256=<옵션>
+          ✅ 필수 다운로드(줄바꿈 구분, 하나라도 실패 시 워크플로우 실패)
+          포맷: url=...,dest=...,sha256=<옵션>
+        required: false
+        default: ""
+      extra_downloads:
+        description: |
+          (선택) 추가 다운로드(줄바꿈 구분, 실패 시 해당 항목만 경고 후 계속)
+          포맷: url=...,dest=...,sha256=<옵션>
         required: false
         default: ""
       auto_bootstrap:
-        description: "빌드 파일 없으면 자동으로 Spring Boot 최소 프로젝트 생성"
+        description: "빌드 파일 없으면 Spring Boot 최소 프로젝트 자동 생성"
         type: boolean
         required: true
         default: true
@@ -70,7 +76,7 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
-  # 공식/안전 도메인만 허용 (필요시 추가)
+  # ✅ 다운로드 화이트리스트 (필요 시 추가)
   ALLOW_DOMAINS_CSV: "github.com,raw.githubusercontent.com,repo1.maven.org,dlcdn.apache.org,ghcr.io,docker.io,storage.googleapis.com,start.spring.io,repo.spring.io,docs.spring.io"
 
 jobs:
@@ -100,6 +106,7 @@ jobs:
           run_cmd(){ logf "▶ $*"; eval $* 2>&1 | tee -a "${SAFE_LOG}"; rc=${PIPESTATUS[0]}; [ $rc -eq 0 ] && echoe "DONE ($rc)" || warn "RC=$rc"; return $rc; }
           _host_from_url(){ printf '%s' "$1" | awk -F/ '{print $3}'; }
           curl_get(){
+            # curl_get URL OUT [SHA256]
             local url="$1" out="$2" want_sha="${3:-}" host allow ok="no"
             host=$(_host_from_url "$url"); allow="${ALLOW_DOMAINS_CSV:-}"
             if [ -n "$allow" ]; then IFS=',' read -r -a A <<< "$allow"; for d in "${A[@]}"; do d="${d## }"; d="${d%% }"; [[ "$host" == "$d" || "$host" == *".$d" ]] && ok="yes" && break; done; [ "$ok" != "yes" ] && fail "BLOCKED DOMAIN: $host" && return 2; fi
@@ -107,7 +114,22 @@ jobs:
             run_cmd curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 "$url" -o "$out"
             if [ -n "$want_sha" ] && [ -f "$out" ]; then got=$(sha256sum "$out" | awk '{print $1}'); [ "$got" != "$want_sha" ] && fail "SHA256 mismatch $out" && return 3 || echoe "SHA256 OK: $out"; fi
           }
-          parse_kv_line(){ local line="$1"; p_url=""; p_dest=""; p_sha=""; IFS=',' read -r -a kvs <<< "$line"; for kv in "${kvs[@]}"; do kv="${kv## }"; kv="${kv%% }"; k="${kv%%=*}"; v="${kv#*=}"; case "$k" in url) p_url="$v";; dest) p_dest="$v";; sha256) p_sha="$v";; esac; done; }
+          parse_kv_line(){
+            # 입력 라인: url=...,dest=...,sha256=...
+            local line="$1"; p_url=""; p_dest=""; p_sha=""
+            IFS=',' read -r -a kvs <<< "$line"
+            for kv in "${kvs[@]}"; do
+              kv="${kv## }"; kv="${kv%% }"; k="${kv%%=*}"; v="${kv#*=}"
+              case "$k" in url) p_url="$v";; dest) p_dest="$v";; sha256) p_sha="$v";; esac
+            done
+          }
+          dl_list_from_file(){
+            # 파일(있으면) 내용을 출력
+            local f="$1"
+            if [ -f "$f" ]; then
+              sed '/^$/d;/^[[:space:]]*#/d' "$f"
+            fi
+          }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
@@ -119,6 +141,7 @@ jobs:
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
+          # manual 이면 선택값, 그 외엔 21 고정
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.java_version }}" ]; then
             JV="${{ inputs.java_version }}"
           else
@@ -127,49 +150,76 @@ jobs:
           echo "java=$JV" >> "$GITHUB_OUTPUT"
           echoe "Resolved Java version: $JV"
 
-      - name: Show inputs (manual only)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
+      # ==== 다운로드 단계 (항상 실행) ====
+      - name: Always-run downloads (pom/dockerfile/must/extra/manifest)
+        id: downloads
+        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
         shell: bash
         run: |
+          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          echoe "project_path=${{ inputs.project_path }}"
-          echoe "java_version=${{ steps.vars.outputs.java }}"
-          echoe "build_tool_hint=${{ inputs.build_tool_hint }}"
-          echoe "pom_url=${{ inputs.pom_url }}"
-          echoe "dockerfile_url=${{ inputs.dockerfile_url }}"
-          echoe "auto_bootstrap=${{ inputs.auto_bootstrap }}"
-          echoe "skip_tests=${{ inputs.skip_tests }}"
-          echoe "build_docker=${{ inputs.build_docker }}"
-          echoe "image_name=${{ inputs.image_name }}"
 
-      # --- (선택) 공식 파일 선다운로드 ---
-      - name: (Optional) Download pom.xml via curl
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.pom_url != '' }}
-        working-directory: ${{ inputs.project_path }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          curl_get "${{ inputs.pom_url }}" "pom.xml"
+          # 1) 개별 URL: pom.xml / Dockerfile — 비어있으면 건너뛰되 단계는 실행
+          POM_URL="${{ github.event_name == 'workflow_dispatch' && inputs.pom_url || '' }}"
+          DOCKERFILE_URL="${{ github.event_name == 'workflow_dispatch' && inputs.dockerfile_url || '' }}"
+          if [ -n "$POM_URL" ]; then
+            curl_get "$POM_URL" "pom.xml" || exit $?
+          else
+            warn "pom_url not provided; skip file but downloads step continues."
+          fi
+          if [ -n "$DOCKERFILE_URL" ]; then
+            curl_get "$DOCKERFILE_URL" "Dockerfile" || exit $?
+          else
+            warn "dockerfile_url not provided; skip file but downloads step continues."
+          fi
 
-      - name: (Optional) Download Dockerfile via curl
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dockerfile_url != '' }}
-        working-directory: ${{ inputs.project_path }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          curl_get "${{ inputs.dockerfile_url }}" "Dockerfile"
+          # 2) 필수 다운로드(must_downloads) — 하나라도 실패 시 즉시 실패
+          MUST_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.must_downloads || '' }}"
+          if [ -n "$MUST_LIST" ]; then
+            echoe "Processing MUST downloads..."
+            printf '%s\n' "$MUST_LIST" | sed '/^$/d' | while IFS= read -r line; do
+              parse_kv_line "$line"
+              if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
+                fail "MUST: url/dest missing → $line"; exit 10
+              fi
+              curl_get "$p_url" "$p_dest" "$p_sha" || exit $?
+            done
+          else
+            warn "No MUST downloads provided (ok)."
+          fi
 
-      - name: (Optional) Additional downloads via curl
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.additional_downloads != '' }}
-        working-directory: ${{ inputs.project_path }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          printf '%s\n' "${{ inputs.additional_downloads }}" | sed '/^$/d' | while IFS= read -r line; do
-            parse_kv_line "$line"
-            [ -z "$p_url" ] || [ -z "$p_dest" ] && warn "Skip (missing url/dest): $line" && continue
-            curl_get "$p_url" "$p_dest" "$p_sha"
-          done
+          # 3) (선택) 추가 다운로드(extra_downloads) — 실패해도 계속
+          EXTRA_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.extra_downloads || '' }}"
+          if [ -n "$EXTRA_LIST" ]; then
+            echoe "Processing EXTRA downloads..."
+            printf '%s\n' "$EXTRA_LIST" | sed '/^$/d' | while IFS= read -r line; do
+              parse_kv_line "$line"
+              if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
+                warn "EXTRA: url/dest missing → $line"; continue
+              fi
+              curl_get "$p_url" "$p_dest" "$p_sha" || warn "EXTRA failed → $line"
+            done
+          else
+            warn "No EXTRA downloads provided."
+          fi
+
+          # 4) 리포 매니페스트 병합 처리(항상 시도): .github/downloads.manifest
+          #    - 이 파일은 MUST처럼 동작(실패 시 종료)하도록 설정
+          if [ -f ".github/downloads.manifest" ]; then
+            echoe "Processing repository manifest: .github/downloads.manifest"
+            dl_list_from_file ".github/downloads.manifest" | while IFS= read -r line; do
+              parse_kv_line "$line"
+              if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
+                fail "MANIFEST: url/dest missing → $line"; exit 20
+              fi
+              curl_get "$p_url" "$p_dest" "$p_sha" || exit $?
+            done
+          else
+            warn "No repository manifest found (.github/downloads.manifest)."
+          fi
+
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echoe "Downloads phase completed."
 
       # --- 1차 빌드도구 탐지 ---
       - name: Detect build tool (pass 1)
@@ -197,7 +247,6 @@ jobs:
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          # push/pr/cron 에서는 자동 활성화, manual 은 inputs.auto_bootstrap 기준
           AB="true"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             AB="${{ inputs.auto_bootstrap && 'true' || 'false' }}"
@@ -216,7 +265,6 @@ jobs:
           curl_get "$URL" "$ZIP"
           run_cmd unzip -o "$ZIP" -d .
           rm -f "$ZIP"
-          # wrapper 실행권한
           [ -f "./mvnw" ] && run_cmd chmod +x ./mvnw || true
           echoe "Bootstrap completed."
 
@@ -291,8 +339,7 @@ jobs:
               run_cmd gradle -v
             fi
           else
-            # 여기까지 와도 없으면, 더미 자바 프로젝트를 만들어 빌드 성공 처리
-            warn "Still no build files; creating a minimal Maven project for success path."
+            warn "Still no build files; creating a minimal Maven dummy project."
             sudo apt-get update -y
             sudo apt-get install -y maven
             run_cmd mvn -B -q -DgroupId=com.example -DartifactId=dummy -Dversion=0.0.1 -Dpackage=com.example.dummy -DarchetypeArtifactId=maven-archetype-quickstart -DinteractiveMode=false archetype:generate
@@ -308,11 +355,9 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           CMD="${{ steps.toolprep.outputs.cmd }}"
-          # dummy 생성 시 경로 보정
           if [ ! -f "pom.xml" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ] && [ -d "dummy" ]; then
             cd dummy
           fi
-          # detect 최신 상태 반영
           if [ -f "pom.xml" ]; then
             if [ "${{ github.event_name == 'workflow_dispatch' && inputs.skip_tests || false }}" = "true" ]; then
               run_cmd "$CMD" -B -DskipTests package
@@ -327,7 +372,7 @@ jobs:
             fi
           fi
 
-      # --- Locate Artifact (Maven/Gradle + dummy 대응) ---
+      # --- Locate Artifact ---
       - name: Locate JAR
         id: findart
         working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
