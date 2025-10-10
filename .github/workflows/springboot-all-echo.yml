@@ -89,32 +89,102 @@ jobs:
           distribution: temurin
           java-version: ${{ inputs.java_version }}
 
-      # ========= Download Spring project via curl =========
-      - name: Download Spring Initializr ZIP (official, via curl)
+      # ========== FIXED: robust Initializr download with GET + fallback ==========
+      - name: Download Spring Initializr ZIP (robust: GET → POST → mirror)
         id: dl
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          PRJ_DIR="${{ inputs.artifact_id }}"
+
+          BUILD="${{ inputs.build_tool }}"
+          TYPE="$([ "${BUILD}" = "gradle" ] && echo gradle-project || echo maven-project)"
+          GROUP="${{ inputs.group_id }}"
+          ART="${{ inputs.artifact_id }}"
+          NAME="${{ inputs.project_name }}"
+          BOOT="${{ inputs.boot_version }}"
+          JVER="${{ inputs.java_version }}"
+          DEPS="${{ inputs.dependencies_csv }}"
+          PRJ_DIR="${ART}"
           ZIP="${PRJ_DIR}.zip"
-          echoe "Downloading Spring Boot project from start.spring.io → ${ZIP}"
-          run_log curl -fSsvL --retry 3 --retry-all-errors \
-            -o "${ZIP}" \
-            https://start.spring.io/starter.zip \
-            -d type=${{ inputs.build_tool == 'gradle' && 'gradle-project' || 'maven-project' }} \
-            -d language=java \
-            -d bootVersion=${{ inputs.boot_version }} \
-            -d groupId=${{ inputs.group_id }} \
-            -d artifactId=${{ inputs.artifact_id }} \
-            -d name=${{ inputs.project_name }} \
-            -d packageName=${{ inputs.group_id }}.${{ inputs.artifact_id }} \
-            -d packaging=jar \
-            -d javaVersion=${{ inputs.java_version }} \
-            -d dependencies=${{ inputs.dependencies_csv }}
+
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+          HEADERS=(-H "Accept: application/zip" -H "User-Agent: ${UA}")
+          FORM_COMMON=(
+            --data-urlencode "type=${TYPE}"
+            --data-urlencode "language=java"
+            --data-urlencode "bootVersion=${BOOT}"
+            --data-urlencode "groupId=${GROUP}"
+            --data-urlencode "artifactId=${ART}"
+            --data-urlencode "name=${NAME}"
+            --data-urlencode "packageName=${GROUP}.${ART}"
+            --data-urlencode "packaging=jar"
+            --data-urlencode "javaVersion=${JVER}"
+            --data-urlencode "dependencies=${DEPS}"
+          )
+
+          try_get() {
+            local base="$1"
+            echoe "GET from ${base}/starter.zip"
+            # IPv4 강제(-4), GET(-G) + URL 인코딩, 재시도 강화
+            curl -4 -fSsvL --retry 5 --retry-all-errors --retry-delay 2 \
+              "${HEADERS[@]}" -G "${base}/starter.zip" \
+              "${FORM_COMMON[@]}" -o "${ZIP}"
+          }
+
+          try_post() {
+            local base="$1"
+            echoe "POST form to ${base}/starter.zip"
+            # 폼 POST (application/x-www-form-urlencoded)
+            curl -4 -fSsvL --retry 5 --retry-all-errors --retry-delay 2 \
+              "${HEADERS[@]}" "${base}/starter.zip" \
+              -d "type=${TYPE}" \
+              -d "language=java" \
+              -d "bootVersion=${BOOT}" \
+              -d "groupId=${GROUP}" \
+              -d "artifactId=${ART}" \
+              -d "name=${NAME}" \
+              -d "packageName=${GROUP}.${ART}" \
+              -d "packaging=jar" \
+              -d "javaVersion=${JVER}" \
+              -d "dependencies=${DEPS}" \
+              -o "${ZIP}"
+          }
+
+          verify_zip() {
+            # ZIP 무결성/유효성 확인 (깨진 JSON/HTML 응답 걸러내기)
+            if ! unzip -t "${ZIP}" >/dev/null 2>&1; then
+              warn "ZIP integrity check failed (maybe HTML/JSON error)."
+              return 1
+            fi
+            return 0
+          }
+
+          BASE1="https://start.spring.io"
+          BASE2="https://start.springboot.io"  # 공식 미러
+
+          # 1) GET (공식)
+          if try_get "${BASE1}" && verify_zip; then
+            echoe "Downloaded via GET from ${BASE1}"
+          # 2) POST (공식)
+          elif try_post "${BASE1}" && verify_zip; then
+            echoe "Downloaded via POST from ${BASE1}"
+          # 3) GET (미러)
+          elif try_get "${BASE2}" && verify_zip; then
+            echoe "Downloaded via GET from mirror ${BASE2}"
+          # 4) POST (미러)
+          elif try_post "${BASE2}" && verify_zip; then
+            echoe "Downloaded via POST from mirror ${BASE2}"
+          else
+            fail "All download attempts failed."
+            echo "----- DEBUG DUMP (if exists) -----"
+            file "${ZIP}" || true
+            head -c 400 "${ZIP}" || true
+            exit 22
+          fi
+
           echo "zip=${ZIP}" >> $GITHUB_OUTPUT
           echo "prj=${PRJ_DIR}" >> $GITHUB_OUTPUT
-          echoe "ZIP downloaded: ${ZIP}"
 
       - name: Unzip project
         shell: bash
@@ -128,7 +198,6 @@ jobs:
           echoe "Project dir ready: ${PRJ}"
           ls -la "${PRJ}" | sed 's/^/  /'
 
-      # ========= Add HelloController via echo / here-doc =========
       - name: Generate sample HelloController (echo + here-doc, safe quoted)
         shell: bash
         run: |
@@ -154,11 +223,9 @@ jobs:
               }
           }
           JAVA
-          # replace package placeholder safely
           sed -i "s#__PKG__#${GROUP}.${ART}#g" "${FILE}"
           echoe "Created: ${FILE}"
 
-      # ========= Cache dependencies =========
       - name: Cache Maven repo
         if: ${{ inputs.build_tool == 'maven' }}
         uses: actions/cache@v4
@@ -179,7 +246,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
-      # ========= Build =========
       - name: Build with Maven
         if: ${{ inputs.build_tool == 'maven' }}
         working-directory: ${{ steps.dl.outputs.prj }}
@@ -212,7 +278,6 @@ jobs:
             run_log ./gradlew build
           fi
 
-      # ========= Run app in background & health check =========
       - name: Run app (background) and verify endpoint
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
@@ -224,7 +289,6 @@ jobs:
           PATH_HEALTH="${{ inputs.run_path }}"
           LOG="../../${LOG_DIR}/app-run.log"
 
-          # Start
           if [ "${{ inputs.build_tool }}" = "maven" ]; then
             run_cmd="./mvnw -q -Dspring-boot.run.jvmArguments='-Dserver.port=${PORT}' spring-boot:run"
           else
@@ -238,7 +302,6 @@ jobs:
           test -n "${PID}" || (fail "PID not captured" && exit 1)
           echoe "App PID: ${PID} (logs → ${LOG})"
 
-          # Wait for readiness (max ~60s)
           for i in $(seq 1 60); do
             if curl -fsS "http://127.0.0.1:${PORT}${PATH_HEALTH}" >/dev/null 2>&1; then
               echoe "Health OK: GET ${PATH_HEALTH}"
@@ -250,27 +313,16 @@ jobs:
               tail -n 200 "${LOG}" || true
               exit 1
             fi
-            if [ "$i" -eq 60 ]; then
-              fail "App not responding on ${PORT}${PATH_HEALTH} within 60s"
-              tail -n 200 "${LOG}" || true
-              exit 1
-            fi
+            [ "$i" -eq 60 ] && (fail "App not responding on ${PORT}${PATH_HEALTH}" && tail -n 200 "${LOG}" || true && exit 1)
           done
 
-          # Print response
           echoe "Requesting ${PATH_HEALTH}"
           curl -fSsv "http://127.0.0.1:${PORT}${PATH_HEALTH}" || true
 
-          # Graceful stop
           echoe "Stopping app PID=${PID}"
           kill "${PID}" || true
           for j in $(seq 1 15); do
-            if ps -p "${PID}" >/dev/null 2>&1; then
-              sleep 1
-              [ "$j" -ge 15 ] && break
-            else
-              break
-            fi
+            ps -p "${PID}" >/dev/null 2>&1 && sleep 1 || break
           done
           ps -p "${PID}" >/dev/null 2>&1 && (warn "Force kill" && kill -9 "${PID}" || true)
 
@@ -281,5 +333,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: spring-logs
-          path: |
-            .github/echo_logs/**
+          path: .github/echo_logs/**
