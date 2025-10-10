@@ -1,4 +1,4 @@
-name: "🌱 Spring Boot: Init + Upgrade + Build + Run (Maven & Gradle, no-skip)"
+name: "🌱 Spring Boot: Init + Upgrade + Build + Run (Maven & Gradle, robust, no-skip)"
 
 on:
   workflow_dispatch:
@@ -7,13 +7,13 @@ on:
         description: "Group ID"
         default: "com.example"
       artifact_id:
-        description: "Base Artifact ID (각 빌드툴별 접미사 자동 부여)"
+        description: "Base Artifact ID (접미사 자동 부여: -mvn / -gradle)"
         default: "demo"
       project_name:
         description: "프로젝트 표시 이름"
         default: "DemoProject"
       boot_version:
-        description: "Spring Boot 버전 (예: 3.3.5)"
+        description: "Spring Boot 버전"
         default: "3.3.5"
       java_version:
         description: "JDK 버전"
@@ -71,12 +71,12 @@ jobs:
           run_log sudo apt-get update -y
           run_log sudo apt-get install -y curl unzip jq
 
-      - name: Setup Java (enable Maven cache)
+      # 1) 초기 JDK 설치 (캐시 미사용) — pom.xml/gradle 파일 생기기 전에 실행해야 하므로 cache 비활성화
+      - name: Setup Java (no cache yet)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ inputs.java_version }}
-          cache: maven
 
       # ===================== Robust Initializr Download (+baseDir) =====================
       - name: Download Spring Initializr ZIP (robust) + baseDir
@@ -191,7 +191,7 @@ jobs:
           echoe "Project dir ready: ${PRJ}"
           ls -la "${PRJ}" | sed 's/^/  /'
 
-      # ===================== Sample Controller (echo + here-doc) =====================
+      # 샘플 컨트롤러 생성
       - name: Generate HelloController
         shell: bash
         run: |
@@ -216,7 +216,28 @@ jobs:
           sed -i "s#__PKG__#${GROUP}.${ART}#g" "${FILE}"
           echoe "Created: ${FILE}"
 
-      # ===================== CACHES (both) + Prefetch =====================
+      # 2) 프로젝트 생성 후 — 캐시 활성 setup-java (빌드툴별 조건 실행)
+      - name: Setup Java with Maven cache (after pom.xml exists)
+        if: ${{ matrix.build_tool == 'maven' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: maven
+          cache-dependency-path: ${{ steps.dl.outputs.prj }}/pom.xml
+
+      - name: Setup Java with Gradle cache (after gradle files exist)
+        if: ${{ matrix.build_tool == 'gradle' }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java_version }}
+          cache: gradle
+          cache-dependency-path: |
+            ${{ steps.dl.outputs.prj }}/**/*.gradle*
+            ${{ steps.dl.outputs.prj }}/**/gradle-wrapper.properties
+
+      # 추가 수동 캐시 (보완)
       - name: Cache Maven repo (multi-key)
         if: ${{ matrix.build_tool == 'maven' }}
         id: cache-maven
@@ -241,19 +262,21 @@ jobs:
             ~/.gradle/wrapper
             ${{ steps.dl.outputs.prj }}/.gradle
           key: |
-            ${{ runner.os }}-gradle-java${{ inputs.java_version }}-boot${{ inputs.boot_version }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+            ${{ runner.os }}-gradle-java${{ inputs.java_version }}-boot${{ inputs.boot_version }}-${{ hashFiles(format('{0}/**/*.gradle*', steps.dl.outputs.prj), format('{0}/**/gradle-wrapper.properties', steps.dl.outputs.prj)) }}
           restore-keys: |
             ${{ runner.os }}-gradle-java${{ inputs.java_version }}-boot${{ inputs.boot_version }}-
             ${{ runner.os }}-gradle-java${{ inputs.java_version }}-
             ${{ runner.os }}-gradle-
           save-always: true
 
+      # 의존성 프리페치
       - name: Prefetch dependencies (Maven go-offline)
         if: ${{ matrix.build_tool == 'maven' }}
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
         run: |
           set -Eeuo pipefail
+          chmod +x ./mvnw || true
           ./mvnw -B -ntp -DskipTests dependency:go-offline
 
       - name: Prefetch dependencies (Gradle)
@@ -265,7 +288,7 @@ jobs:
           chmod +x ./gradlew || true
           ./gradlew -q dependencies || true
 
-      # ===================== UPGRADE (Maven / Gradle) =====================
+      # 업그레이드
       - name: Upgrade (Maven dependencies & parent/BOM)
         if: ${{ matrix.build_tool == 'maven' }}
         working-directory: ${{ steps.dl.outputs.prj }}
@@ -273,13 +296,9 @@ jobs:
         run: |
           set -Eeuo pipefail
           chmod +x ./mvnw || true
-          # 최신 릴리스 사용 (스냅샷 제외, 백업 POM 미생성)
           ./mvnw -B -ntp versions:use-latest-releases -DallowSnapshots=false -DgenerateBackupPoms=false
-          # 부모(spring-boot-starter-parent) 업데이트
           ./mvnw -B -ntp versions:update-parent -DallowSnapshots=false -DgenerateBackupPoms=false || true
-          # BOM/프로퍼티 최신화
           ./mvnw -B -ntp versions:update-properties -DallowSnapshots=false -DgenerateBackupPoms=false || true
-          # 의존성 그래프 재확인 (네트워크 최신화)
           ./mvnw -B -ntp -U help:effective-pom -DskipTests
 
       - name: Upgrade (Gradle deps via init script + versions report)
@@ -289,41 +308,33 @@ jobs:
         run: |
           set -Eeuo pipefail
           chmod +x ./gradlew || true
-          # 1) 리포트용 플러그인 (ben-manes.versions) 적용용 init script
           mkdir -p ~/.gradle/init.d
           cat > ~/.gradle/init.d/versionsReport.gradle <<'G'
           initscript {
             repositories { gradlePluginPortal(); mavenCentral() }
             dependencies { classpath "com.github.ben-manes:gradle-versions-plugin:0.51.0" }
           }
-          allprojects {
-            apply plugin: "com.github.ben-manes.versions"
-          }
+          allprojects { apply plugin: "com.github.ben-manes.versions" }
           G
-          # 2) 실제 업데이트용 플러그인 (use-latest-versions) 적용용 init script
           cat > ~/.gradle/init.d/useLatestVersions.gradle <<'G'
           initscript {
             repositories { gradlePluginPortal(); mavenCentral() }
             dependencies { classpath "se.patrikerdes:gradle-use-latest-versions-plugin:0.2.18" }
           }
-          allprojects {
-            apply plugin: "se.patrikerdes.use-latest-versions"
-          }
+          allprojects { apply plugin: "se.patrikerdes.use-latest-versions" }
           G
-          # 3) 현재 의존성 최신 버전 리포트 생성
           ./gradlew -I ~/.gradle/init.d/versionsReport.gradle dependencyUpdates -Drevision=release || true
-          # 4) 최신 버전으로 의존성 실제 업데이트 (가능 범위 내)
           ./gradlew -I ~/.gradle/init.d/useLatestVersions.gradle useLatestVersions || true
-          # 5) Gradle Wrapper 최신 안정 버전으로 시도(동 일 major 범위 권장; 실패 무시)
           ./gradlew wrapper || true
 
-      # ===================== BUILD (no skip) =====================
+      # 빌드(테스트 포함, 스킵 없음)
       - name: Build & Test (Maven, no-skip)
         if: ${{ matrix.build_tool == 'maven' }}
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
         run: |
           set -Eeuo pipefail
+          chmod +x ./mvnw || true
           ./mvnw -B -ntp clean verify
 
       - name: Build & Test (Gradle, no-skip)
@@ -335,7 +346,7 @@ jobs:
           chmod +x ./gradlew || true
           ./gradlew clean build
 
-      # ===================== RUN → HEALTHCHECK → STOP =====================
+      # 실행 → 헬스체크 → 종료 (절대경로 로그)
       - name: Run app and verify endpoint (absolute log path)
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
@@ -343,7 +354,6 @@ jobs:
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-
           PORT="8080"
           PATH_HEALTH="/hello"
           LOG_DIR_ABS="${GITHUB_WORKSPACE}/${LOG_DIR}"
@@ -394,7 +404,6 @@ jobs:
           echoe "Done. Tail of app log:"
           tail -n 120 "${LOG}" || true
 
-      # ===================== ARTIFACTS =====================
       - name: Upload artifacts (project, logs, reports)
         uses: actions/upload-artifact@v4
         with:
@@ -402,4 +411,4 @@ jobs:
           path: |
             ${{ steps.dl.outputs.prj }}/**
             .github/echo_logs/**
-            ${{ steps.dl.outputs.prj }}/build/reports/dependency-updates/**   # gradle report (if exists)
+            ${{ steps.dl.outputs.prj }}/build/reports/dependency-updates/**
