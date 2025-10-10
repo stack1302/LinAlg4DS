@@ -1,419 +1,285 @@
-name: "🚀 Spring Boot ALL-ECHO CI (Always-Download + Auto Bootstrap + Maven/Gradle + 5-min Cron + Docker)"
+name: "🌱 Spring Boot: Init + Build + Run(Test) (curl + echo, Maven/Gradle 선택)"
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-  schedule:
-    - cron: "*/5 * * * *"   # (UTC) 5분마다
   workflow_dispatch:
     inputs:
-      project_path:
-        description: "프로젝트 루트 경로"
-        required: true
-        default: "."
-      java_version:
-        description: "JDK version"
+      build_tool:
+        description: "빌드 도구 선택"
         type: choice
+        options: [maven, gradle]
+        default: maven
+      group_id:
+        description: "Group ID (예: com.example)"
+        default: "com.example"
         required: true
-        default: "21"
-        options: ["17", "21"]
-      build_tool_hint:
-        description: "강제 지정 (auto | maven | gradle)"
+      artifact_id:
+        description: "Artifact ID (예: demo)"
+        default: "demo"
         required: true
-        default: "auto"
-      must_downloads:
-        description: |
-          ✅ 필수 다운로드(줄바꿈 구분, 하나라도 실패 시 워크플로우 실패)
-          포맷: url=...,dest=...,sha256=<옵션>
-          (pom.xml/Dockerfile도 여기에 넣으세요)
-        required: false
-        default: ""
-      extra_downloads:
-        description: |
-          (선택) 추가 다운로드(줄바꿈 구분, 실패 시 해당 항목만 경고 후 계속)
-          포맷: url=...,dest=...,sha256=<옵션>
-        required: false
-        default: ""
-      auto_bootstrap:
-        description: "빌드 파일 없으면 Spring Boot 최소 프로젝트 자동 생성"
-        type: boolean
-        required: true
-        default: true
+      project_name:
+        description: "프로젝트 표시 이름"
+        default: "DemoProject"
+      boot_version:
+        description: "Spring Boot 버전 (예: 3.3.5)"
+        default: "3.3.5"
+      java_version:
+        description: "JDK 버전 (17 또는 21 권장)"
+        default: "17"
+      dependencies_csv:
+        description: "의존성 CSV (예: web,lombok,actuator)"
+        default: "web,lombok"
+      run_port:
+        description: "앱 실행 포트"
+        default: "8080"
+      run_path:
+        description: "헬스 체크 경로"
+        default: "/hello"
       skip_tests:
-        description: "Skip unit tests"
+        description: "빌드 시 테스트 스킵 여부"
         type: boolean
-        required: true
         default: false
-      build_docker:
-        description: "Build & push Docker image"
-        type: boolean
-        required: true
-        default: false
-      image_name:
-        description: "ghcr.io/<owner>/<repo> 또는 docker.io/<user>/<repo>"
-        required: false
-        default: ""
 
 permissions:
-  contents: write
-  packages: write
-  actions: read
-  id-token: write
+  contents: read
 
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
-  DOWNLOAD_DIR: .github/echo_downloads
-  DOCKER_LOG_DIR: .github/echo_logs/docker
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
-  ALLOW_DOMAINS_CSV: "github.com,raw.githubusercontent.com,repo1.maven.org,dlcdn.apache.org,ghcr.io,docker.io,storage.googleapis.com,start.spring.io,repo.spring.io,docs.spring.io"
 
 jobs:
-  build:
+  init-build-run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare echo helpers (no eval; safe args)
+      - name: Prepare echo helpers & folders
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${DOWNLOAD_DIR}" "${DOCKER_LOG_DIR}"
+          mkdir -p "${LOG_DIR}"
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "${LOG_DIR}"
-          SAFE_LOG="${LOG_DIR}/echo-$(date +%Y%m%d%H%M%S).log"
-
-          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
-          warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
-          fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
-          logf(){  printf '%s\n' "$*" | tee -a "${SAFE_LOG}"; }
-
-          # ✅ 핵심 수정: eval 제거, 인자 배열 그대로 실행
-          run_cmd(){
-            logf "▶ $*"
-            "$@" 2>&1 | tee -a "${SAFE_LOG}"
-            local rc=${PIPESTATUS[0]}
-            if [ $rc -eq 0 ]; then echoe "DONE ($rc)"; else warn "RC=$rc"; fi
-            return $rc
-          }
-
-          _host_from_url(){ printf '%s' "$1" | awk -F/ '{print $3}'; }
-
-          curl_get(){
-            # curl_get URL OUT [SHA256]
-            local url="$1" out="$2" want_sha="${3:-}" host allow ok="no"
-            host=$(_host_from_url "$url"); allow="${ALLOW_DOMAINS_CSV:-}"
-            if [ -n "$allow" ]; then
-              IFS=',' read -r -a A <<< "$allow"
-              for d in "${A[@]}"; do
-                d="${d## }"; d="${d%% }"
-                if [[ "$host" == "$d" || "$host" == *".$d" ]]; then ok="yes"; break; fi
-              done
-              if [ "$ok" != "yes" ]; then fail "BLOCKED DOMAIN: $host"; return 2; fi
-            fi
-            mkdir -p "$(dirname "$out")"
-            run_cmd curl -fSsvL --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 300 "$url" -o "$out"
-            if [ -n "$want_sha" ] && [ -f "$out" ]; then
-              local got; got=$(sha256sum "$out" | awk '{print $1}')
-              if [ "$got" != "$want_sha" ]; then fail "SHA256 mismatch $out"; return 3; else echoe "SHA256 OK: $out"; fi
-            fi
-          }
-
-          parse_kv_line(){
-            local line="$1"; p_url=""; p_dest=""; p_sha=""
-            IFS=',' read -r -a kvs <<< "$line"
-            for kv in "${kvs[@]}"; do
-              kv="${kv## }"; kv="${kv%% }"
-              k="${kv%%=*}"; v="${kv#*=}"
-              case "$k" in url) p_url="$v";; dest) p_dest="$v";; sha256) p_sha="$v";; esac
-            done
-          }
-
-          dl_list_from_file(){
-            local f="$1"
-            if [ -f "$f" ]; then
-              sed '/^$/d;/^[[:space:]]*#/d' "$f"
-            fi
-          }
+          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*"; }
+          warn(){  printf '%s %s\n' "$ECHO_WARN" "$*"; }
+          fail(){  printf '%s %s\n' "$ECHO_FAIL" "$*"; }
+          run_log(){ echo "▶ $*"; "$@"; }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready."
+          run_log uname -a
 
-      # ==== 항상 유효한 java-version 계산 ====
-      - name: Resolve Java version (always set)
-        id: vars
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.java_version }}" ]; then
-            JV="${{ inputs.java_version }}"
-          else
-            JV="21"
-          fi
-          echo "java=$JV" >> "$GITHUB_OUTPUT"
-          echoe "Resolved Java version: $JV"
-
-      # ==== 다운로드 단계 (항상 실행) ====
-      - name: Always-run downloads (must/extra/manifest)
-        id: downloads
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
+      - name: Install required packages (curl, unzip, jq)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
+          run_log sudo apt-get update -y
+          run_log sudo apt-get install -y curl unzip jq
 
-          MUST_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.must_downloads || '' }}"
-          if [ -n "$MUST_LIST" ]; then
-            echoe "Processing MUST downloads..."
-            printf '%s\n' "$MUST_LIST" | sed '/^$/d' | while IFS= read -r line; do
-              parse_kv_line "$line"
-              if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
-                fail "MUST: url/dest missing → $line"; exit 10
-              fi
-              curl_get "$p_url" "$p_dest" "$p_sha" || exit $?
-            done
-          else
-            warn "No MUST downloads provided (ok)."
-          fi
-
-          EXTRA_LIST="${{ github.event_name == 'workflow_dispatch' && inputs.extra_downloads || '' }}"
-          if [ -n "$EXTRA_LIST" ]; then
-            echoe "Processing EXTRA downloads..."
-            printf '%s\n' "$EXTRA_LIST" | sed '/^$/d' | while IFS= read -r line; do
-              parse_kv_line "$line"
-              if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
-                warn "EXTRA: url/dest missing → $line"; continue
-              fi
-              curl_get "$p_url" "$p_dest" "$p_sha" || warn "EXTRA failed → $line"
-            done
-          else
-            warn "No EXTRA downloads provided."
-          fi
-
-          if [ -f ".github/downloads.manifest" ]; then
-            echoe "Processing repository manifest: .github/downloads.manifest"
-            dl_list_from_file ".github/downloads.manifest" | while IFS= read -r line; do
-              parse_kv_line "$line"
-              if [ -z "$p_url" ] || [ -z "$p_dest" ]; then
-                fail "MANIFEST: url/dest missing → $line"; exit 20
-              fi
-              curl_get "$p_url" "$p_dest" "$p_sha" || exit $?
-            done
-          else
-            warn "No repository manifest found (.github/downloads.manifest)."
-          fi
-
-          echo "ok=true" >> "$GITHUB_OUTPUT"
-          echoe "Downloads phase completed."
-
-      # --- 1차 빌드도구 탐지 ---
-      - name: Detect build tool (pass 1)
-        id: detect1
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          HINT="${{ github.event_name == 'workflow_dispatch' && inputs.build_tool_hint || 'auto' }}"
-          if [ "$HINT" = "maven" ]; then BT="maven"
-          elif [ "$HINT" = "gradle" ]; then BT="gradle"
-          else
-            if [ -f "pom.xml" ] || ls -1 **/pom.xml >/dev/null 2>&1; then BT="maven"
-            elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || ls -1 **/build.gradle* >/dev/null 2>&1; then BT="gradle"
-            else BT="none"
-            fi
-          fi
-          echo "tool=$BT" >> "$GITHUB_OUTPUT"
-          echoe "Detected (pass1): $BT"
-
-      # --- 없으면 스프링부트 최소 프로젝트 자동 생성 ---
-      - name: Auto-bootstrap Spring Boot project if missing
-        if: ${{ steps.detect1.outputs.tool == 'none' }}
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          AB="true"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            AB="${{ inputs.auto_bootstrap && 'true' || 'false' }}"
-          fi
-          if [ "$AB" != "true" ]; then
-            warn "Auto-bootstrap disabled. Proceeding without project files."
-            exit 0
-          fi
-          echoe "Auto-bootstrap: generating minimal Spring Boot project (Maven)"
-          sudo apt-get update -y
-          sudo apt-get install -y unzip
-          START_VER="3.3.4"
-          JV="${{ steps.vars.outputs.java }}"
-          ZIP="starter.zip"
-          URL="https://start.spring.io/starter.zip?type=maven-project&language=java&bootVersion=${START_VER}&groupId=com.example&artifactId=demo&name=demo&packageName=com.example.demo&javaVersion=${JV}&dependencies=web"
-          curl_get "$URL" "$ZIP"
-          run_cmd unzip -o "$ZIP" -d .
-          rm -f "$ZIP"
-          [ -f "./mvnw" ] && run_cmd chmod +x ./mvnw || true
-          echoe "Bootstrap completed."
-
-      # --- 2차 빌드도구 재탐지 ---
-      - name: Detect build tool (pass 2)
-        id: detect2
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          if [ -f "pom.xml" ] || ls -1 **/pom.xml >/dev/null 2>&1; then BT="maven"
-          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ] || ls -1 **/build.gradle* >/dev/null 2>&1; then BT="gradle"
-          else BT="none"
-          fi
-          echo "tool=$BT" >> "$GITHUB_OUTPUT"
-          echoe "Detected (pass2): $BT"
-
-      # --- setup-java (항상 java-version 제공) ---
-      - name: Set up JDK (Maven cache)
-        if: ${{ steps.detect2.outputs.tool == 'maven' }}
+      - name: Setup Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ steps.vars.outputs.java }}
-          cache: maven
-          server-id: github
-          server-username: GITHUB_ACTOR
-          server-password: GITHUB_TOKEN
-          overwrite-settings: true
+          java-version: ${{ inputs.java_version }}
 
-      - name: Set up JDK (Gradle cache)
-        if: ${{ steps.detect2.outputs.tool == 'gradle' }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ steps.vars.outputs.java }}
-          cache: gradle
-          overwrite-settings: true
-
-      - name: Set up JDK (no cache)
-        if: ${{ steps.detect2.outputs.tool == 'none' }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: ${{ steps.vars.outputs.java }}
-          overwrite-settings: true
-
-      # --- Maven/Gradle 준비 ---
-      - name: Ensure Maven or Gradle available
-        id: toolprep
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          BT="${{ steps.detect2.outputs.tool }}"
-          if [ "$BT" = "maven" ]; then
-            if [ -x "./mvnw" ]; then echo "cmd=./mvnw" >> "$GITHUB_OUTPUT"; echoe "Using mvnw"
-            else
-              echo "cmd=mvn" >> "$GITHUB_OUTPUT"
-              echoe "Installing maven via apt"
-              run_cmd sudo apt-get update -y
-              run_cmd sudo apt-get install -y maven
-              run_cmd mvn -v
-            fi
-          elif [ "$BT" = "gradle" ]; then
-            if [ -x "./gradlew" ]; then echo "cmd=./gradlew" >> "$GITHUB_OUTPUT"; echoe "Using gradlew"
-            else
-              echo "cmd=gradle" >> "$GITHUB_OUTPUT"
-              echoe "Installing gradle via apt"
-              run_cmd sudo apt-get update -y
-              run_cmd sudo apt-get install -y gradle
-              run_cmd gradle -v
-            fi
-          else
-            warn "Still no build files; creating a minimal Maven dummy project."
-            sudo apt-get update -y
-            sudo apt-get install -y maven
-            run_cmd mvn -B -q -DgroupId=com.example -DartifactId=dummy -Dversion=0.0.1 -Dpackage=com.example.dummy -DarchetypeArtifactId=maven-archetype-quickstart -DinteractiveMode=false archetype:generate
-            echo "cmd=mvn" >> "$GITHUB_OUTPUT"
-            echoe "Fallback dummy project created at ./dummy"
-          fi
-
-      # --- Build ---
-      - name: Build (verify/package or gradle build)
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
+      # ========= Download Spring project via curl =========
+      - name: Download Spring Initializr ZIP (official, via curl)
+        id: dl
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          CMD="${{ steps.toolprep.outputs.cmd }}"
-          if [ ! -f "pom.xml" ] && [ ! -f "build.gradle" ] && [ ! -f "build.gradle.kts" ] && [ -d "dummy" ]; then
-            cd dummy
-          fi
-          if [ -f "pom.xml" ]; then
-            if [ "${{ github.event_name == 'workflow_dispatch' && inputs.skip_tests || false }}" = "true" ]; then
-              run_cmd "$CMD" -B -DskipTests package
-            else
-              run_cmd "$CMD" -B verify
-            fi
-          else
-            if [ "${{ github.event_name == 'workflow_dispatch' && inputs.skip_tests || false }}" = "true" ]; then
-              run_cmd "$CMD" build -x test
-            else
-              run_cmd "$CMD" build
-            fi
-          fi
+          PRJ_DIR="${{ inputs.artifact_id }}"
+          ZIP="${PRJ_DIR}.zip"
+          echoe "Downloading Spring Boot project from start.spring.io → ${ZIP}"
+          run_log curl -fSsvL --retry 3 --retry-all-errors \
+            -o "${ZIP}" \
+            https://start.spring.io/starter.zip \
+            -d type=${{ inputs.build_tool == 'gradle' && 'gradle-project' || 'maven-project' }} \
+            -d language=java \
+            -d bootVersion=${{ inputs.boot_version }} \
+            -d groupId=${{ inputs.group_id }} \
+            -d artifactId=${{ inputs.artifact_id }} \
+            -d name=${{ inputs.project_name }} \
+            -d packageName=${{ inputs.group_id }}.${{ inputs.artifact_id }} \
+            -d packaging=jar \
+            -d javaVersion=${{ inputs.java_version }} \
+            -d dependencies=${{ inputs.dependencies_csv }}
+          echo "zip=${ZIP}" >> $GITHUB_OUTPUT
+          echo "prj=${PRJ_DIR}" >> $GITHUB_OUTPUT
+          echoe "ZIP downloaded: ${ZIP}"
 
-      # --- Locate Artifact ---
-      - name: Locate JAR
-        id: findart
-        working-directory: ${{ github.event_name == 'workflow_dispatch' && inputs.project_path || '.' }}
+      - name: Unzip project
         shell: bash
         run: |
+          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          search_path="."
-          [ -d "dummy" ] && search_path="./dummy"
-          JAR=$(ls -1 ${search_path}/**/target/*.jar ${search_path}/**/build/libs/*.jar 2>/dev/null | head -n1 || true)
-          [ -z "$JAR" ] && fail "No JAR found" && exit 1
-          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
-          echoe "Found JAR: $JAR"
+          PRJ="${{ steps.dl.outputs.prj }}"
+          ZIP="${{ steps.dl.outputs.zip }}"
+          run_log unzip -q "${ZIP}"
+          test -d "${PRJ}" || (fail "Project dir not found: ${PRJ}" && exit 1)
+          echoe "Project dir ready: ${PRJ}"
+          ls -la "${PRJ}" | sed 's/^/  /'
 
-      - name: Upload JAR artifact
+      # ========= Add HelloController via echo / here-doc =========
+      - name: Generate sample HelloController (echo + here-doc, safe quoted)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          PRJ="${{ steps.dl.outputs.prj }}"
+          GROUP="${{ inputs.group_id }}"
+          ART="${{ inputs.artifact_id }}"
+          PKG_DIR="src/main/java/$(echo "${GROUP}" | tr '.' '/')/${ART}"
+          FILE="${PRJ}/${PKG_DIR}/HelloController.java"
+          run_log mkdir -p "${PRJ}/${PKG_DIR}"
+          cat > "${FILE}" <<'JAVA'
+          package __PKG__;
+
+          import org.springframework.web.bind.annotation.GetMapping;
+          import org.springframework.web.bind.annotation.RestController;
+
+          @RestController
+          public class HelloController {
+              @GetMapping("/hello")
+              public String hello() {
+                  return "Hello, Workflow! Spring Boot is running ✅";
+              }
+          }
+          JAVA
+          # replace package placeholder safely
+          sed -i "s#__PKG__#${GROUP}.${ART}#g" "${FILE}"
+          echoe "Created: ${FILE}"
+
+      # ========= Cache dependencies =========
+      - name: Cache Maven repo
+        if: ${{ inputs.build_tool == 'maven' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Cache Gradle
+        if: ${{ inputs.build_tool == 'gradle' }}
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ========= Build =========
+      - name: Build with Maven
+        if: ${{ inputs.build_tool == 'maven' }}
+        working-directory: ${{ steps.dl.outputs.prj }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          run_log chmod +x ./mvnw || true
+          if ${{ inputs.skip_tests }}; then
+            echoe "Skip tests: ON"
+            run_log ./mvnw -B -ntp clean package -DskipTests
+          else
+            echoe "Skip tests: OFF"
+            run_log ./mvnw -B -ntp clean verify
+          fi
+
+      - name: Build with Gradle
+        if: ${{ inputs.build_tool == 'gradle' }}
+        working-directory: ${{ steps.dl.outputs.prj }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          run_log chmod +x ./gradlew || true
+          if ${{ inputs.skip_tests }}; then
+            echoe "Skip tests: ON"
+            run_log ./gradlew build -x test
+          else
+            echoe "Skip tests: OFF"
+            run_log ./gradlew build
+          fi
+
+      # ========= Run app in background & health check =========
+      - name: Run app (background) and verify endpoint
+        working-directory: ${{ steps.dl.outputs.prj }}
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          PORT="${{ inputs.run_port }}"
+          PATH_HEALTH="${{ inputs.run_path }}"
+          LOG="../../${LOG_DIR}/app-run.log"
+
+          # Start
+          if [ "${{ inputs.build_tool }}" = "maven" ]; then
+            run_cmd="./mvnw -q -Dspring-boot.run.jvmArguments='-Dserver.port=${PORT}' spring-boot:run"
+          else
+            run_cmd="./gradlew -q bootRun -Pargs=--server.port=${PORT}"
+          fi
+
+          echoe "Starting app on port ${PORT}"
+          (nohup bash -lc "${run_cmd}" > "${LOG}" 2>&1 & echo $! > app.pid) || true
+          sleep 2
+          PID="$(cat app.pid || true)"
+          test -n "${PID}" || (fail "PID not captured" && exit 1)
+          echoe "App PID: ${PID} (logs → ${LOG})"
+
+          # Wait for readiness (max ~60s)
+          for i in $(seq 1 60); do
+            if curl -fsS "http://127.0.0.1:${PORT}${PATH_HEALTH}" >/dev/null 2>&1; then
+              echoe "Health OK: GET ${PATH_HEALTH}"
+              break
+            fi
+            sleep 1
+            if ! ps -p "${PID}" >/dev/null 2>&1; then
+              fail "Process exited early. See logs."
+              tail -n 200 "${LOG}" || true
+              exit 1
+            fi
+            if [ "$i" -eq 60 ]; then
+              fail "App not responding on ${PORT}${PATH_HEALTH} within 60s"
+              tail -n 200 "${LOG}" || true
+              exit 1
+            fi
+          done
+
+          # Print response
+          echoe "Requesting ${PATH_HEALTH}"
+          curl -fSsv "http://127.0.0.1:${PORT}${PATH_HEALTH}" || true
+
+          # Graceful stop
+          echoe "Stopping app PID=${PID}"
+          kill "${PID}" || true
+          for j in $(seq 1 15); do
+            if ps -p "${PID}" >/dev/null 2>&1; then
+              sleep 1
+              [ "$j" -ge 15 ] && break
+            else
+              break
+            fi
+          done
+          ps -p "${PID}" >/dev/null 2>&1 && (warn "Force kill" && kill -9 "${PID}" || true)
+
+          echoe "Done. Tail of app log:"
+          tail -n 120 "${LOG}" || true
+
+      - name: Upload logs
         uses: actions/upload-artifact@v4
         with:
-          name: spring-boot-jar
-          path: ${{ steps.findart.outputs.jar }}
-          if-no-files-found: error
-          retention-days: 10
-
-      # --- Optional Docker ---
-      - name: Login GHCR
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_docker && startsWith(inputs.image_name, 'ghcr.io/') }}
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login Docker Hub
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_docker && startsWith(inputs.image_name, 'docker.io/') }}
-        uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build & Push Image
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_docker && inputs.image_name != '' }}
-        working-directory: ${{ inputs.project_path }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          TAG="${{ inputs.image_name }}:$(date +%Y%m%d%H%M%S)"
-          echoe "Building image: $TAG"
-          run_cmd docker build -t "$TAG" .
-          run_cmd docker push "$TAG"
-          echoe "Pushed: $TAG"
+          name: spring-logs
+          path: |
+            .github/echo_logs/**
