@@ -1,21 +1,14 @@
-name: "🌱 Spring Boot: Init + Build + Run (curl+echo, Robust Download, baseDir, Fixed Logs)"
+name: "🌱 Spring Boot: Init + Upgrade + Build + Run (Maven & Gradle, no-skip)"
 
 on:
   workflow_dispatch:
     inputs:
-      build_tool:
-        description: "빌드 도구 선택"
-        type: choice
-        options: [maven, gradle]
-        default: maven
       group_id:
-        description: "Group ID (예: com.example)"
+        description: "Group ID"
         default: "com.example"
-        required: true
       artifact_id:
-        description: "Artifact ID (예: demo)"
+        description: "Base Artifact ID (각 빌드툴별 접미사 자동 부여)"
         default: "demo"
-        required: true
       project_name:
         description: "프로젝트 표시 이름"
         default: "DemoProject"
@@ -23,21 +16,11 @@ on:
         description: "Spring Boot 버전 (예: 3.3.5)"
         default: "3.3.5"
       java_version:
-        description: "JDK 버전 (17 또는 21 권장)"
+        description: "JDK 버전"
         default: "17"
       dependencies_csv:
         description: "의존성 CSV (예: web,lombok,actuator)"
         default: "web,lombok"
-      run_port:
-        description: "앱 실행 포트"
-        default: "8080"
-      run_path:
-        description: "헬스 체크 경로"
-        default: "/hello"
-      skip_tests:
-        description: "빌드 시 테스트 스킵 여부"
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -50,8 +33,13 @@ env:
   ECHO_FAIL: "❌"
 
 jobs:
-  init-build-run:
+  init-upgrade-build-run:
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        build_tool: [maven, gradle]
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -83,25 +71,27 @@ jobs:
           run_log sudo apt-get update -y
           run_log sudo apt-get install -y curl unzip jq
 
-      - name: Setup Java
+      - name: Setup Java (enable Maven cache)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: ${{ inputs.java_version }}
+          cache: maven
 
-      # ===== 강인한 Initializr 다운로드 (GET → POST → 공식 미러), baseDir 보장 =====
-      - name: Download Spring Initializr ZIP (robust:GET → POST → mirror) + baseDir
+      # ===================== Robust Initializr Download (+baseDir) =====================
+      - name: Download Spring Initializr ZIP (robust) + baseDir
         id: dl
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
 
-          BUILD="${{ inputs.build_tool }}"
+          BUILD="${{ matrix.build_tool }}"
           TYPE="$([ "${BUILD}" = "gradle" ] && echo gradle-project || echo maven-project)"
           GROUP="${{ inputs.group_id }}"
-          ART="${{ inputs.artifact_id }}"
-          NAME="${{ inputs.project_name }}"
+          BASE_ART="${{ inputs.artifact_id }}"
+          ART="$([ "${BUILD}" = "gradle" ] && echo "${BASE_ART}-gradle" || echo "${BASE_ART}-mvn")"
+          NAME="${{ inputs.project_name }} ($BUILD)"
           BOOT="${{ inputs.boot_version }}"
           JVER="${{ inputs.java_version }}"
           DEPS="${{ inputs.dependencies_csv }}"
@@ -131,7 +121,6 @@ jobs:
               "${HEADERS[@]}" -G "${base}/starter.zip" \
               "${FORM_COMMON[@]}" -o "${ZIP}"
           }
-
           try_post() {
             local base="$1"
             echoe "POST form to ${base}/starter.zip"
@@ -150,17 +139,10 @@ jobs:
               -d "baseDir=${ART}" \
               -o "${ZIP}"
           }
-
-          verify_zip() {
-            if ! unzip -t "${ZIP}" >/dev/null 2>&1; then
-              warn "ZIP integrity check failed (maybe HTML/JSON error)."
-              return 1
-            fi
-            return 0
-          }
+          verify_zip() { unzip -t "${ZIP}" >/dev/null 2>&1; }
 
           BASE1="https://start.spring.io"
-          BASE2="https://start.springboot.io"  # 공식 미러
+          BASE2="https://start.springboot.io"
 
           if try_get "${BASE1}" && verify_zip; then
             echoe "Downloaded via GET from ${BASE1}"
@@ -180,141 +162,195 @@ jobs:
 
           echo "zip=${ZIP}" >> $GITHUB_OUTPUT
           echo "prj=${PRJ_DIR}" >> $GITHUB_OUTPUT
+          echo "group=${GROUP}" >> $GITHUB_OUTPUT
+          echo "artifact=${ART}" >> $GITHUB_OUTPUT
 
-      - name: Save downloaded zip as artifact (for traceability)
+      - name: Save downloaded zip as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: spring-initializr-zip
+          name: spring-initializr-zip-${{ matrix.build_tool }}
           path: ${{ steps.dl.outputs.zip }}
 
-      # ===== Unzip + 보정(최상위 디렉터리 보장 및 과거 루트 산포 복구) =====
-      - name: Unzip project (with baseDir guarantee + auto-reconstruct)
+      - name: Unzip project (baseDir guarantee + auto-reconstruct)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           PRJ="${{ steps.dl.outputs.prj }}"
           ZIP="${{ steps.dl.outputs.zip }}"
-
           run_log unzip -q "${ZIP}"
-
           if [ ! -d "${PRJ}" ]; then
             warn "No base directory '${PRJ}' found. Reconstructing..."
             mkdir -p "${PRJ}"
             for f in pom.xml mvnw mvnw.cmd build.gradle build.gradle.kts gradlew gradlew.bat settings.gradle settings.gradle.kts src; do
-              if [ -e "$f" ]; then
-                mv "$f" "${PRJ}/" || true
-              fi
+              [ -e "$f" ] && mv "$f" "${PRJ}/" || true
             done
             [ "$(ls -A "${PRJ}" | wc -l)" -gt 0 ] || (fail "Reconstruction failed: ${PRJ} is empty" && exit 1)
             echoe "Reconstructed project dir: ${PRJ}"
           fi
-
           echoe "Project dir ready: ${PRJ}"
           ls -la "${PRJ}" | sed 's/^/  /'
 
-      # ===== 샘플 컨트롤러 생성 (안전 인용) =====
-      - name: Generate HelloController (echo + here-doc, safe quoted)
+      # ===================== Sample Controller (echo + here-doc) =====================
+      - name: Generate HelloController
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           PRJ="${{ steps.dl.outputs.prj }}"
-          GROUP="${{ inputs.group_id }}"
-          ART="${{ inputs.artifact_id }}"
+          GROUP="${{ steps.dl.outputs.group }}"
+          ART="${{ steps.dl.outputs.artifact }}"
           PKG_DIR="src/main/java/$(echo "${GROUP}" | tr '.' '/')/${ART}"
           FILE="${PRJ}/${PKG_DIR}/HelloController.java"
           run_log mkdir -p "${PRJ}/${PKG_DIR}"
           cat > "${FILE}" <<'JAVA'
           package __PKG__;
-
           import org.springframework.web.bind.annotation.GetMapping;
           import org.springframework.web.bind.annotation.RestController;
-
           @RestController
           public class HelloController {
               @GetMapping("/hello")
-              public String hello() {
-                  return "Hello, Workflow! Spring Boot is running ✅";
-              }
+              public String hello() { return "Hello, Workflow! Spring Boot is running ✅"; }
           }
           JAVA
           sed -i "s#__PKG__#${GROUP}.${ART}#g" "${FILE}"
           echoe "Created: ${FILE}"
 
-      # ===== 캐시 =====
-      - name: Cache Maven repo
-        if: ${{ inputs.build_tool == 'maven' }}
+      # ===================== CACHES (both) + Prefetch =====================
+      - name: Cache Maven repo (multi-key)
+        if: ${{ matrix.build_tool == 'maven' }}
+        id: cache-maven
         uses: actions/cache@v4
         with:
           path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          key: |
+            ${{ runner.os }}-maven-java${{ inputs.java_version }}-boot${{ inputs.boot_version }}-${{ hashFiles(format('{0}/pom.xml', steps.dl.outputs.prj)) }}
           restore-keys: |
+            ${{ runner.os }}-maven-java${{ inputs.java_version }}-boot${{ inputs.boot_version }}-
+            ${{ runner.os }}-maven-java${{ inputs.java_version }}-
             ${{ runner.os }}-maven-
+          save-always: true
 
-      - name: Cache Gradle
-        if: ${{ inputs.build_tool == 'gradle' }}
+      - name: Cache Gradle (caches + wrapper + project .gradle)
+        if: ${{ matrix.build_tool == 'gradle' }}
+        id: cache-gradle
         uses: actions/cache@v4
         with:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+            ${{ steps.dl.outputs.prj }}/.gradle
+          key: |
+            ${{ runner.os }}-gradle-java${{ inputs.java_version }}-boot${{ inputs.boot_version }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
+            ${{ runner.os }}-gradle-java${{ inputs.java_version }}-boot${{ inputs.boot_version }}-
+            ${{ runner.os }}-gradle-java${{ inputs.java_version }}-
             ${{ runner.os }}-gradle-
+          save-always: true
 
-      # ===== 빌드 =====
-      - name: Build with Maven
-        if: ${{ inputs.build_tool == 'maven' }}
+      - name: Prefetch dependencies (Maven go-offline)
+        if: ${{ matrix.build_tool == 'maven' }}
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          run_log chmod +x ./mvnw || true
-          if ${{ inputs.skip_tests }}; then
-            echoe "Skip tests: ON"
-            run_log ./mvnw -B -ntp clean package -DskipTests
-          else
-            echoe "Skip tests: OFF"
-            run_log ./mvnw -B -ntp clean verify
-          fi
+          ./mvnw -B -ntp -DskipTests dependency:go-offline
 
-      - name: Build with Gradle
-        if: ${{ inputs.build_tool == 'gradle' }}
+      - name: Prefetch dependencies (Gradle)
+        if: ${{ matrix.build_tool == 'gradle' }}
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          run_log chmod +x ./gradlew || true
-          if ${{ inputs.skip_tests }}; then
-            echoe "Skip tests: ON"
-            run_log ./gradlew build -x test
-          else
-            echoe "Skip tests: OFF"
-            run_log ./gradlew build
-          fi
+          chmod +x ./gradlew || true
+          ./gradlew -q dependencies || true
 
-      # ===== 실행 + 헬스체크 + 종료 (절대경로 로그 + 디렉터리 보장) =====
-      - name: Run app (background) and verify endpoint (absolute log path)
+      # ===================== UPGRADE (Maven / Gradle) =====================
+      - name: Upgrade (Maven dependencies & parent/BOM)
+        if: ${{ matrix.build_tool == 'maven' }}
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
-        timeout-minutes: 6
+        run: |
+          set -Eeuo pipefail
+          chmod +x ./mvnw || true
+          # 최신 릴리스 사용 (스냅샷 제외, 백업 POM 미생성)
+          ./mvnw -B -ntp versions:use-latest-releases -DallowSnapshots=false -DgenerateBackupPoms=false
+          # 부모(spring-boot-starter-parent) 업데이트
+          ./mvnw -B -ntp versions:update-parent -DallowSnapshots=false -DgenerateBackupPoms=false || true
+          # BOM/프로퍼티 최신화
+          ./mvnw -B -ntp versions:update-properties -DallowSnapshots=false -DgenerateBackupPoms=false || true
+          # 의존성 그래프 재확인 (네트워크 최신화)
+          ./mvnw -B -ntp -U help:effective-pom -DskipTests
+
+      - name: Upgrade (Gradle deps via init script + versions report)
+        if: ${{ matrix.build_tool == 'gradle' }}
+        working-directory: ${{ steps.dl.outputs.prj }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          chmod +x ./gradlew || true
+          # 1) 리포트용 플러그인 (ben-manes.versions) 적용용 init script
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/versionsReport.gradle <<'G'
+          initscript {
+            repositories { gradlePluginPortal(); mavenCentral() }
+            dependencies { classpath "com.github.ben-manes:gradle-versions-plugin:0.51.0" }
+          }
+          allprojects {
+            apply plugin: "com.github.ben-manes.versions"
+          }
+          G
+          # 2) 실제 업데이트용 플러그인 (use-latest-versions) 적용용 init script
+          cat > ~/.gradle/init.d/useLatestVersions.gradle <<'G'
+          initscript {
+            repositories { gradlePluginPortal(); mavenCentral() }
+            dependencies { classpath "se.patrikerdes:gradle-use-latest-versions-plugin:0.2.18" }
+          }
+          allprojects {
+            apply plugin: "se.patrikerdes.use-latest-versions"
+          }
+          G
+          # 3) 현재 의존성 최신 버전 리포트 생성
+          ./gradlew -I ~/.gradle/init.d/versionsReport.gradle dependencyUpdates -Drevision=release || true
+          # 4) 최신 버전으로 의존성 실제 업데이트 (가능 범위 내)
+          ./gradlew -I ~/.gradle/init.d/useLatestVersions.gradle useLatestVersions || true
+          # 5) Gradle Wrapper 최신 안정 버전으로 시도(동 일 major 범위 권장; 실패 무시)
+          ./gradlew wrapper || true
+
+      # ===================== BUILD (no skip) =====================
+      - name: Build & Test (Maven, no-skip)
+        if: ${{ matrix.build_tool == 'maven' }}
+        working-directory: ${{ steps.dl.outputs.prj }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ./mvnw -B -ntp clean verify
+
+      - name: Build & Test (Gradle, no-skip)
+        if: ${{ matrix.build_tool == 'gradle' }}
+        working-directory: ${{ steps.dl.outputs.prj }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          chmod +x ./gradlew || true
+          ./gradlew clean build
+
+      # ===================== RUN → HEALTHCHECK → STOP =====================
+      - name: Run app and verify endpoint (absolute log path)
+        working-directory: ${{ steps.dl.outputs.prj }}
+        shell: bash
+        timeout-minutes: 8
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
 
-          PORT="${{ inputs.run_port }}"
-          PATH_HEALTH="${{ inputs.run_path }}"
-
-          # 절대 경로 로그 (작업 디렉터리와 무관)
+          PORT="8080"
+          PATH_HEALTH="/hello"
           LOG_DIR_ABS="${GITHUB_WORKSPACE}/${LOG_DIR}"
           mkdir -p "${LOG_DIR_ABS}"
-          LOG="${LOG_DIR_ABS}/app-run.log"
+          LOG="${LOG_DIR_ABS}/app-run-${{ matrix.build_tool }}.log"
 
-          # 실행 커맨드 구성
-          if [ "${{ inputs.build_tool }}" = "maven" ]; then
+          if [ "${{ matrix.build_tool }}" = "maven" ]; then
             run_cmd="./mvnw -q -Dspring-boot.run.jvmArguments='-Dserver.port=${PORT}' spring-boot:run"
           else
             run_cmd="./gradlew -q bootRun -Pargs=--server.port=${PORT}"
@@ -327,7 +363,6 @@ jobs:
           test -n "${PID}" || (fail "PID not captured" && tail -n +1 "${LOG}" || true && exit 1)
           echoe "App PID: ${PID}"
 
-          # 최대 90초까지 헬스체크 (초기 의존성 다운로드 지연 대비)
           for i in $(seq 1 90); do
             if curl -fsS "http://127.0.0.1:${PORT}${PATH_HEALTH}" >/dev/null 2>&1; then
               echoe "Health OK: GET ${PATH_HEALTH}"
@@ -359,10 +394,12 @@ jobs:
           echoe "Done. Tail of app log:"
           tail -n 120 "${LOG}" || true
 
-      - name: Upload project & logs
+      # ===================== ARTIFACTS =====================
+      - name: Upload artifacts (project, logs, reports)
         uses: actions/upload-artifact@v4
         with:
-          name: spring-project-and-logs
+          name: spring-out-${{ matrix.build_tool }}
           path: |
             ${{ steps.dl.outputs.prj }}/**
             .github/echo_logs/**
+            ${{ steps.dl.outputs.prj }}/build/reports/dependency-updates/**   # gradle report (if exists)
