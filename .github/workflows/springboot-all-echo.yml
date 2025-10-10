@@ -1,4 +1,4 @@
-name: "🌱 Spring Boot: Init + Build + Run(Test) (curl + echo, Maven/Gradle 선택)"
+name: "🌱 Spring Boot: Init + Build + Run (curl+echo, Robust Download, baseDir)"
 
 on:
   workflow_dispatch:
@@ -89,8 +89,8 @@ jobs:
           distribution: temurin
           java-version: ${{ inputs.java_version }}
 
-      # ========== FIXED: robust Initializr download with GET + fallback ==========
-      - name: Download Spring Initializr ZIP (robust:GET → POST → mirror)
+      # ===== 강인한 Initializr 다운로드 (GET → POST → 공식 미러), baseDir 보장 =====
+      - name: Download Spring Initializr ZIP (robust:GET → POST → mirror) + baseDir
         id: dl
         shell: bash
         run: |
@@ -121,12 +121,12 @@ jobs:
             --data-urlencode "packaging=jar"
             --data-urlencode "javaVersion=${JVER}"
             --data-urlencode "dependencies=${DEPS}"
+            --data-urlencode "baseDir=${ART}"
           )
 
           try_get() {
             local base="$1"
             echoe "GET from ${base}/starter.zip"
-            # IPv4 강제(-4), GET(-G) + URL 인코딩, 재시도 강화
             curl -4 -fSsvL --retry 5 --retry-all-errors --retry-delay 2 \
               "${HEADERS[@]}" -G "${base}/starter.zip" \
               "${FORM_COMMON[@]}" -o "${ZIP}"
@@ -135,7 +135,6 @@ jobs:
           try_post() {
             local base="$1"
             echoe "POST form to ${base}/starter.zip"
-            # 폼 POST (application/x-www-form-urlencoded)
             curl -4 -fSsvL --retry 5 --retry-all-errors --retry-delay 2 \
               "${HEADERS[@]}" "${base}/starter.zip" \
               -d "type=${TYPE}" \
@@ -148,11 +147,11 @@ jobs:
               -d "packaging=jar" \
               -d "javaVersion=${JVER}" \
               -d "dependencies=${DEPS}" \
+              -d "baseDir=${ART}" \
               -o "${ZIP}"
           }
 
           verify_zip() {
-            # ZIP 무결성/유효성 확인 (깨진 JSON/HTML 응답 걸러내기)
             if ! unzip -t "${ZIP}" >/dev/null 2>&1; then
               warn "ZIP integrity check failed (maybe HTML/JSON error)."
               return 1
@@ -163,16 +162,12 @@ jobs:
           BASE1="https://start.spring.io"
           BASE2="https://start.springboot.io"  # 공식 미러
 
-          # 1) GET (공식)
           if try_get "${BASE1}" && verify_zip; then
             echoe "Downloaded via GET from ${BASE1}"
-          # 2) POST (공식)
           elif try_post "${BASE1}" && verify_zip; then
             echoe "Downloaded via POST from ${BASE1}"
-          # 3) GET (미러)
           elif try_get "${BASE2}" && verify_zip; then
             echoe "Downloaded via GET from mirror ${BASE2}"
-          # 4) POST (미러)
           elif try_post "${BASE2}" && verify_zip; then
             echoe "Downloaded via POST from mirror ${BASE2}"
           else
@@ -186,19 +181,40 @@ jobs:
           echo "zip=${ZIP}" >> $GITHUB_OUTPUT
           echo "prj=${PRJ_DIR}" >> $GITHUB_OUTPUT
 
-      - name: Unzip project
+      - name: Save downloaded zip as artifact (for traceability)
+        uses: actions/upload-artifact@v4
+        with:
+          name: spring-initializr-zip
+          path: ${{ steps.dl.outputs.zip }}
+
+      # ===== Unzip + 보정(최상위 디렉터리 보장 및 과거 루트 산포 복구) =====
+      - name: Unzip project (with baseDir guarantee + auto-reconstruct)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           PRJ="${{ steps.dl.outputs.prj }}"
           ZIP="${{ steps.dl.outputs.zip }}"
+
           run_log unzip -q "${ZIP}"
-          test -d "${PRJ}" || (fail "Project dir not found: ${PRJ}" && exit 1)
+
+          if [ ! -d "${PRJ}" ]; then
+            warn "No base directory '${PRJ}' found. Reconstructing..."
+            mkdir -p "${PRJ}"
+            for f in pom.xml mvnw mvnw.cmd build.gradle build.gradle.kts gradlew gradlew.bat settings.gradle settings.gradle.kts src; do
+              if [ -e "$f" ]; then
+                mv "$f" "${PRJ}/" || true
+              fi
+            done
+            [ "$(ls -A "${PRJ}" | wc -l)" -gt 0 ] || (fail "Reconstruction failed: ${PRJ} is empty" && exit 1)
+            echoe "Reconstructed project dir: ${PRJ}"
+          fi
+
           echoe "Project dir ready: ${PRJ}"
           ls -la "${PRJ}" | sed 's/^/  /'
 
-      - name: Generate sample HelloController (echo + here-doc, safe quoted)
+      # ===== 샘플 컨트롤러 생성 (안전 인용) =====
+      - name: Generate HelloController (echo + here-doc, safe quoted)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -226,6 +242,7 @@ jobs:
           sed -i "s#__PKG__#${GROUP}.${ART}#g" "${FILE}"
           echoe "Created: ${FILE}"
 
+      # ===== 캐시 =====
       - name: Cache Maven repo
         if: ${{ inputs.build_tool == 'maven' }}
         uses: actions/cache@v4
@@ -246,6 +263,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-gradle-
 
+      # ===== 빌드 =====
       - name: Build with Maven
         if: ${{ inputs.build_tool == 'maven' }}
         working-directory: ${{ steps.dl.outputs.prj }}
@@ -278,6 +296,7 @@ jobs:
             run_log ./gradlew build
           fi
 
+      # ===== 실행 + 헬스체크 + 종료 =====
       - name: Run app (background) and verify endpoint
         working-directory: ${{ steps.dl.outputs.prj }}
         shell: bash
@@ -329,8 +348,10 @@ jobs:
           echoe "Done. Tail of app log:"
           tail -n 120 "${LOG}" || true
 
-      - name: Upload logs
+      - name: Upload project & logs
         uses: actions/upload-artifact@v4
         with:
-          name: spring-logs
-          path: .github/echo_logs/**
+          name: spring-project-and-logs
+          path: |
+            ${{ steps.dl.outputs.prj }}/**
+            .github/echo_logs/**
