@@ -90,7 +90,7 @@ jobs:
           java-version: ${{ inputs.java_version }}
 
       # ========== FIXED: robust Initializr download with GET + fallback ==========
-      - name: Download Spring Initializr ZIP (robust: GET → POST → mirror)
+      - name: Download Spring Initializr ZIP (robust:GET → POST → mirror)
         id: dl
         shell: bash
         run: |
