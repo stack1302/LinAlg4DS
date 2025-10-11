@@ -1,0 +1,1 @@
+✅ ▶ rsync -a --relative ".github/echo_logs" ".github/artifacts/gather/" || true

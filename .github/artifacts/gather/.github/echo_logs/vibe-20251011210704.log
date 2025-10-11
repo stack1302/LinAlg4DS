@@ -1,0 +1,4 @@
+✅ ▶ . .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+✅ ▶ curl -fsSL http://127.0.0.1:8000/health | tee .github/echo_logs/health.json
+✅ ▶ lsof -ti:8000 | xargs -r kill
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

@@ -1,3 +1,10 @@
+You are now connected to database "vibe_db" as user "postgres".
+         List of relations
+ Schema | Name  | Type  |  Owner   
+--------+-------+-------+----------
+ public | items | table | postgres
+(1 row)
+
  item_cnt 
 ----------
         2
