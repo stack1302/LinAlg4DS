@@ -145,11 +145,9 @@ def categorize(desc: str) -> str:
     if "the ki" in d:    return "GOOGLE *THE KI"
     return "기타"
 
-# 입력 CSV가 있으면 우선
 use_csv = Path(TX_CSV_CLI).is_file()
 if use_csv:
     df = pd.read_csv(TX_CSV_CLI)
-    # 최소 컬럼 존재 확인
     assert {"거래일자","거래시간","출금(원)","내용","잔액(원)"} <= set(df.columns), "CSV 컬럼명 불일치"
 else:
     df = pd.DataFrame(ROWS, columns=COLS)
@@ -157,7 +155,7 @@ else:
 df["출금"] = df["출금(원)"].map(kr_to_int)
 df["입금"] = df.get("입금(원)", 0)
 if not pd.api.types.is_integer_dtype(df["입금"]):
-    df["입금"] = df["입금"].apply(kr_to_int)  # 있을 경우
+    df["입금"] = df["입금"].apply(kr_to_int)
 
 df["잔액"] = df["잔액(원)"].map(kr_to_int)
 df["일시"] = pd.to_datetime(df["거래일자"] + " " + df["거래시간"])
@@ -165,11 +163,10 @@ df["카테고리"] = df["내용"].map(categorize)
 
 total_out = int(df["출금"].sum())
 n_tx = int((df["출금"] > 0).sum())
-by_cat = (df.groupby("카테고리", as_index=False)["출금"]
-          .sum().sort_values("출금", ascending=False))
+by_cat = df.groupby("카테고리", as_index=False)["출금"].sum().sort_values("출금", ascending=False)
 
 out_dir = Path("out"); out_dir.mkdir(parents=True, exist_ok=True)
-df.sort_values("일시").to_csv(out_dir / "transactions_clean.csv", index=False, encoding="utf-8-sig")
+(df.sort_values("일시")).to_csv(out_dir / "transactions_clean.csv", index=False, encoding="utf-8-sig")
 
 with pd.ExcelWriter(out_dir / "bank_statement_summary.xlsx", engine="xlsxwriter",
                     datetime_format="yyyy-mm-dd HH:MM:SS") as xl:
@@ -188,7 +185,6 @@ print(f"- 거래 건수: {n_tx}건")
 print("\n[카테고리별 합계]")
 for _, r in by_cat.iterrows():
     print(f"  • {r['카테고리']}: {int(r['출금']):,}원")
-
 PY
             chmod +x make_statement.py
           fi
@@ -232,26 +228,20 @@ PY
           set -Eeuo pipefail
           DOCS_INPUT="${{ github.event.inputs.docs_glob || 'docs/**' }}"
           echo "Docs glob: $DOCS_INPUT" | tee -a "$LOG_DIR/flow.log"
-
-          # 쉼표로 여러 패턴 지원
           IFS=',' read -r -a GLOBS <<< "$DOCS_INPUT"
           DOC_COUNT=0
+          shopt -s nullglob
           for g in "${GLOBS[@]}"; do
-            # glob 공백 제거
             g_trim="$(echo "$g" | sed 's/^ *//;s/ *$//')"
-            # 매칭 파일 반복
-            shopt -s nullglob
             for f in $g_trim; do
-              # out/docs/ 경로로 복사 (디렉터리 구조 유지 없이 파일만)
               mkdir -p "$OUT_DIR/docs"
               base="$(basename "$f")"
               cp "$f" "$OUT_DIR/docs/$base"
               echo "${ECHO_OK} Attached doc: $f → $OUT_DIR/docs/$base" | tee -a "$LOG_DIR/flow.log"
               DOC_COUNT=$((DOC_COUNT+1))
             done
-            shopt -u nullglob
           done
-
+          shopt -u nullglob
           if [ "$DOC_COUNT" -eq 0 ]; then
             echo "${ECHO_WARN} No docs matched pattern(s): $DOCS_INPUT" | tee -a "$LOG_DIR/flow.log"
           else
