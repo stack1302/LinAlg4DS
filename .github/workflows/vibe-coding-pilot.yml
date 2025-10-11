@@ -1,4 +1,4 @@
-name: "🎧 Vibe Coding Pilot — MUST Create + Perm/Server + Bulk Modify + Safe-Continue + Always-Success"
+name: "🎧 Vibe Coding Pilot — MUST Create + Perm/Server + Bulk Modify + Safe-Continue + Always-Success (≤10 inputs)"
 
 on:
   workflow_dispatch:
@@ -13,49 +13,33 @@ on:
       run_docs:
         type: boolean
         default: true
-      dirs_root:
-        default: ".github/echo_dirs"
-      dirs_count:
-        default: "50"
-      files_root:
-        default: ".github/echo_files"
-      files_count:
-        default: "80"
       install_servers:
         description: "Nginx/Apache/Redis/PostgreSQL 설치·기동 시도(실패해도 통과)"
         type: boolean
         default: true
-      # ----- 대량 수정 옵션 -----
-      bulk_globs:
-        description: "대량 수정 대상 글롭(공백 구분)"
-        default: ".github/echo_files/*.txt docs/**/*.md README.md"
-      replace_from:
-        description: "치환: FROM (비워두면 미실행)"
-        default: "echo-file"
-      replace_to:
-        description: "치환: TO (비워두면 미실행)"
-        default: "vibe-file"
-      append_line:
-        description: "각 파일 끝에 추가할 라인"
-        default: "# appended-by-workflow"
-      rename_prefix:
-        description: "파일명 접두사(빈 문자열이면 미적용)"
-        default: "bulk_"
-      rename_suffix:
-        description: "파일명 접미사(확장자 앞)"
-        default: ""
-      duplicate_copies:
-        description: "각 파일 복제본 개수(0이면 미복제)"
-        default: "2"
-      chmod_mode:
-        description: "일괄 chmod 모드(예: 644, 디렉토리엔 755 적용)"
-        default: "644"
       auto_commit:
         type: boolean
         default: false
       force_success_message:
         type: boolean
         default: true
+      creation_scale:
+        description: "대량 생성 규모"
+        type: choice
+        default: "medium"
+        options: ["small", "medium", "large", "xlarge"]
+      bulk_enable:
+        description: "대량 수정(치환/추가/리네임/복제) 실행"
+        type: boolean
+        default: true
+      bulk_profile:
+        description: "대량 수정 프로필"
+        type: choice
+        default: "basic"
+        options: ["basic", "docs-only", "aggressive"]
+      chmod_mode:
+        description: "파일 chmod (디렉토리는 755 고정)"
+        default: "644"
 
 permissions:
   contents: write
@@ -66,6 +50,8 @@ env:
   LOG_DIR: .github/echo_logs
   ARTIFACT_DIR: .github/artifacts
   GATHER_DIR: .github/artifacts/gather
+  DIRS_ROOT: .github/echo_dirs
+  FILES_ROOT: .github/echo_files
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
@@ -95,18 +81,8 @@ jobs:
           warne(){ printf '%s %s\n' "$ECHO_WARN" "$*" | tee -a "$LOG_FILE"; }
           faile(){ printf '%s %s (rc=%s)\n' "$ECHO_FAIL" "$1" "${2:-1}" | tee -a "$LOG_FILE"; }
           inc_fail(){ n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
-          safe_run(){
-            local cmd="$*"
-            echoe "▶ ${cmd}"
-            bash -lc "$cmd"
-            local rc=$?
-            if [ $rc -ne 0 ]; then faile "FAILED: $cmd" $rc; inc_fail; fi
-            return 0
-          }
-          summarize(){
-            local n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
-            echoe "단계 완료 (실패 ${n}건 기록, 파이프라인 계속 진행)."
-          }
+          safe_run(){ local cmd="$*"; echoe "▶ ${cmd}"; bash -lc "$cmd"; local rc=$?; if [ $rc -ne 0 ]; then faile "FAILED: $cmd" $rc; inc_fail; fi; return 0; }
+          summarize(){ local n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); echoe "단계 완료 (실패 ${n}건 기록, 파이프라인 계속 진행)."; }
           SH
           chmod +x /tmp/safe_run.sh
           echo "ok=1" >> "$GITHUB_OUTPUT"
@@ -126,14 +102,27 @@ jobs:
           safe_run "chmod -R u+rwX,go+rX \"$WS\" || true"
           summarize
 
+      # ---------- 생성 규모 매핑 ----------
+      - name: Derive creation scale
+        id: scale
+        shell: bash
+        continue-on-error: true
+        run: |
+          case "${{ inputs.creation_scale }}" in
+            small)  echo "DIRS=25"  >> $GITHUB_OUTPUT; echo "FILES=30"  >> $GITHUB_OUTPUT ;;
+            medium) echo "DIRS=50"  >> $GITHUB_OUTPUT; echo "FILES=80"  >> $GITHUB_OUTPUT ;;
+            large)  echo "DIRS=150" >> $GITHUB_OUTPUT; echo "FILES=300" >> $GITHUB_OUTPUT ;;
+            xlarge) echo "DIRS=400" >> $GITHUB_OUTPUT; echo "FILES=800" >> $GITHUB_OUTPUT ;;
+          esac
+
       # ---------- MUST: 디렉토리/파일 생성 ----------
       - name: MUST — Bulk directory create
         shell: bash
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          ROOT="${{ inputs.dirs_root }}"; COUNT="${{ inputs.dirs_count }}"
-          safe_run "mkdir -p \"$ROOT\" .github/echo_files .github/echo_artifacts app tests docs/adr docs/api"
+          ROOT="${DIRS_ROOT}"; COUNT="${{ steps.scale.outputs.DIRS }}"
+          safe_run "mkdir -p \"$ROOT\" \"${FILES_ROOT}\" .github/echo_artifacts app tests docs/adr docs/api"
           safe_run "i=1; while [ \$i -le \"$COUNT\" ]; do d=\$(printf '%s/d%04d' \"$ROOT\" \"\$i\"); mkdir -p \"\$d\" || true; i=\$((i+1)); done"
           summarize
 
@@ -142,7 +131,7 @@ jobs:
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          FROOT="${{ inputs.files_root }}"; FCOUNT="${{ inputs.files_count }}"
+          FROOT="${FILES_ROOT}"; FCOUNT="${{ steps.scale.outputs.FILES }}"
           safe_run "mkdir -p \"$FROOT\""
           safe_run "i=1; while [ \$i -le \"$FCOUNT\" ]; do f=\$(printf '%s/file%04d.txt' \"$FROOT\" \"\$i\"); echo \"echo-file-\$i $(date -Iseconds)\" > \"\$f\" || true; i=\$((i+1)); done"
           safe_run "printf '# Vibe Coding Pilot\n- Created: %s\n' \"$(date -Iseconds)\" > README.md"
@@ -214,7 +203,6 @@ jobs:
             safe_run ". .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &"
             sleep 2
             safe_run "curl -fsSL http://127.0.0.1:8000/health | tee ${LOG_DIR}/health.json"
-            # 종료 실패해도 메시지 후 통과
             safe_run "pkill -f uvicorn || true"
           elif [ "${{ inputs.framework }}" = "node-express" ]; then
             safe_run "cd nodeapp && npm run -s start &"
@@ -247,52 +235,83 @@ jobs:
           safe_run "psql --version | tee ${LOG_DIR}/psql_ver.txt || true"
           summarize
 
-      # ---------- ✅ 신규: 대량 수정(치환/추가/이름변경/복제/권한) ----------
-      - name: BULK MODIFY — replace/append/rename/duplicate/chmod (no-skip)
+      # ---------- 대량 수정 프로필 매핑 ----------
+      - name: Resolve bulk profile (globs/replace/append/rename/dup)
+        id: bulkvars
+        shell: bash
+        continue-on-error: true
+        run: |
+          if [ "${{ inputs.bulk_enable }}" != "true" ]; then
+            echo "ENABLE=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          case "${{ inputs.bulk_profile }}" in
+            basic)
+              echo "GLOBS=.github/echo_files/*.txt docs/**/*.md README.md" >> $GITHUB_OUTPUT
+              echo "FROM=echo-file"   >> $GITHUB_OUTPUT
+              echo "TO=vibe-file"     >> $GITHUB_OUTPUT
+              echo "APPEND=# appended-by-workflow" >> $GITHUB_OUTPUT
+              echo "RPRE=bulk_"       >> $GITHUB_OUTPUT
+              echo "RSUF="            >> $GITHUB_OUTPUT
+              echo "COPIES=2"         >> $GITHUB_OUTPUT
+              ;;
+            docs-only)
+              echo "GLOBS=docs/**/*.md README.md" >> $GITHUB_OUTPUT
+              echo "FROM=Accepted"    >> $GITHUB_OUTPUT
+              echo "TO=Accepted ✅"    >> $GITHUB_OUTPUT
+              echo "APPEND=# docs-touched" >> $GITHUB_OUTPUT
+              echo "RPRE="            >> $GITHUB_OUTPUT
+              echo "RSUF=_v2"         >> $GITHUB_OUTPUT
+              echo "COPIES=0"         >> $GITHUB_OUTPUT
+              ;;
+            aggressive)
+              echo "GLOBS=**/*.{md,txt}" >> $GITHUB_OUTPUT
+              echo "FROM=item-"       >> $GITHUB_OUTPUT
+              echo "TO=vitem-"        >> $GITHUB_OUTPUT
+              echo "APPEND=# aggressive-bulk" >> $GITHUB_OUTPUT
+              echo "RPRE=ag_"         >> $GITHUB_OUTPUT
+              echo "RSUF="            >> $GITHUB_OUTPUT
+              echo "COPIES=1"         >> $GITHUB_OUTPUT
+              ;;
+          esac
+          echo "ENABLE=true" >> $GITHUB_OUTPUT
+
+      # ---------- ✅ 대량 수정 ----------
+      - name: BULK MODIFY — replace/append/rename/duplicate/chmod
+        if: steps.bulkvars.outputs.ENABLE == 'true'
         shell: bash
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
 
-          GLOBS="${{ inputs.bulk_globs }}"
-          FROM="${{ inputs.replace_from }}"
-          TO="${{ inputs.replace_to }}"
-          APPEND_LINE="${{ inputs.append_line }}"
-          RPRE="${{ inputs.rename_prefix }}"
-          RSUF="${{ inputs.rename_suffix }}"
-          COPIES="${{ inputs.duplicate_copies }}"
+          GLOBS="${{ steps.bulkvars.outputs.GLOBS }}"
+          FROM="${{ steps.bulkvars.outputs.FROM }}"
+          TO="${{ steps.bulkvars.outputs.TO }}"
+          APPEND_LINE="${{ steps.bulkvars.outputs.APPEND }}"
+          RPRE="${{ steps.bulkvars.outputs.RPRE }}"
+          RSUF="${{ steps.bulkvars.outputs.RSUF }}"
+          COPIES="${{ steps.bulkvars.outputs.COPIES }}"
           FMODE="${{ inputs.chmod_mode }}"
 
-          # 1) 글롭 확장 → 파일 리스트(공백, 개행 안전)
+          # 글롭 확장
           mapfile -t TARGETS < <(bash -lc "shopt -s nullglob globstar; for g in ${GLOBS}; do echo \$g; done")
           if [ ${#TARGETS[@]} -eq 0 ]; then
             warne "대상 글롭(${GLOBS})에 해당하는 파일이 없습니다."
           else
-            # 2) 각 파일에 대해: 치환(sed), 끝에 라인 추가, 이름변경, 복제
             for g in "${TARGETS[@]}"; do
               for f in $g; do
                 [ -f "$f" ] || continue
-                # 치환
-                if [ -n "$FROM" ]; then
-                  safe_run "sed -i 's/${FROM//\//\\/}/${TO//\//\\/}/g' \"$f\""
-                fi
-                # 끝에 라인 추가
-                if [ -n "$APPEND_LINE" ]; then
-                  safe_run "printf '%s\n' \"$APPEND_LINE\" >> \"$f\""
-                fi
-                # 이름변경(동일 경로 내)
+                [ -n "$FROM" ] && safe_run "sed -i 's/${FROM//\//\\/}/${TO//\//\\/}/g' \"$f\""
+                [ -n "$APPEND_LINE" ] && safe_run "printf '%s\n' \"$APPEND_LINE\" >> \"$f\""
                 dir=$(dirname "$f"); base=$(basename "$f")
                 name="${base%.*}"; ext="${base##*.}"; dot="."
-                [ "$base" = "$ext" ] && dot="" # 확장자 없는 경우
+                [ "$base" = "$ext" ] && dot=""
                 new="${dir}/${RPRE}${name}${RSUF}${dot}${ext}"
                 if [ -n "$RPRE" ] || [ -n "$RSUF" ]; then
-                  safe_run "mv \"$f\" \"$new\""
-                  f="$new"
+                  safe_run "mv \"$f\" \"$new\""; f="$new"
                 fi
-                # 복제 N개
                 if [ "$COPIES" -gt 0 ]; then
-                  idx=1
-                  while [ $idx -le "$COPIES" ]; do
+                  idx=1; while [ $idx -le "$COPIES" ]; do
                     clone="${f%.*}_copy${idx}${dot}${ext}"
                     safe_run "cp -f \"$f\" \"$clone\""
                     idx=$((idx+1))
@@ -302,11 +321,8 @@ jobs:
             done
           fi
 
-          # 3) 권한 일괄 조정(파일 644, 디렉토리 755)
           safe_run "find . -type f -not -path './.git/*' -exec chmod ${FMODE} {} + || true"
           safe_run "find . -type d -not -path './.git/*' -exec chmod 755 {} + || true"
-
-          # 4) 변경 요약 산출
           safe_run "git status --porcelain | tee ${LOG_DIR}/bulk_modify_changes.txt || true"
           summarize
 
@@ -328,7 +344,6 @@ jobs:
         run: |
           source /tmp/safe_run.sh
           safe_run "curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true"
-          # 최신 구문 권고사항 반영: packages -> scan (실패해도 통과)
           safe_run "syft scan dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || syft packages dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || true"
           summarize
 
@@ -350,14 +365,14 @@ jobs:
           source /tmp/safe_run.sh
           WS="${GITHUB_WORKSPACE}"
           mkdir -p "${GATHER_DIR}"
-          for p in ".github/echo_logs" ".github/artifacts" "${{ inputs.dirs_root }}" "${{ inputs.files_root }}" "app" "tests" "docs" "nodeapp" "demo" "README.md"; do
+          for p in ".github/echo_logs" ".github/artifacts" "${DIRS_ROOT}" "${FILES_ROOT}" "app" "tests" "docs" "nodeapp" "demo" "README.md"; do
             [ -e "$p" ] || continue
             R="$(realpath -s "$p" 2>/dev/null || echo '')"
             case "$R" in "$WS"/*) ;; *) warne "워크스페이스 밖 경로 스킵: $p -> $R"; continue;; esac
             safe_run "rsync -a --relative \"$p\" \"${GATHER_DIR}/\" || true"
           done
-          safe_run "find '${{ inputs.files_root }}' -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -I{} sha256sum '{}' | tee ${GATHER_DIR}/files.sha256 || true"
-          safe_run "find '${{ inputs.dirs_root }}' -maxdepth 2 2>/dev/null | head -n 200 | tee ${GATHER_DIR}/created-list.txt || true"
+          safe_run "find \"${FILES_ROOT}\" -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -I{} sha256sum '{}' | tee ${GATHER_DIR}/files.sha256 || true"
+          safe_run "find \"${DIRS_ROOT}\" -maxdepth 2 2>/dev/null | head -n 200 | tee ${GATHER_DIR}/created-list.txt || true"
           safe_run "zip -qr ${GATHER_DIR}/prototype-${{ inputs.framework }}.zip app nodeapp demo 2>/dev/null || true"
           summarize
 
@@ -381,17 +396,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "chore(vibe): bulk modify & artifacts [skip ci]" || true
+          git commit -m "chore(vibe): create/perm/server/bulk & artifacts [skip ci]" || true
           git push || true
 
       - name: ✅ Always-success banner
         if: ${{ inputs.force_success_message == 'true' || inputs.force_success_message == true }}
         shell: bash
         run: |
-          echo "## ✅ 전체 파이프라인 완료 (대량 수정 포함·실패는 메시지 출력 후 정상 처리·스킵 없이 진행)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 수정 대상: '${{ inputs.bulk_globs }}'" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 치환: '${{ inputs.replace_from }}' → '${{ inputs.replace_to }}', 추가 라인: '${{ inputs.append_line }}'" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 리네임 prefix/suffix: '${{ inputs.rename_prefix }}' / '${{ inputs.rename_suffix }}', 복제본: ${{
-            inputs.duplicate_copies }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ✅ 전체 파이프라인 완료 (실패는 메시지 출력 후 정상 처리·스킵 없이 진행)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- creation_scale=${{ inputs.creation_scale }}, bulk_enable=${{ inputs.bulk_enable }}, bulk_profile=${{ inputs.bulk_profile }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- chmod: 파일 ${{ inputs.chmod_mode }}, 디렉토리 755" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 아티팩트: vibe-artifacts (logs / lists / sbom / trivy / prototype / bulk_modify_changes.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 아티팩트: vibe-artifacts (logs/lists/sbom/trivy/prototype/bulk_modify_changes.txt)" >> "$GITHUB_STEP_SUMMARY"
