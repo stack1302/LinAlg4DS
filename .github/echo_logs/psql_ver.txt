@@ -1,0 +1,1 @@
+psql (PostgreSQL) 16.10 (Ubuntu 16.10-1.pgdg24.04+1)

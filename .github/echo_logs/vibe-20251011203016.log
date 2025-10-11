@@ -1,0 +1,8 @@
+✅ ▶ mkdir -p ".github/echo_files"
+✅ ▶ i=1; while [ $i -le "80" ]; do f=$(printf '%s/file%04d.txt' ".github/echo_files" "$i"); echo "echo-file-$i 2025-10-11T20:30:16+09:00" > "$f" || true; i=$((i+1)); done
+✅ ▶ printf '# Vibe Coding Pilot\n- Created: %s\n' "2025-10-11T20:30:16+09:00" > README.md
+✅ ▶ printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md
+✅ ▶ printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).
+✅ ▶ python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).
