@@ -1,32 +1,46 @@
-name: "📒 Bank Statement → Excel/CSV (Echo + Artifact + Tx Log)"
+name: "📒 Bank Statement → Excel/CSV (Full Echo + Tx Log + Docs Attach)"
 
 on:
-  workflow_dispatch: {}   # 수동 실행
+  workflow_dispatch:
+    inputs:
+      tx_csv_path:
+        description: "선택: 거래 CSV 경로(없으면 스크립트 내 내장 데이터 사용)"
+        required: false
+        default: "raw/transactions.csv"
+      docs_glob:
+        description: "함께 올릴 문서 글롭 패턴 (쉼표 구분 가능)"
+        required: false
+        default: "docs/**"
   push:
     paths:
       - "make_statement.py"
       - ".github/workflows/bank-statement.yml"
+      - "docs/**"
+      - "raw/transactions.csv"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
       TZ: Asia/Seoul
       ECHO_OK: "✅"
       ECHO_WARN: "⚠️"
       ECHO_FAIL: "❌"
       LOG_DIR: .github/echo_logs
+      OUT_DIR: out
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare echo logs
+      - name: Prepare echo logs & dirs
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "$LOG_DIR"
-          echo "${ECHO_OK} Start bank-statement job" | tee -a "$LOG_DIR/flow.log"
+          mkdir -p "$LOG_DIR" "$OUT_DIR" raw docs
+          echo "${ECHO_OK} Start bank-statement job ($(date -Iseconds))" | tee -a "$LOG_DIR/flow.log"
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -42,47 +56,216 @@ jobs:
           pip install pandas xlsxwriter >/dev/null
           echo "${ECHO_OK} Deps installed" | tee -a "$LOG_DIR/flow.log"
 
+      - name: Ensure make_statement.py exists (auto-generate safe version)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ -f make_statement.py ]; then
+            echo "${ECHO_OK} Existing make_statement.py found" | tee -a "$LOG_DIR/flow.log"
+          else
+            echo "${ECHO_WARN} make_statement.py not found → generating default script" | tee -a "$LOG_DIR/flow.log"
+            cat > make_statement.py <<'PY'
+# -*- coding: utf-8 -*-
+import sys
+from pathlib import Path
+import pandas as pd
+
+TX_CSV_CLI = sys.argv[1] if len(sys.argv) > 1 else "raw/transactions.csv"
+
+# ===== Fallback rows (없을 때 사용) =====
+ROWS = [
+["2025-10-11","16:36:58","체크카드","10,860","","Google handj","1,673,419","원신한"],
+["2025-10-09","14:15:58","체크카드","53,692","","Google handj","190,880","원신한"],
+["2025-10-09","12:41:23","체크카드","2,682","","Google Pokemon","144,572","원신한"],
+["2025-10-08","15:40:43","체크카드","10,731","","Google handj","179,288","원신한"],
+["2025-10-08","14:52:20","체크카드","32,222","","Google handj","190,019","원신한"],
+["2025-10-06","11:53:06","체크카드","513","","Google Pokemon","239,640","원신한"],
+["2025-10-04","14:00:41","체크카드","2,631","","Google Pokemon","238,252","원신한"],
+["2025-10-01","19:49:51","체크카드","31,391","","Google handj","93,113","원신한"],
+["2025-10-01","17:31:29","체크카드","5,228","","Google Pokemon","124,504","원신한"],
+["2025-09-30","20:56:29","체크카드","510","","Google Pokemon","136,782","원신한"],
+["2025-09-28","22:06:41","체크카드","6,338","","Google Pokemon","158,892","원신한"],
+["2025-09-28","16:56:18","체크카드","1,837","","Google Crystal","167,430","원신한"],
+["2025-09-28","15:46:26","체크카드","5,283","","Google Pokemon","169,267","원신한"],
+["2025-09-21","10:05:09","체크카드","2,641","","Google Pokemon","236,067","원신한"],
+["2025-09-20","12:17:36","체크카드","522","","Google Pokemon","305,608","원신한"],
+["2025-09-19","07:39:02","체크카드","518","","Google Pokemon","317,096","원신한"],
+["2025-09-14","15:43:13","체크카드","1,056","","GOOGLE *Pokemo","396,814","원신한"],
+["2025-09-08","17:52:09","체크카드","1,458","","GOOGLE *THE KI","277,436","원신한"],
+["2025-09-06","00:29:03","체크카드","5,250","","Google Pokemon","304,094","원신한"],
+["2025-09-03","20:49:08","체크카드","31,582","","Google handj","371,334","원신한"],
+["2025-08-30","15:10:09","체크카드","1,053","","Google Pokemon","243,416","원신한"],
+["2025-08-28","20:44:00","체크카드","31,572","","Google handj","273,169","원신한"],
+["2025-08-23","10:18:29","체크카드","52,777","","Google Pokemon","375,041","원신한"],
+["2025-08-23","09:46:51","체크카드","52,777","","Google Pokemon","277,818","원신한"],
+["2025-08-22","17:29:55","체크카드","2,641","","Google Pokemon","317,395","원신한"],
+["2025-08-21","14:37:39","체크카드","522","","Google Pokemon","391,526","원신한"],
+["2025-08-21","11:22:21","체크카드","10,609","","Google Pokemon","398,548","원신한"],
+["2025-08-20","20:06:00","체크카드","31,869","","Google handj","418,157","원신한"],
+["2025-08-19","20:37:27","체크카드","2,637","","Google Pokemon","458,026","원신한"],
+["2025-08-19","19:58:49","체크카드","31,616","","Google handj","460,663","원신한"],
+["2025-08-18","10:04:14","체크카드","10,492","","Google Pokemon","506,279","원신한"],
+["2025-08-17","14:07:40","체크카드","31,540","","Google handj","437,271","원신한"],
+["2025-08-17","13:25:41","체크카드","10,489","","Google handj","468,811","원신한"],
+["2025-08-15","15:07:15","체크카드","2,639","","Google Pokemon","500,650","원신한"],
+["2025-08-10","11:59:11","체크카드","52,646","","Google Pokemon","1,979,950","원신한"],
+["2025-08-08","17:47:30","체크카드","5,265","","Google Pokemon","2,136,496","원신한"],
+["2025-08-07","20:08:50","체크카드","31,558","","Google handj","349,171","원신한"],
+["2025-08-06","20:23:50","체크카드","52,852","","Google handj","340,729","원신한"],
+["2025-08-06","20:11:30","체크카드","10,545","","Google handj","393,581","원신한"],
+["2025-08-06","20:09:03","체크카드","10,545","","Google handj","404,126","원신한"],
+["2025-08-06","20:08:30","체크카드","10,545","","Google handj","414,671","원신한"],
+["2025-08-03","14:09:25","체크카드","2,615","","Google Pokemon","429,306","원신한"],
+["2025-08-02","14:00:47","체크카드","1,054","","Google Pokemon","461,721","원신한"],
+["2025-08-01","19:42:48","체크카드","31,834","","Google handj","520,775","원신한"],
+["2025-07-30","20:18:40","체크카드","31,199","","Google handj","572,209","원신한"],
+["2025-07-27","15:02:31","체크카드","517","","Google Pokemon","635,602","원신한"],
+["2025-07-25","19:38:31","체크카드","31,161","","Google handj","562,160","원신한"],
+["2025-07-22","19:59:03","체크카드","32,060","","Google handj","625,858","원신한"],
+["2025-07-22","19:41:21","체크카드","10,666","","Google handj","657,918","원신한"],
+["2025-07-22","12:20:34","체크카드","6,659","","Google Kingsho","568,584","원신한"],
+["2025-07-22","11:32:32","체크카드","2,669","","Google Pokemon","583,543","원신한"],
+["2025-07-20","22:45:08","체크카드","13,354","","Google jp poke","688,302","원신한"],
+["2025-07-19","22:15:45","체크카드","2,110","","Google Play Pa","731,656","원신한"],
+["2025-07-18","20:16:49","체크카드","1,066","","Google Pokemon","716,544","원신한"],
+["2025-07-16","07:50:38","체크카드","2,690","","Google Pokemon","788,750","원신한"],
+]
+COLS = ["거래일자","거래시간","적요","출금(원)","입금(원)","내용","잔액(원)","거래점"]
+
+def kr_to_int(s: str) -> int:
+    s = (s or "").strip()
+    return int(s.replace(",", "")) if s else 0
+
+def categorize(desc: str) -> str:
+    d = (desc or "").lower()
+    if "handj" in d:     return "Google handj"
+    if ("pokemon" in d) or ("pokemo" in d) or ("poke" in d): return "Google Pokemon"
+    if "kingsho" in d:   return "Google Kingsho"
+    if "crystal" in d:   return "Google Crystal"
+    if "the ki" in d:    return "GOOGLE *THE KI"
+    return "기타"
+
+# 입력 CSV가 있으면 우선
+use_csv = Path(TX_CSV_CLI).is_file()
+if use_csv:
+    df = pd.read_csv(TX_CSV_CLI)
+    # 최소 컬럼 존재 확인
+    assert {"거래일자","거래시간","출금(원)","내용","잔액(원)"} <= set(df.columns), "CSV 컬럼명 불일치"
+else:
+    df = pd.DataFrame(ROWS, columns=COLS)
+
+df["출금"] = df["출금(원)"].map(kr_to_int)
+df["입금"] = df.get("입금(원)", 0)
+if not pd.api.types.is_integer_dtype(df["입금"]):
+    df["입금"] = df["입금"].apply(kr_to_int)  # 있을 경우
+
+df["잔액"] = df["잔액(원)"].map(kr_to_int)
+df["일시"] = pd.to_datetime(df["거래일자"] + " " + df["거래시간"])
+df["카테고리"] = df["내용"].map(categorize)
+
+total_out = int(df["출금"].sum())
+n_tx = int((df["출금"] > 0).sum())
+by_cat = (df.groupby("카테고리", as_index=False)["출금"]
+          .sum().sort_values("출금", ascending=False))
+
+out_dir = Path("out"); out_dir.mkdir(parents=True, exist_ok=True)
+df.sort_values("일시").to_csv(out_dir / "transactions_clean.csv", index=False, encoding="utf-8-sig")
+
+with pd.ExcelWriter(out_dir / "bank_statement_summary.xlsx", engine="xlsxwriter",
+                    datetime_format="yyyy-mm-dd HH:MM:SS") as xl:
+    df.sort_values("일시").to_excel(xl, index=False, sheet_name="Transactions")
+    by_cat.to_excel(xl, index=False, sheet_name="SummaryByCategory")
+    pd.DataFrame({
+        "항목": ["총 출금액", "거래 건수", "기간", "입력소스"],
+        "값": [f"{total_out:,}원", f"{n_tx}건",
+               f"{df['거래일자'].min()} ~ {df['거래일자'].max()}",
+               ("CSV:" + TX_CSV_CLI) if use_csv else "내장 ROWS"],
+    }).to_excel(xl, index=False, sheet_name="Summary")
+
+print("=== 명세서 요약 ===")
+print(f"- 총 출금액: {total_out:,}원")
+print(f"- 거래 건수: {n_tx}건")
+print("\n[카테고리별 합계]")
+for _, r in by_cat.iterrows():
+    print(f"  • {r['카테고리']}: {int(r['출금']):,}원")
+
+PY
+            chmod +x make_statement.py
+          fi
+
       - name: Run script (generate Excel/CSV)
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ ! -f make_statement.py ]; then
-            echo "${ECHO_FAIL} make_statement.py not found" | tee -a "$LOG_DIR/flow.log"
-            exit 1
+          TX_CSV="${{ github.event.inputs.tx_csv_path || 'raw/transactions.csv' }}"
+          if [ -f "$TX_CSV" ]; then
+            echo "${ECHO_OK} Using CSV → $TX_CSV" | tee -a "$LOG_DIR/flow.log"
+            python make_statement.py "$TX_CSV" 2>&1 | tee -a "$LOG_DIR/flow.log"
+          else
+            echo "${ECHO_WARN} No CSV found, using embedded rows" | tee -a "$LOG_DIR/flow.log"
+            python make_statement.py 2>&1 | tee -a "$LOG_DIR/flow.log"
           fi
-          python make_statement.py 2>&1 | tee -a "$LOG_DIR/flow.log"
           echo "${ECHO_OK} Script done" | tee -a "$LOG_DIR/flow.log"
 
       - name: Echo transactions into logs (자동 포함)
         shell: bash
         run: |
           set -Eeuo pipefail
-          # CSV가 생성됐는지 확인
-          if [ ! -f out/transactions_clean.csv ]; then
-            echo "${ECHO_FAIL} out/transactions_clean.csv not found" | tee -a "$LOG_DIR/flow.log"
+          if [ ! -f "$OUT_DIR/transactions_clean.csv" ]; then
+            echo "${ECHO_FAIL} $OUT_DIR/transactions_clean.csv not found" | tee -a "$LOG_DIR/flow.log"
             exit 1
           fi
-
-          # 거래내역 CSV 전체를 flow.log에 에코 + 별도 트랜잭션 로그 파일 생성
           {
             echo "=== BEGIN TRANSACTIONS CSV ==="
-            cat out/transactions_clean.csv
+            cat "$OUT_DIR/transactions_clean.csv"
             echo "=== END TRANSACTIONS CSV ==="
           } | tee -a "$LOG_DIR/flow.log" > "$LOG_DIR/transactions.log"
 
-          # 무결성 체크(선택)
-          (cd out && sha256sum bank_statement_summary.xlsx transactions_clean.csv) \
+          (cd "$OUT_DIR" && sha256sum bank_statement_summary.xlsx transactions_clean.csv) \
             | tee -a "$LOG_DIR/flow.log" > "$LOG_DIR/checksums.sha256"
 
-          echo "${ECHO_OK} Transactions echoed to $LOG_DIR/transactions.log" | tee -a "$LOG_DIR/flow.log"
+          echo "${ECHO_OK} Transactions echoed & checksums created" | tee -a "$LOG_DIR/flow.log"
 
-      - name: Upload artifacts (Excel/CSV + logs)
+      - name: Attach additional docs (지출 줄이기 정리 등)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          DOCS_INPUT="${{ github.event.inputs.docs_glob || 'docs/**' }}"
+          echo "Docs glob: $DOCS_INPUT" | tee -a "$LOG_DIR/flow.log"
+
+          # 쉼표로 여러 패턴 지원
+          IFS=',' read -r -a GLOBS <<< "$DOCS_INPUT"
+          DOC_COUNT=0
+          for g in "${GLOBS[@]}"; do
+            # glob 공백 제거
+            g_trim="$(echo "$g" | sed 's/^ *//;s/ *$//')"
+            # 매칭 파일 반복
+            shopt -s nullglob
+            for f in $g_trim; do
+              # out/docs/ 경로로 복사 (디렉터리 구조 유지 없이 파일만)
+              mkdir -p "$OUT_DIR/docs"
+              base="$(basename "$f")"
+              cp "$f" "$OUT_DIR/docs/$base"
+              echo "${ECHO_OK} Attached doc: $f → $OUT_DIR/docs/$base" | tee -a "$LOG_DIR/flow.log"
+              DOC_COUNT=$((DOC_COUNT+1))
+            done
+            shopt -u nullglob
+          done
+
+          if [ "$DOC_COUNT" -eq 0 ]; then
+            echo "${ECHO_WARN} No docs matched pattern(s): $DOCS_INPUT" | tee -a "$LOG_DIR/flow.log"
+          else
+            echo "${ECHO_OK} Total attached docs: $DOC_COUNT" | tee -a "$LOG_DIR/flow.log"
+          fi
+
+      - name: Upload artifacts (Excel/CSV + logs + docs)
         uses: actions/upload-artifact@v4
         with:
           name: bank-statement-artifacts
           path: |
             out/bank_statement_summary.xlsx
             out/transactions_clean.csv
+            out/docs/**
             .github/echo_logs/flow.log
             .github/echo_logs/transactions.log
             .github/echo_logs/checksums.sha256
