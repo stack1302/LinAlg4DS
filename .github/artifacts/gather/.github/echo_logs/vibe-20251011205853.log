@@ -1,0 +1,7 @@
+✅ ▶ sudo -u postgres psql -v ON_ERROR_STOP=0 -c "CREATE DATABASE vibe_db;" || true
+✅ ▶ sudo -u postgres psql -v ON_ERROR_STOP=0 -f /tmp/seed.sql
+✅ ▶ sudo -u postgres psql -v ON_ERROR_STOP=0 -f /tmp/test.sql | tee .github/echo_logs/pg_test.txt
+✅ ▶ sudo -u postgres pg_dump -Fc -d vibe_db -f /tmp/vibe_db.dump
+✅ ▶ sudo cp /tmp/vibe_db.dump .github/artifacts/vibe_db.dump
+✅ ▶ sudo chown runner:runner .github/artifacts/vibe_db.dump
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

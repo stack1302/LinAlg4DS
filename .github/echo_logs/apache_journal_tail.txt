@@ -1,0 +1,10 @@
+Oct 11 20:58:45 runnervmwhb2z systemd[1]: Starting apache2.service - The Apache HTTP Server...
+Oct 11 20:58:45 runnervmwhb2z apachectl[35523]: (98)Address already in use: AH00072: make_sock: could not bind to address [::]:80
+Oct 11 20:58:45 runnervmwhb2z apachectl[35523]: (98)Address already in use: AH00072: make_sock: could not bind to address 0.0.0.0:80
+Oct 11 20:58:45 runnervmwhb2z apachectl[35523]: no listening sockets available, shutting down
+Oct 11 20:58:45 runnervmwhb2z apachectl[35523]: AH00015: Unable to open logs
+Oct 11 20:58:45 runnervmwhb2z systemd[1]: apache2.service: Control process exited, code=exited, status=1/FAILURE
+Oct 11 20:58:45 runnervmwhb2z systemd[1]: apache2.service: Failed with result 'exit-code'.
+Oct 11 20:58:45 runnervmwhb2z systemd[1]: Failed to start apache2.service - The Apache HTTP Server.
+Oct 11 20:58:52 runnervmwhb2z systemd[1]: Starting apache2.service - The Apache HTTP Server...
+Oct 11 20:58:52 runnervmwhb2z systemd[1]: Started apache2.service - The Apache HTTP Server.
