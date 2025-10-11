@@ -1,262 +1,405 @@
-name: "📒 Bank Statement → Excel/CSV (Full Echo + Tx Log + Docs Attach)"
+name: "🏦 Java Ledger Viewer (Echo + CSV/XLS/XLSX 지원)"
 
 on:
   workflow_dispatch:
     inputs:
-      tx_csv_path:
-        description: "선택: 거래 CSV 경로(없으면 스크립트 내 내장 데이터 사용)"
+      ledger_path:
+        description: "통장 파일 경로 (CSV/XLS/XLSX). 예: data/bank_ledger.xlsx"
         required: false
-        default: "raw/transactions.csv"
-      docs_glob:
-        description: "함께 올릴 문서 글롭 패턴 (쉼표 구분 가능)"
+        default: ""
+      from_date:
+        description: "조회 시작일 (YYYY-MM-DD, 선택)"
         required: false
-        default: "docs/**"
-  push:
-    paths:
-      - "make_statement.py"
-      - ".github/workflows/bank-statement.yml"
-      - "docs/**"
-      - "raw/transactions.csv"
+        default: ""
+      to_date:
+        description: "조회 종료일 (YYYY-MM-DD, 선택)"
+        required: false
+        default: ""
+      sheet_name:
+        description: "엑셀 시트명 (XLS/XLSX일 때만, 미지정 시 첫 시트)"
+        required: false
+        default: ""
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_logs
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
 
 jobs:
-  build:
+  view-ledger:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    env:
-      TZ: Asia/Seoul
-      ECHO_OK: "✅"
-      ECHO_WARN: "⚠️"
-      ECHO_FAIL: "❌"
-      LOG_DIR: .github/echo_logs
-      OUT_DIR: out
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Prepare echo logs & dirs
+      - name: Prepare Echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "$LOG_DIR" "$OUT_DIR" raw docs
-          echo "${ECHO_OK} Start bank-statement job ($(date -Iseconds))" | tee -a "$LOG_DIR/flow.log"
+          mkdir -p "${LOG_DIR}"
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
+          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          warne(){ printf '%s %s\n' "${ECHO_WARN}" "$*"; }
+          faile(){ printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
+          run(){ printf '▶ %s\n' "$*" ; eval "$@"; }
+          SH
+          chmod +x /tmp/echo_helpers.sh
+          source /tmp/echo_helpers.sh
+          echoe "Echo helpers ready at /tmp/echo_helpers.sh"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Setup Java (Temurin 21) + Maven cache
+        uses: actions/setup-java@v4
         with:
-          python-version: "3.12"
+          distribution: temurin
+          java-version: '21'
+          cache: maven
 
-      - name: Install deps (pandas,xlsxwriter)
+      - name: Bootstrap minimal Maven project (if missing)
         shell: bash
         run: |
           set -Eeuo pipefail
-          python -V | tee -a "$LOG_DIR/flow.log"
-          pip install --upgrade pip >/dev/null
-          pip install pandas xlsxwriter >/dev/null
-          echo "${ECHO_OK} Deps installed" | tee -a "$LOG_DIR/flow.log"
+          source /tmp/echo_helpers.sh
+          if [[ ! -f pom.xml ]]; then
+            echoe "pom.xml이 없어 최소 Maven 프로젝트를 생성합니다."
+            mkdir -p src/main/java/com/example src/main/resources
+            cat > pom.xml <<'POM'
+            <?xml version="1.0" encoding="UTF-8"?>
+            <project xmlns="http://maven.apache.org/POM/4.0.0"
+                     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+              <modelVersion>4.0.0</modelVersion>
+              <groupId>com.example</groupId>
+              <artifactId>bank-ledger</artifactId>
+              <version>1.0.0</version>
+              <properties>
+                <maven.compiler.source>21</maven.compiler.source>
+                <maven.compiler.target>21</maven.compiler.target>
+                <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+              </properties>
+              <dependencies>
+                <!-- CSV 파싱 -->
+                <dependency>
+                  <groupId>org.apache.commons</groupId>
+                  <artifactId>commons-csv</artifactId>
+                  <version>1.11.0</version>
+                </dependency>
+                <!-- Excel(XLS/XLSX) 파싱 -->
+                <dependency>
+                  <groupId>org.apache.poi</groupId>
+                  <artifactId>poi</artifactId>
+                  <version>5.2.5</version>
+                </dependency>
+                <dependency>
+                  <groupId>org.apache.poi</groupId>
+                  <artifactId>poi-ooxml</artifactId>
+                  <version>5.2.5</version>
+                </dependency>
+                <!-- 날짜 파싱 편의 -->
+                <dependency>
+                  <groupId>org.apache.commons</groupId>
+                  <artifactId>commons-lang3</artifactId>
+                  <version>3.14.0</version>
+                </dependency>
+              </dependencies>
+              <build>
+                <plugins>
+                  <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.13.0</version>
+                    <configuration>
+                      <release>21</release>
+                    </configuration>
+                  </plugin>
+                  <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-shade-plugin</artifactId>
+                    <version>3.5.3</version>
+                    <executions>
+                      <execution>
+                        <phase>package</phase>
+                        <goals><goal>shade</goal></goals>
+                        <configuration>
+                          <createDependencyReducedPom>false</createDependencyReducedPom>
+                          <transformers>
+                            <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                              <mainClass>com.example.BankLedger</mainClass>
+                            </transformer>
+                          </transformers>
+                        </configuration>
+                      </execution>
+                    </executions>
+                  </plugin>
+                </plugins>
+              </build>
+            </project>
+            POM
 
-      - name: Ensure make_statement.py exists (auto-generate safe version)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [ -f make_statement.py ]; then
-            echo "${ECHO_OK} Existing make_statement.py found" | tee -a "$LOG_DIR/flow.log"
+            cat > src/main/java/com/example/BankLedger.java <<'JAVA'
+            package com.example;
+
+            import org.apache.commons.csv.CSVFormat;
+            import org.apache.commons.csv.CSVParser;
+            import org.apache.commons.csv.CSVRecord;
+            import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+            import org.apache.poi.ss.usermodel.*;
+            import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+            import java.io.*;
+            import java.nio.charset.StandardCharsets;
+            import java.nio.file.*;
+            import java.time.LocalDate;
+            import java.time.format.DateTimeFormatter;
+            import java.util.*;
+
+            public class BankLedger {
+                record Row(LocalDate date, String time, String type, long amount, String memo, Long balance, String account){}
+
+                static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
+                        DateTimeFormatter.ofPattern("yyyy-MM-dd"),
+                        DateTimeFormatter.ofPattern("yyyy.M.d"),
+                        DateTimeFormatter.ofPattern("yyyy/M/d")
+                };
+
+                public static void main(String[] args) throws Exception {
+                    String path = argOrEnv(args, 0, "LEDGER_PATH", "");
+                    String from = argOrEnv(args, 1, "FROM_DATE", "");
+                    String to   = argOrEnv(args, 2, "TO_DATE", "");
+                    String sheetName = System.getenv().getOrDefault("SHEET_NAME", "");
+
+                    if (path.isBlank()) {
+                        System.out.println("⚠️ ledger_path 미지정 → 예시 CSV 생성 후 실행합니다: data/sample_ledger.csv");
+                        Path p = Paths.get("data"); Files.createDirectories(p);
+                        Path csv = p.resolve("sample_ledger.csv");
+                        String sample = String.join("\n", List.of(
+                                "date,time,type,amount,memo,balance,account",
+                                "2025-10-11,16:36:58,체크카드,10860,Google handj,1673419,원신한",
+                                "2025-10-09,14:15:58,체크카드,53692,Google handj,190880,원신한",
+                                "2025-10-09,12:41:23,체크카드,2682,Google Pokemon,144572,원신한",
+                                "2025-10-08,15:40:43,체크카드,10731,Google handj,179288,원신한",
+                                "2025-10-08,14:52:20,체크카드,32222,Google handj,190019,원신한"
+                        ));
+                        Files.writeString(csv, sample, StandardCharsets.UTF_8);
+                        path = csv.toString();
+                    }
+
+                    LocalDate fromDate = parseDateOrNull(from);
+                    LocalDate toDate   = parseDateOrNull(to);
+
+                    List<Row> rows;
+                    String lower = path.toLowerCase(Locale.ROOT);
+                    if (lower.endsWith(".csv")) {
+                        rows = readCsv(path);
+                    } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
+                        rows = readExcel(path, sheetName);
+                    } else {
+                        System.out.println("❌ 지원하지 않는 확장자: " + path);
+                        return;
+                    }
+
+                    // 날짜 필터
+                    rows = filterByDate(rows, fromDate, toDate);
+
+                    // 출력
+                    printTable(rows);
+
+                    // 요약
+                    long totalOut = rows.stream().mapToLong(r -> r.amount).sum();
+                    Long lastBalance = rows.stream().filter(r -> r.balance != null).reduce((a,b)->b).map(r->r.balance).orElse(null);
+
+                    System.out.println();
+                    System.out.println("==== 요약 ====");
+                    System.out.printf("거래 건수  : %,d%n", rows.size());
+                    System.out.printf("총 출금합계: %,d원 (amount 컬럼 합)%n", totalOut);
+                    if (lastBalance != null) {
+                        System.out.printf("마지막 잔액: %,d원%n", lastBalance);
+                    }
+                }
+
+                static String argOrEnv(String[] args, int idx, String env, String def) {
+                    if (args.length > idx && args[idx] != null && !args[idx].isBlank()) return args[idx];
+                    return System.getenv().getOrDefault(env, def);
+                }
+
+                static LocalDate parseDateOrNull(String s) {
+                    if (s == null || s.isBlank()) return null;
+                    for (var fmt: DATE_FMTS) {
+                        try { return LocalDate.parse(s.trim(), fmt); } catch (Exception ignore) {}
+                    }
+                    try { return LocalDate.parse(s.trim()); } catch (Exception ignore) {}
+                    return null;
+                }
+
+                static List<Row> readCsv(String path) throws IOException {
+                    try (Reader in = Files.newBufferedReader(Paths.get(path), StandardCharsets.UTF_8)) {
+                        CSVParser p = CSVFormat.DEFAULT.builder()
+                                .setHeader()
+                                .setSkipHeaderRecord(true)
+                                .setTrim(true)
+                                .build().parse(in);
+                        List<Row> out = new ArrayList<>();
+                        for (CSVRecord r: p) {
+                            LocalDate d = parseDateOrNull(r.get("date"));
+                            String time = getSafe(r, "time");
+                            String type = getSafe(r, "type");
+                            long amount = parseLongSafe(getSafe(r, "amount"));
+                            String memo = getSafe(r, "memo");
+                            Long bal = parseLongSafeNullable(getSafe(r, "balance"));
+                            String account = getSafe(r, "account");
+                            if (d != null) out.add(new Row(d,time,type,amount,memo,bal,account));
+                        }
+                        return out;
+                    }
+                }
+
+                static List<Row> readExcel(String path, String sheetName) throws IOException {
+                    try (InputStream is = Files.newInputStream(Paths.get(path))) {
+                        Workbook wb = path.toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
+                        Sheet sheet = null;
+                        if (sheetName != null && !sheetName.isBlank()) {
+                            sheet = wb.getSheet(sheetName);
+                        }
+                        if (sheet == null) sheet = wb.getSheetAt(0);
+
+                        // 헤더 맵핑
+                        Map<String,Integer> idx = new HashMap<>();
+                        Iterator<Row> it = sheet.rowIterator();
+                        if (!it.hasNext()) return List.of();
+                        org.apache.poi.ss.usermodel.Row hr = it.next();
+                        for (Cell c: hr) {
+                            idx.put(c.getStringCellValue().toLowerCase(Locale.ROOT), c.getColumnIndex());
+                        }
+
+                        List<Row> out = new ArrayList<>();
+                        while (it.hasNext()) {
+                            org.apache.poi.ss.usermodel.Row rr = it.next();
+                            LocalDate d = parseDateOrNull(cellStr(rr, idx.getOrDefault("date",-1)));
+                            if (d == null) continue;
+                            String time = cellStr(rr, idx.getOrDefault("time",-1));
+                            String type = cellStr(rr, idx.getOrDefault("type",-1));
+                            long amount = parseLongSafe(cellStr(rr, idx.getOrDefault("amount",-1)));
+                            String memo = cellStr(rr, idx.getOrDefault("memo",-1));
+                            Long bal = parseLongSafeNullable(cellStr(rr, idx.getOrDefault("balance",-1)));
+                            String account = cellStr(rr, idx.getOrDefault("account",-1));
+                            out.add(new Row(d,time,type,amount,memo,bal,account));
+                        }
+                        wb.close();
+                        return out;
+                    }
+                }
+
+                static String cellStr(org.apache.poi.ss.usermodel.Row r, int cidx) {
+                    if (cidx < 0) return "";
+                    Cell c = r.getCell(cidx);
+                    if (c == null) return "";
+                    return switch (c.getCellType()) {
+                        case STRING -> c.getStringCellValue();
+                        case NUMERIC -> {
+                            if (DateUtil.isCellDateFormatted(c)) {
+                                var ld = c.getLocalDateTimeCellValue().toLocalDate();
+                                yield ld.toString();
+                            } else {
+                                yield String.valueOf(Math.round(c.getNumericCellValue()));
+                            }
+                        }
+                        case BOOLEAN -> String.valueOf(c.getBooleanCellValue());
+                        default -> "";
+                    };
+                }
+
+                static String getSafe(CSVRecord r, String key) {
+                    try { return r.get(key); } catch (Exception e) { return ""; }
+                }
+
+                static long parseLongSafe(String s) {
+                    if (s == null) return 0L;
+                    String t = s.replaceAll("[^0-9-]", "");
+                    if (t.isBlank() || t.equals("-")) return 0L;
+                    try { return Long.parseLong(t); } catch (Exception e) { return 0L; }
+                }
+                static Long parseLongSafeNullable(String s) {
+                    String t = (s==null) ? "" : s.replaceAll("[^0-9-]", "");
+                    if (t.isBlank() || t.equals("-")) return null;
+                    try { return Long.parseLong(t); } catch (Exception e) { return null; }
+                }
+
+                static List<Row> filterByDate(List<Row> in, LocalDate from, LocalDate to) {
+                    if (from == null && to == null) return in;
+                    List<Row> out = new ArrayList<>();
+                    for (Row r: in) {
+                        boolean ok = true;
+                        if (from != null && r.date.isBefore(from)) ok = false;
+                        if (to != null && r.date.isAfter(to)) ok = false;
+                        if (ok) out.add(r);
+                    }
+                    return out;
+                }
+
+                static void printTable(List<Row> rows) {
+                    System.out.println("date       | time     | type   | amount  | memo             | balance   | account");
+                    System.out.println("-----------+----------+--------+---------+------------------+-----------+--------");
+                    for (Row r: rows) {
+                        System.out.printf("%-10s | %-8s | %-6s | %8s | %-16s | %9s | %s%n",
+                                r.date, nv(r.time), nv(r.type), fmt(r.amount), nv(r.memo),
+                                r.balance==null? "-" : fmt(r.balance), nv(r.account));
+                    }
+                }
+                static String nv(String s){ return (s==null||s.isBlank())?"-":s; }
+                static String fmt(long v){ return String.format("%,d", v); }
+            }
+            JAVA
           else
-            echo "${ECHO_WARN} make_statement.py not found → generating default script" | tee -a "$LOG_DIR/flow.log"
-            cat > make_statement.py <<'PY'
-# -*- coding: utf-8 -*-
-import sys
-from pathlib import Path
-import pandas as pd
-
-TX_CSV_CLI = sys.argv[1] if len(sys.argv) > 1 else "raw/transactions.csv"
-
-# ===== Fallback rows (없을 때 사용) =====
-ROWS = [
-["2025-10-11","16:36:58","체크카드","10,860","","Google handj","1,673,419","원신한"],
-["2025-10-09","14:15:58","체크카드","53,692","","Google handj","190,880","원신한"],
-["2025-10-09","12:41:23","체크카드","2,682","","Google Pokemon","144,572","원신한"],
-["2025-10-08","15:40:43","체크카드","10,731","","Google handj","179,288","원신한"],
-["2025-10-08","14:52:20","체크카드","32,222","","Google handj","190,019","원신한"],
-["2025-10-06","11:53:06","체크카드","513","","Google Pokemon","239,640","원신한"],
-["2025-10-04","14:00:41","체크카드","2,631","","Google Pokemon","238,252","원신한"],
-["2025-10-01","19:49:51","체크카드","31,391","","Google handj","93,113","원신한"],
-["2025-10-01","17:31:29","체크카드","5,228","","Google Pokemon","124,504","원신한"],
-["2025-09-30","20:56:29","체크카드","510","","Google Pokemon","136,782","원신한"],
-["2025-09-28","22:06:41","체크카드","6,338","","Google Pokemon","158,892","원신한"],
-["2025-09-28","16:56:18","체크카드","1,837","","Google Crystal","167,430","원신한"],
-["2025-09-28","15:46:26","체크카드","5,283","","Google Pokemon","169,267","원신한"],
-["2025-09-21","10:05:09","체크카드","2,641","","Google Pokemon","236,067","원신한"],
-["2025-09-20","12:17:36","체크카드","522","","Google Pokemon","305,608","원신한"],
-["2025-09-19","07:39:02","체크카드","518","","Google Pokemon","317,096","원신한"],
-["2025-09-14","15:43:13","체크카드","1,056","","GOOGLE *Pokemo","396,814","원신한"],
-["2025-09-08","17:52:09","체크카드","1,458","","GOOGLE *THE KI","277,436","원신한"],
-["2025-09-06","00:29:03","체크카드","5,250","","Google Pokemon","304,094","원신한"],
-["2025-09-03","20:49:08","체크카드","31,582","","Google handj","371,334","원신한"],
-["2025-08-30","15:10:09","체크카드","1,053","","Google Pokemon","243,416","원신한"],
-["2025-08-28","20:44:00","체크카드","31,572","","Google handj","273,169","원신한"],
-["2025-08-23","10:18:29","체크카드","52,777","","Google Pokemon","375,041","원신한"],
-["2025-08-23","09:46:51","체크카드","52,777","","Google Pokemon","277,818","원신한"],
-["2025-08-22","17:29:55","체크카드","2,641","","Google Pokemon","317,395","원신한"],
-["2025-08-21","14:37:39","체크카드","522","","Google Pokemon","391,526","원신한"],
-["2025-08-21","11:22:21","체크카드","10,609","","Google Pokemon","398,548","원신한"],
-["2025-08-20","20:06:00","체크카드","31,869","","Google handj","418,157","원신한"],
-["2025-08-19","20:37:27","체크카드","2,637","","Google Pokemon","458,026","원신한"],
-["2025-08-19","19:58:49","체크카드","31,616","","Google handj","460,663","원신한"],
-["2025-08-18","10:04:14","체크카드","10,492","","Google Pokemon","506,279","원신한"],
-["2025-08-17","14:07:40","체크카드","31,540","","Google handj","437,271","원신한"],
-["2025-08-17","13:25:41","체크카드","10,489","","Google handj","468,811","원신한"],
-["2025-08-15","15:07:15","체크카드","2,639","","Google Pokemon","500,650","원신한"],
-["2025-08-10","11:59:11","체크카드","52,646","","Google Pokemon","1,979,950","원신한"],
-["2025-08-08","17:47:30","체크카드","5,265","","Google Pokemon","2,136,496","원신한"],
-["2025-08-07","20:08:50","체크카드","31,558","","Google handj","349,171","원신한"],
-["2025-08-06","20:23:50","체크카드","52,852","","Google handj","340,729","원신한"],
-["2025-08-06","20:11:30","체크카드","10,545","","Google handj","393,581","원신한"],
-["2025-08-06","20:09:03","체크카드","10,545","","Google handj","404,126","원신한"],
-["2025-08-06","20:08:30","체크카드","10,545","","Google handj","414,671","원신한"],
-["2025-08-03","14:09:25","체크카드","2,615","","Google Pokemon","429,306","원신한"],
-["2025-08-02","14:00:47","체크카드","1,054","","Google Pokemon","461,721","원신한"],
-["2025-08-01","19:42:48","체크카드","31,834","","Google handj","520,775","원신한"],
-["2025-07-30","20:18:40","체크카드","31,199","","Google handj","572,209","원신한"],
-["2025-07-27","15:02:31","체크카드","517","","Google Pokemon","635,602","원신한"],
-["2025-07-25","19:38:31","체크카드","31,161","","Google handj","562,160","원신한"],
-["2025-07-22","19:59:03","체크카드","32,060","","Google handj","625,858","원신한"],
-["2025-07-22","19:41:21","체크카드","10,666","","Google handj","657,918","원신한"],
-["2025-07-22","12:20:34","체크카드","6,659","","Google Kingsho","568,584","원신한"],
-["2025-07-22","11:32:32","체크카드","2,669","","Google Pokemon","583,543","원신한"],
-["2025-07-20","22:45:08","체크카드","13,354","","Google jp poke","688,302","원신한"],
-["2025-07-19","22:15:45","체크카드","2,110","","Google Play Pa","731,656","원신한"],
-["2025-07-18","20:16:49","체크카드","1,066","","Google Pokemon","716,544","원신한"],
-["2025-07-16","07:50:38","체크카드","2,690","","Google Pokemon","788,750","원신한"],
-]
-COLS = ["거래일자","거래시간","적요","출금(원)","입금(원)","내용","잔액(원)","거래점"]
-
-def kr_to_int(s: str) -> int:
-    s = (s or "").strip()
-    return int(s.replace(",", "")) if s else 0
-
-def categorize(desc: str) -> str:
-    d = (desc or "").lower()
-    if "handj" in d:     return "Google handj"
-    if ("pokemon" in d) or ("pokemo" in d) or ("poke" in d): return "Google Pokemon"
-    if "kingsho" in d:   return "Google Kingsho"
-    if "crystal" in d:   return "Google Crystal"
-    if "the ki" in d:    return "GOOGLE *THE KI"
-    return "기타"
-
-use_csv = Path(TX_CSV_CLI).is_file()
-if use_csv:
-    df = pd.read_csv(TX_CSV_CLI)
-    assert {"거래일자","거래시간","출금(원)","내용","잔액(원)"} <= set(df.columns), "CSV 컬럼명 불일치"
-else:
-    df = pd.DataFrame(ROWS, columns=COLS)
-
-df["출금"] = df["출금(원)"].map(kr_to_int)
-df["입금"] = df.get("입금(원)", 0)
-if not pd.api.types.is_integer_dtype(df["입금"]):
-    df["입금"] = df["입금"].apply(kr_to_int)
-
-df["잔액"] = df["잔액(원)"].map(kr_to_int)
-df["일시"] = pd.to_datetime(df["거래일자"] + " " + df["거래시간"])
-df["카테고리"] = df["내용"].map(categorize)
-
-total_out = int(df["출금"].sum())
-n_tx = int((df["출금"] > 0).sum())
-by_cat = df.groupby("카테고리", as_index=False)["출금"].sum().sort_values("출금", ascending=False)
-
-out_dir = Path("out"); out_dir.mkdir(parents=True, exist_ok=True)
-(df.sort_values("일시")).to_csv(out_dir / "transactions_clean.csv", index=False, encoding="utf-8-sig")
-
-with pd.ExcelWriter(out_dir / "bank_statement_summary.xlsx", engine="xlsxwriter",
-                    datetime_format="yyyy-mm-dd HH:MM:SS") as xl:
-    df.sort_values("일시").to_excel(xl, index=False, sheet_name="Transactions")
-    by_cat.to_excel(xl, index=False, sheet_name="SummaryByCategory")
-    pd.DataFrame({
-        "항목": ["총 출금액", "거래 건수", "기간", "입력소스"],
-        "값": [f"{total_out:,}원", f"{n_tx}건",
-               f"{df['거래일자'].min()} ~ {df['거래일자'].max()}",
-               ("CSV:" + TX_CSV_CLI) if use_csv else "내장 ROWS"],
-    }).to_excel(xl, index=False, sheet_name="Summary")
-
-print("=== 명세서 요약 ===")
-print(f"- 총 출금액: {total_out:,}원")
-print(f"- 거래 건수: {n_tx}건")
-print("\n[카테고리별 합계]")
-for _, r in by_cat.iterrows():
-    print(f"  • {r['카테고리']}: {int(r['출금']):,}원")
-PY
-            chmod +x make_statement.py
+            echo "pom.xml이 이미 존재합니다. (사용자 프로젝트 우선)"
           fi
 
-      - name: Run script (generate Excel/CSV)
+      - name: Build (Maven + Shade)
         shell: bash
         run: |
           set -Eeuo pipefail
-          TX_CSV="${{ github.event.inputs.tx_csv_path || 'raw/transactions.csv' }}"
-          if [ -f "$TX_CSV" ]; then
-            echo "${ECHO_OK} Using CSV → $TX_CSV" | tee -a "$LOG_DIR/flow.log"
-            python make_statement.py "$TX_CSV" 2>&1 | tee -a "$LOG_DIR/flow.log"
-          else
-            echo "${ECHO_WARN} No CSV found, using embedded rows" | tee -a "$LOG_DIR/flow.log"
-            python make_statement.py 2>&1 | tee -a "$LOG_DIR/flow.log"
-          fi
-          echo "${ECHO_OK} Script done" | tee -a "$LOG_DIR/flow.log"
+          source /tmp/echo_helpers.sh
+          run mvn -B -q -DskipTests package
+          echoe "패키징 완료: target/bank-ledger-1.0.0-shaded.jar (또는 사용자 설정)"
 
-      - name: Echo transactions into logs (자동 포함)
+      - name: Run viewer (자바 명령어 실행)
         shell: bash
+        env:
+          LEDGER_PATH: ${{ inputs.ledger_path }}
+          FROM_DATE: ${{ inputs.from_date }}
+          TO_DATE: ${{ inputs.to_date }}
+          SHEET_NAME: ${{ inputs.sheet_name }}
         run: |
           set -Eeuo pipefail
-          if [ ! -f "$OUT_DIR/transactions_clean.csv" ]; then
-            echo "${ECHO_FAIL} $OUT_DIR/transactions_clean.csv not found" | tee -a "$LOG_DIR/flow.log"
+          source /tmp/echo_helpers.sh
+          JAR="$(ls -1 target/*-shaded.jar 2>/dev/null | head -n1 || true)"
+          if [[ -z "${JAR}" ]]; then
+            # shade 결과명이 다를 경우 fallback (artifactId가 다를 때)
+            JAR="$(ls -1 target/*jar-with-dependencies.jar 2>/dev/null | head -n1 || true)"
+          fi
+          if [[ -z "${JAR}" ]]; then
+            faile "실행 JAR을 찾지 못했습니다. shade 플러그인 산출물이 없습니다."
             exit 1
           fi
-          {
-            echo "=== BEGIN TRANSACTIONS CSV ==="
-            cat "$OUT_DIR/transactions_clean.csv"
-            echo "=== END TRANSACTIONS CSV ==="
-          } | tee -a "$LOG_DIR/flow.log" > "$LOG_DIR/transactions.log"
 
-          (cd "$OUT_DIR" && sha256sum bank_statement_summary.xlsx transactions_clean.csv) \
-            | tee -a "$LOG_DIR/flow.log" > "$LOG_DIR/checksums.sha256"
+          echo "----- 실행 파라미터 요약 -----"
+          echo "LEDGER_PATH=${LEDGER_PATH:-'(빈값: 샘플 CSV 자동 생성)'}"
+          echo "FROM_DATE=${FROM_DATE}"
+          echo "TO_DATE=${TO_DATE}"
+          echo "SHEET_NAME=${SHEET_NAME}"
+          echo "------------------------------"
 
-          echo "${ECHO_OK} Transactions echoed & checksums created" | tee -a "$LOG_DIR/flow.log"
+          run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
-      - name: Attach additional docs (지출 줄이기 정리 등)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          DOCS_INPUT="${{ github.event.inputs.docs_glob || 'docs/**' }}"
-          echo "Docs glob: $DOCS_INPUT" | tee -a "$LOG_DIR/flow.log"
-          IFS=',' read -r -a GLOBS <<< "$DOCS_INPUT"
-          DOC_COUNT=0
-          shopt -s nullglob
-          for g in "${GLOBS[@]}"; do
-            g_trim="$(echo "$g" | sed 's/^ *//;s/ *$//')"
-            for f in $g_trim; do
-              mkdir -p "$OUT_DIR/docs"
-              base="$(basename "$f")"
-              cp "$f" "$OUT_DIR/docs/$base"
-              echo "${ECHO_OK} Attached doc: $f → $OUT_DIR/docs/$base" | tee -a "$LOG_DIR/flow.log"
-              DOC_COUNT=$((DOC_COUNT+1))
-            done
-          done
-          shopt -u nullglob
-          if [ "$DOC_COUNT" -eq 0 ]; then
-            echo "${ECHO_WARN} No docs matched pattern(s): $DOCS_INPUT" | tee -a "$LOG_DIR/flow.log"
-          else
-            echo "${ECHO_OK} Total attached docs: $DOC_COUNT" | tee -a "$LOG_DIR/flow.log"
-          fi
-
-      - name: Upload artifacts (Excel/CSV + logs + docs)
+      - name: Upload logs/artifacts (optional)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bank-statement-artifacts
+          name: java-ledger-logs
           path: |
-            out/bank_statement_summary.xlsx
-            out/transactions_clean.csv
-            out/docs/**
-            .github/echo_logs/flow.log
-            .github/echo_logs/transactions.log
-            .github/echo_logs/checksums.sha256
-          if-no-files-found: error
+            ${LOG_DIR}
+            target/*.jar
+            data/*.csv
+          if-no-files-found: ignore
