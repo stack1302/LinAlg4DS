@@ -1,4 +1,4 @@
-name: "🏦 Java Ledger Viewer (Ultra Echo + .github Excel Auto-Discovery + LFS + Maven/Gradle + Self-Heal + Release)"
+name: "🏦 Java Ledger Viewer (Ultra Echo + .github Excel Auto-Discovery + LFS + Maven/Gradle + Self-Heal + TypePatch + Release)"
 
 on:
   workflow_dispatch:
@@ -72,7 +72,7 @@ jobs:
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      # 1) pom.xml이 없으면 정상 POM + 자동탐색 자바코드 생성
+      # 1) pom.xml 없으면 정상 POM + 자바 본문 생성(자동탐색 포함)
       - name: Bootstrap minimal Maven project when pom.xml is missing
         if: hashFiles('**/pom.xml') == ''
         shell: bash
@@ -123,9 +123,7 @@ jobs:
                   <groupId>org.apache.maven.plugins</groupId>
                   <artifactId>maven-compiler-plugin</artifactId>
                   <version>3.13.0</version>
-                  <configuration>
-                    <release>21</release>
-                  </configuration>
+                  <configuration><release>21</release></configuration>
                 </plugin>
                 <plugin>
                   <groupId>org.apache.maven.plugins</groupId>
@@ -134,9 +132,7 @@ jobs:
                   <executions>
                     <execution>
                       <phase>package</phase>
-                      <goals>
-                        <goal>shade</goal>
-                      </goals>
+                      <goals><goal>shade</goal></goals>
                       <configuration>
                         <createDependencyReducedPom>false</createDependencyReducedPom>
                         <transformers>
@@ -153,7 +149,7 @@ jobs:
           </project>
           POM
 
-          # 자동탐색/표출/요약 포함 Java 본문
+          # 초기 Java 본문(이후 패치 스텝에서 안전하게 덮어씀)
           cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
           package com.example;
 
@@ -174,6 +170,78 @@ jobs:
 
           public class BankLedger {
               record Row(LocalDate date, String time, String type, long amount, String memo, Long balance, String account){}
+
+              static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
+                      DateTimeFormatter.ofPattern("yyyy-MM-dd"),
+                      DateTimeFormatter.ofPattern("yyyy.M.d"),
+                      DateTimeFormatter.ofPattern("yyyy/M/d")
+              };
+
+              public static void main(String[] args) throws Exception {
+                  System.out.println("Bootstrap placeholder — 다음 패치 스텝에서 본문 교체됨");
+              }
+          }
+          JAVA
+
+          echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
+
+      # 2) (외부/기존 POM 방어) shade <transformer> 태그 자동 치유
+      - name: Self-heal POM shade <transformer> tag if broken
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          POM_PATH="${POM_PATH:-}"
+          if [[ -z "${POM_PATH}" ]]; then
+            POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
+          fi
+          if [[ -z "${POM_PATH}" ]]; then
+            warne "POM 미발견 → Self-heal 스킵"; exit 0
+          fi
+          NEED_FIX="$(
+            awk '
+              /<transformers>/ {inT=1}
+              inT && /<\/transformers>/ { if (count==0) print "MISSING"; inT=0; count=0 }
+              inT && /<transformer[ >]/ { count++ }
+            ' "${POM_PATH}" || true
+          )"
+          if [[ "${NEED_FIX:-}" == "MISSING" ]]; then
+            awk '
+              /<transformers>/ {print; inT=1; next}
+              inT && /<\/transformers>/ {print "                    </transformer>"; print; inT=0; next}
+              {print}
+            ' "${POM_PATH}" > "${POM_PATH}.fixed"
+            mv "${POM_PATH}.fixed" "${POM_PATH}"
+            echo "✅ POM transformer 태그 자동 보정 완료"
+          else
+            echo "✅ POM transformer 태그 정상"
+          fi
+
+      # 3) POI Row 타입 충돌 패치(Record Row → LedgerRow, 풀네임 사용)
+      - name: Patch BankLedger.java (fix POI Row clash + full implementation)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
+          package com.example;
+
+          import org.apache.commons.csv.CSVFormat;
+          import org.apache.commons.csv.CSVParser;
+          import org.apache.commons.csv.CSVRecord;
+          import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+          import org.apache.poi.ss.usermodel.*;
+          import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+          import java.io.*;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.*;
+          import java.time.LocalDate;
+          import java.time.format.DateTimeFormatter;
+          import java.util.*;
+          import java.util.stream.Stream;
+
+          public class BankLedger {
+              record LedgerRow(LocalDate date, String time, String type, long amount, String memo, Long balance, String account){}
 
               static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
                       DateTimeFormatter.ofPattern("yyyy-MM-dd"),
@@ -212,7 +280,7 @@ jobs:
                   LocalDate fromDate = parseDateOrNull(from);
                   LocalDate toDate   = parseDateOrNull(to);
 
-                  List<Row> rows;
+                  List<LedgerRow> rows;
                   String lower = path.toLowerCase(Locale.ROOT);
                   if (lower.endsWith(".csv")) {
                       rows = readCsv(path);
@@ -239,6 +307,7 @@ jobs:
                   }
               }
 
+              // .github 최신 파일 자동탐색: xlsx → xls → csv
               static Optional<Path> autoDiscover() {
                   List<String> patterns = List.of(".github/**/*.xlsx", ".github/**/*.xls", ".github/**/*.csv");
                   return patterns.stream().map(BankLedger::globLatest).filter(Objects::nonNull).findFirst();
@@ -275,10 +344,10 @@ jobs:
                   return null;
               }
 
-              static List<Row> readCsv(String path) throws IOException {
+              static List<LedgerRow> readCsv(String path) throws IOException {
                   try (Reader in = Files.newBufferedReader(Paths.get(path), StandardCharsets.UTF_8)) {
                       CSVParser p = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).build().parse(in);
-                      List<Row> out = new ArrayList<>();
+                      List<LedgerRow> out = new ArrayList<>();
                       for (CSVRecord r: p) {
                           LocalDate d = parseDateOrNull(r.get("date"));
                           String time = getSafe(r, "time");
@@ -287,19 +356,19 @@ jobs:
                           String memo = getSafe(r, "memo");
                           Long bal = parseLongSafeNullable(getSafe(r, "balance"));
                           String account = getSafe(r, "account");
-                          if (d != null) out.add(new Row(d,time,type,amount,memo,bal,account));
+                          if (d != null) out.add(new LedgerRow(d,time,type,amount,memo,bal,account));
                       }
                       return out;
                   }
               }
 
-              static List<Row> readExcel(String path, String sheetName) throws IOException {
+              static List<LedgerRow> readExcel(String path, String sheetName) throws IOException {
                   try (InputStream is = Files.newInputStream(Paths.get(path))) {
                       Workbook wb = path.toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
                       Sheet sheet = (sheetName != null && !sheetName.isBlank()) ? wb.getSheet(sheetName) : wb.getSheetAt(0);
 
                       Map<String,Integer> idx = new HashMap<>();
-                      Iterator<Row> it = sheet.rowIterator();
+                      java.util.Iterator<org.apache.poi.ss.usermodel.Row> it = sheet.rowIterator();
                       if (!it.hasNext()) return List.of();
                       org.apache.poi.ss.usermodel.Row hr = it.next();
                       for (Cell c: hr) {
@@ -307,7 +376,7 @@ jobs:
                           idx.put(c.getStringCellValue().toLowerCase(Locale.ROOT), c.getColumnIndex());
                       }
 
-                      List<Row> out = new ArrayList<>();
+                      List<LedgerRow> out = new ArrayList<>();
                       while (it.hasNext()) {
                           org.apache.poi.ss.usermodel.Row rr = it.next();
                           LocalDate d = parseDateOrNull(cellStr(rr, idx.getOrDefault("date",-1)));
@@ -318,7 +387,7 @@ jobs:
                           String memo = cellStr(rr, idx.getOrDefault("memo",-1));
                           Long bal = parseLongSafeNullable(cellStr(rr, idx.getOrDefault("balance",-1)));
                           String account = cellStr(rr, idx.getOrDefault("account",-1));
-                          out.add(new Row(d,time,type,amount,memo,bal,account));
+                          out.add(new LedgerRow(d,time,type,amount,memo,bal,account));
                       }
                       wb.close();
                       return out;
@@ -352,10 +421,10 @@ jobs:
                   try { return Long.parseLong(t); } catch (Exception e) { return null; }
               }
 
-              static List<Row> filterByDate(List<Row> in, LocalDate from, LocalDate to) {
+              static List<LedgerRow> filterByDate(List<LedgerRow> in, LocalDate from, LocalDate to) {
                   if (from == null && to == null) return in;
-                  List<Row> out = new ArrayList<>();
-                  for (Row r: in) {
+                  List<LedgerRow> out = new ArrayList<>();
+                  for (LedgerRow r: in) {
                       boolean ok = true;
                       if (from != null && r.date.isBefore(from)) ok = false;
                       if (to != null && r.date.isAfter(to)) ok = false;
@@ -364,10 +433,10 @@ jobs:
                   return out;
               }
 
-              static void printTable(List<Row> rows) {
+              static void printTable(List<LedgerRow> rows) {
                   System.out.println("date       | time     | type   | amount  | memo             | balance   | account");
                   System.out.println("-----------+----------+--------+---------+------------------+-----------+--------");
-                  for (Row r: rows) {
+                  for (LedgerRow r: rows) {
                       System.out.printf("%-10s | %-8s | %-6s | %8s | %-16s | %9s | %s%n",
                               r.date, nv(r.time), nv(r.type), fmt(r.amount), nv(r.memo),
                               r.balance==null? "-" : fmt(r.balance), nv(r.account));
@@ -378,47 +447,7 @@ jobs:
           }
           JAVA
 
-          echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
-          echo "JAVA_MAIN=com.example.BankLedger" >> "$GITHUB_ENV"
-
-      # 2) (기존/외부 POM 방어) shade <transformer> 태그 자동 치유
-      - name: Self-heal POM shade <transformer> tag if broken
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          POM_PATH="${POM_PATH:-}"
-          if [[ -z "${POM_PATH}" ]]; then
-            POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
-          fi
-          if [[ -z "${POM_PATH}" ]]; then
-            warne "POM 미발견 → Self-heal 스킵"
-            exit 0
-          fi
-          echo "Target POM: ${POM_PATH}"
-
-          # transformer 종료태그 누락 케이스 방어
-          NEED_FIX="$(
-            awk '
-              /<transformers>/ {inT=1}
-              inT && /<\/transformers>/ { if (count==0) { print "MISSING"; } inT=0; count=0 }
-              inT && /<transformer[ >]/ { count++ }
-            ' "${POM_PATH}" || true
-          )"
-
-          if [[ "${NEED_FIX:-}" == "MISSING" ]]; then
-            awk '
-              /<transformers>/ {print; inT=1; next}
-              inT && /<\/transformers>/ {print "                    </transformer>"; print; inT=0; next}
-              {print}
-            ' "${POM_PATH}" > "${POM_PATH}.fixed"
-            mv "${POM_PATH}.fixed" "${POM_PATH}"
-            echoe "POM transformer 태그 자동 보정 완료"
-          else
-            echoe "POM transformer 태그 정상"
-          fi
-
-      # 3) JDK/캐시
+      # 4) JDK/캐시
       - name: Setup Java (Temurin 21 + Maven cache if pom exists)
         if: hashFiles('**/pom.xml') != ''
         uses: actions/setup-java@v4
@@ -435,7 +464,7 @@ jobs:
           java-version: '21'
           cache: gradle
 
-      # 4) Build (Maven 또는 Gradle 자동 감지)
+      # 5) Build (Maven 또는 Gradle 자동 감지)
       - name: Build (auto-detect Maven/Gradle; include untracked)
         shell: bash
         run: |
@@ -495,7 +524,7 @@ jobs:
             fi
           fi
 
-      # 5) Run Viewer
+      # 6) Run Viewer
       - name: Run viewer (java -jar)
         shell: bash
         env:
@@ -513,7 +542,7 @@ jobs:
           test -n "${JAR:-}" || { faile "JAR 환경변수가 비어 있습니다."; exit 1; }
           run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
-      # 6) (옵션) 릴리즈 생성
+      # 7) (옵션) 릴리즈 생성
       - name: Create GitHub Release (optional)
         if: ${{ inputs.create_release == true }}
         uses: softprops/action-gh-release@v2
@@ -527,7 +556,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 7) 아티팩트 업로드
+      # 8) 아티팩트 업로드
       - name: Upload artifacts (logs + jars + discovered files)
         if: always()
         uses: actions/upload-artifact@v4
