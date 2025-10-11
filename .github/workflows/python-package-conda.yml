@@ -1,66 +1,78 @@
-name: "🏦 Java Ledger Viewer (Echo + .github Excel Auto-Discovery)"
+name: "🏦 Java Ledger Viewer (Ultra Echo, LFS, .github Excel Auto-Discovery, Maven/Gradle, Release)"
 
 on:
   workflow_dispatch:
     inputs:
       ledger_path:
-        description: "통장 파일 경로 (CSV/XLS/XLSX). 비우면 .github/에서 자동 탐색"
+        description: "통장 파일 경로 (CSV/XLS/XLSX). 비우면 .github/에서 자동탐색"
         required: false
         default: ""
       from_date:
-        description: "조회 시작일 (YYYY-MM-DD, 선택)"
+        description: "조회 시작일 (YYYY-MM-DD)"
         required: false
         default: ""
       to_date:
-        description: "조회 종료일 (YYYY-MM-DD, 선택)"
+        description: "조회 종료일 (YYYY-MM-DD)"
         required: false
         default: ""
       sheet_name:
-        description: "엑셀 시트명 (선택, 미지정 시 첫 시트)"
+        description: "엑셀 시트명(선택, 미지정 시 첫 시트)"
         required: false
         default: ""
+      create_release:
+        description: "빌드 산출물로 GitHub Release 생성"
+        type: boolean
+        required: false
+        default: false
 
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
+  DL_DIR: .github/echo_downloads
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
+
+permissions:
+  contents: write   # 릴리즈/아티팩트 업로드용
+  actions: read
 
 jobs:
   view-ledger:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
         with:
-          lfs: true  # LFS 포인터 파일이면 자동으로 당겨옴
+          lfs: true
 
-      - name: Git LFS ensure (대형 엑셀 대비)
+      - name: Ensure Git LFS (optional)
         shell: bash
         run: |
           set -Eeuo pipefail
           git lfs install
           git lfs pull || true
 
-      - name: Echo helpers
+      - name: Setup Echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}"
+          mkdir -p "${LOG_DIR}" "${DL_DIR}"
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
-          echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
-          warne(){ printf '%s %s\n' "${ECHO_WARN}" "$*"; }
-          faile(){ printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
-          run(){ printf '▶ %s\n' "$*" ; eval "$@"; }
+          log(){ printf '%s %s\n' "$1" "$2" | tee -a "${LOG_DIR}/echo.log"; }
+          echoe(){ log "${ECHO_OK}" "$*"; }
+          warne(){ log "${ECHO_WARN}" "$*"; }
+          faile(){ log "${ECHO_FAIL}" "$*"; }
+          run(){ printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/echo.log" ; eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo.log"; }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      # ✅ pom.xml 없으면 먼저 부트스트랩
+      # ===== 1) 프로젝트 부트스트랩 (pom.xml 없으면 생성) =====
       - name: Bootstrap minimal Maven project when pom.xml is missing
         if: hashFiles('**/pom.xml') == ''
         shell: bash
@@ -68,7 +80,7 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           echoe "pom.xml 미존재 → 최소 Maven 프로젝트 생성 (app/)"
-          mkdir -p app/src/main/java/com/example app/src/main/resources
+          run mkdir -p app/src/main/java/com/example app/src/main/resources
           cat > app/pom.xml <<'POM'
           <?xml version="1.0" encoding="UTF-8"?>
           <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -136,9 +148,8 @@ jobs:
           </project>
           POM
 
-          # Java 소스 생성/갱신
+          # 자바 소스(자동탐색 완전판)
           cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
-          // ⬇️ 이 파일은 .github 경로 엑셀 자동 탐색 기능 포함 (아래 2) Java 코드 참고)
           package com.example;
 
           import org.apache.commons.csv.CSVFormat;
@@ -171,14 +182,13 @@ jobs:
                   String to   = argOrEnv(args, 2, "TO_DATE", "");
                   String sheetName = System.getenv().getOrDefault("SHEET_NAME", "");
 
-                  // ✅ 입력이 비어 있으면 .github/ 아래에서 자동 탐색 (xlsx → xls → csv)
                   if (path.isBlank()) {
                       Optional<Path> found = autoDiscover();
                       if (found.isPresent()) {
                           path = found.get().toString();
                           System.out.println("🔎 Auto-discovered ledger: " + path);
                       } else {
-                          System.out.println("⚠️ .github/ 내 통장 파일을 찾지 못해 샘플 CSV를 생성합니다: data/sample_ledger.csv");
+                          System.out.println("⚠️ .github/ 내 통장 파일을 찾지 못해 샘플 CSV 생성: data/sample_ledger.csv");
                           Path p = Paths.get("data"); Files.createDirectories(p);
                           Path csv = p.resolve("sample_ledger.csv");
                           String sample = String.join("\n", List.of(
@@ -208,35 +218,27 @@ jobs:
                       return;
                   }
 
-                  // 날짜 필터
                   rows = filterByDate(rows, fromDate, toDate);
 
-                  // 출력
                   printTable(rows);
 
-                  // 요약
                   long totalOut = rows.stream().mapToLong(r -> r.amount).sum();
                   Long lastBalance = rows.stream().filter(r -> r.balance != null).reduce((a,b)->b).map(r->r.balance).orElse(null);
 
                   System.out.println();
                   System.out.println("==== 요약 ====");
                   System.out.printf("거래 건수  : %,d%n", rows.size());
-                  System.out.printf("총 출금합계: %,d원 (amount 컬럼 합)%n", totalOut);
+                  System.out.printf("총 출금합계: %,d원 (amount 합)%n", totalOut);
                   if (lastBalance != null) {
                       System.out.printf("마지막 잔액: %,d원%n", lastBalance);
                   }
               }
 
-              // .github/에서 최신 파일 1개 자동 탐색
               static Optional<Path> autoDiscover() {
                   List<String> patterns = List.of(".github/**/*.xlsx", ".github/**/*.xls", ".github/**/*.csv");
-                  return patterns.stream()
-                          .map(BankLedger::globLatest)
-                          .filter(Objects::nonNull)
-                          .findFirst();
+                  return patterns.stream().map(BankLedger::globLatest).filter(Objects::nonNull).findFirst();
               }
 
-              // glob으로 가장 최근 수정된 파일
               static Path globLatest(String pattern) {
                   try {
                       Path root = Paths.get(".");
@@ -244,12 +246,9 @@ jobs:
                               (p, attr) -> p.toString().replace('\\','/').matches(globToRegex(pattern)) && attr.isRegularFile())) {
                           return s.max(Comparator.comparingLong(p -> p.toFile().lastModified())).orElse(null);
                       }
-                  } catch (Exception ignore) {
-                      return null;
-                  }
+                  } catch (Exception ignore) { return null; }
               }
 
-              // 간단한 glob -> regex (**, *, ?)
               static String globToRegex(String glob) {
                   String g = glob.replace(".", "\\.")
                           .replace("**/", "(.*/)?")
@@ -266,20 +265,14 @@ jobs:
 
               static LocalDate parseDateOrNull(String s) {
                   if (s == null || s.isBlank()) return null;
-                  for (var fmt: DATE_FMTS) {
-                      try { return LocalDate.parse(s.trim(), fmt); } catch (Exception ignore) {}
-                  }
+                  for (var fmt: DATE_FMTS) { try { return LocalDate.parse(s.trim(), fmt); } catch (Exception ignore) {} }
                   try { return LocalDate.parse(s.trim()); } catch (Exception ignore) {}
                   return null;
               }
 
               static List<Row> readCsv(String path) throws IOException {
                   try (Reader in = Files.newBufferedReader(Paths.get(path), StandardCharsets.UTF_8)) {
-                      CSVParser p = CSVFormat.DEFAULT.builder()
-                              .setHeader()
-                              .setSkipHeaderRecord(true)
-                              .setTrim(true)
-                              .build().parse(in);
+                      CSVParser p = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).build().parse(in);
                       List<Row> out = new ArrayList<>();
                       for (CSVRecord r: p) {
                           LocalDate d = parseDateOrNull(r.get("date"));
@@ -298,13 +291,8 @@ jobs:
               static List<Row> readExcel(String path, String sheetName) throws IOException {
                   try (InputStream is = Files.newInputStream(Paths.get(path))) {
                       Workbook wb = path.toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
-                      Sheet sheet = null;
-                      if (sheetName != null && !sheetName.isBlank()) {
-                          sheet = wb.getSheet(sheetName);
-                      }
-                      if (sheet == null) sheet = wb.getSheetAt(0);
+                      Sheet sheet = (sheetName != null && !sheetName.isBlank()) ? wb.getSheet(sheetName) : wb.getSheetAt(0);
 
-                      // 헤더 맵핑
                       Map<String,Integer> idx = new HashMap<>();
                       Iterator<Row> it = sheet.rowIterator();
                       if (!it.hasNext()) return List.of();
@@ -338,23 +326,15 @@ jobs:
                   if (c == null) return "";
                   return switch (c.getCellType()) {
                       case STRING -> c.getStringCellValue();
-                      case NUMERIC -> {
-                          if (DateUtil.isCellDateFormatted(c)) {
-                              var ld = c.getLocalDateTimeCellValue().toLocalDate();
-                              yield ld.toString();
-                          } else {
-                              yield String.valueOf(Math.round(c.getNumericCellValue()));
-                          }
-                      }
+                      case NUMERIC -> DateUtil.isCellDateFormatted(c)
+                              ? c.getLocalDateTimeCellValue().toLocalDate().toString()
+                              : String.valueOf(Math.round(c.getNumericCellValue()));
                       case BOOLEAN -> String.valueOf(c.getBooleanCellValue());
                       default -> "";
                   };
               }
 
-              static String getSafe(CSVRecord r, String key) {
-                  try { return r.get(key); } catch (Exception e) { return ""; }
-              }
-
+              static String getSafe(CSVRecord r, String key) { try { return r.get(key); } catch (Exception e) { return ""; } }
               static long parseLongSafe(String s) {
                   if (s == null) return 0L;
                   String t = s.replaceAll("[^0-9-]", "");
@@ -393,41 +373,89 @@ jobs:
           }
           JAVA
 
-      - name: Setup Java (Temurin 21) + Maven cache
+          # 🔑 생성된 pom 경로를 전역 환경에 저장 (git 미추적이어도 후속 스텝에서 인식)
+          echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
+
+      # ===== 2) JDK + 캐시 =====
+      - name: Setup Java (Temurin 21) + Maven cache (if pom exists)
+        if: hashFiles('**/pom.xml') != ''
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
           cache: maven
 
-      - name: Build (auto-detect pom path)
+      # ===== 3) Build (Maven 또는 Gradle 자동 감지) =====
+      - name: Build (auto-detect Maven/Gradle; include untracked)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          POM_PATH="$(git ls-files '**/pom.xml' | head -n1 || true)"
+
+          # 1) bootstrap 단계에서 설정한 값 우선
+          POM_PATH="${POM_PATH:-}"
+
+          # 2) find로 검색 (git 미추적 포함)
           if [[ -z "${POM_PATH}" ]]; then
-            faile "pom.xml을 찾지 못했습니다."
-            exit 1
+            POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
           fi
-          WORKDIR="$(dirname "${POM_PATH}")"
-          echo "Detected pom: ${POM_PATH}"
-          run mvn -B -q -DskipTests -f "${POM_PATH}" package
 
-          JAR="$(ls -1 "${WORKDIR}"/target/*-shaded.jar 2>/dev/null | head -n1 || true)"
-          if [[ -z "${JAR}" ]]; then
-            JAR="$(ls -1 "${WORKDIR}"/target/*jar-with-dependencies.jar 2>/dev/null | head -n1 || true)"
-          fi
-          if [[ -z "${JAR}" ]]; then
-            faile "실행 JAR을 찾지 못했습니다 (shade 산출물 없음)."
-            exit 1
-          fi
-          echo "JAR=${JAR}" >> $GITHUB_ENV
+          if [[ -n "${POM_PATH}" ]]; then
+            echo "Detected pom: ${POM_PATH}"
+            WORKDIR="$(dirname "${POM_PATH}")"
+            run mvn -B -q -DskipTests -f "${POM_PATH}" package
+            JAR="$(ls -1 "${WORKDIR}"/target/*-shaded.jar 2>/dev/null | head -n1 || true)"
+            if [[ -z "${JAR}" ]]; then
+              JAR="$(ls -1 "${WORKDIR}"/target/*jar-with-dependencies.jar 2>/dev/null | head -n1 || true)"
+            fi
+            if [[ -z "${JAR}" ]]; then
+              faile "실행 JAR을 찾지 못했습니다 (shade 산출물 없음)."
+              ls -al "${WORKDIR}/target" || true
+              exit 1
+            fi
+            echo "JAR=${JAR}" >> "$GITHUB_ENV"
+          else
+            # Maven 없음 → Gradle 시도
+            if [[ -f gradlew || -f build.gradle || -f build.gradle.kts ]]; then
+              if [[ -f gradlew ]]; then
+                run chmod +x gradlew
+                # shadow 플러그인이 있으면 shadowJar, 없으면 build
+                if ./gradlew tasks | grep -q '^shadowJar'; then
+                  run ./gradlew -q shadowJar
+                  JAR="$(ls -1 build/libs/*-all.jar 2>/dev/null | head -n1 || true)"
+                  [[ -z "$JAR" ]] && JAR="$(ls -1 build/libs/*-shadow.jar 2>/dev/null | head -n1 || true)"
+                else
+                  run ./gradlew -q build
+                  JAR="$(ls -1 build/libs/*-all.jar 2>/dev/null | head -n1 || true)"
+                  [[ -z "$JAR" ]] && JAR="$(ls -1 build/libs/*-shadow.jar 2>/dev/null | head -n1 || true)"
+                  [[ -z "$JAR" ]] && JAR="$(ls -1 build/libs/*.jar 2>/dev/null | head -n1 || true)"
+                fi
+              else
+                # 시스템 gradle
+                run sudo apt-get update -y
+                run sudo apt-get install -y gradle || true
+                run gradle -q build
+                JAR="$(ls -1 build/libs/*.jar 2>/dev/null | head -n1 || true)"
+              fi
 
-      - name: Run viewer (자바 명령 실행)
+              if [[ -z "${JAR:-}" ]]; then
+                faile "Gradle JAR을 찾지 못했습니다."
+                ls -al build/libs || true
+                exit 1
+              fi
+              echo "JAR=${JAR}" >> "$GITHUB_ENV"
+            else
+              faile "pom.xml/Gradle 빌드 파일을 찾지 못했습니다."
+              find . -maxdepth 4 -type f \( -name pom.xml -o -name build.gradle -o -name build.gradle.kts \) -print || true
+              exit 1
+            fi
+          fi
+
+      # ===== 4) Run Viewer =====
+      - name: Run viewer (java -jar)
         shell: bash
         env:
-          LEDGER_PATH: ${{ inputs.ledger_path }}   # 비어 있으면 .github 자동 탐색
+          LEDGER_PATH: ${{ inputs.ledger_path }}
           FROM_DATE: ${{ inputs.from_date }}
           TO_DATE: ${{ inputs.to_date }}
           SHEET_NAME: ${{ inputs.sheet_name }}
@@ -438,16 +466,34 @@ jobs:
           echo "FROM_DATE=${FROM_DATE}"
           echo "TO_DATE=${TO_DATE}"
           echo "SHEET_NAME=${SHEET_NAME}"
+          test -n "${JAR:-}" || { faile "JAR 환경변수가 비어 있습니다."; exit 1; }
           run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
+      # ===== 5) (옵션) 릴리즈 생성 =====
+      - name: Create GitHub Release (optional)
+        if: ${{ inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "ledger-${{ github.run_id }}"
+          name: "Ledger Viewer Build ${{ github.run_id }}"
+          draft: false
+          prerelease: false
+          files: |
+            ${{ env.JAR }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ===== 6) 아티팩트 업로드 =====
       - name: Upload artifacts (logs + jars + discovered files)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: java-ledger-artifacts
+          name: ledger-artifacts-${{ github.run_id }}
           path: |
             ${LOG_DIR}
+            ${DL_DIR}
             **/target/*.jar
+            build/libs/*.jar
             data/*.csv
             .github/**/*.xlsx
             .github/**/*.xls
