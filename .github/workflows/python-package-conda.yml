@@ -1,10 +1,10 @@
-name: "🏦 Java Ledger Viewer (Echo + CSV/XLS/XLSX 지원)"
+name: "🏦 Java Ledger Viewer (Echo + .github Excel Auto-Discovery)"
 
 on:
   workflow_dispatch:
     inputs:
       ledger_path:
-        description: "통장 파일 경로 (CSV/XLS/XLSX). 예: data/bank_ledger.xlsx"
+        description: "통장 파일 경로 (CSV/XLS/XLSX). 비우면 .github/에서 자동 탐색"
         required: false
         default: ""
       from_date:
@@ -16,7 +16,7 @@ on:
         required: false
         default: ""
       sheet_name:
-        description: "엑셀 시트명 (XLS/XLSX일 때만, 미지정 시 첫 시트)"
+        description: "엑셀 시트명 (선택, 미지정 시 첫 시트)"
         required: false
         default: ""
 
@@ -32,8 +32,17 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true  # LFS 포인터 파일이면 자동으로 당겨옴
 
-      - name: Prepare Echo helpers
+      - name: Git LFS ensure (대형 엑셀 대비)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git lfs install
+          git lfs pull || true
+
+      - name: Echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -49,7 +58,340 @@ jobs:
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
-          echoe "Echo helpers ready at /tmp/echo_helpers.sh"
+          echoe "Echo helpers ready"
+
+      # ✅ pom.xml 없으면 먼저 부트스트랩
+      - name: Bootstrap minimal Maven project when pom.xml is missing
+        if: hashFiles('**/pom.xml') == ''
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          echoe "pom.xml 미존재 → 최소 Maven 프로젝트 생성 (app/)"
+          mkdir -p app/src/main/java/com/example app/src/main/resources
+          cat > app/pom.xml <<'POM'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.example</groupId>
+            <artifactId>bank-ledger</artifactId>
+            <version>1.0.0</version>
+            <properties>
+              <maven.compiler.source>21</maven.compiler.source>
+              <maven.compiler.target>21</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <dependencies>
+              <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-csv</artifactId>
+                <version>1.11.0</version>
+              </dependency>
+              <dependency>
+                <groupId>org.apache.poi</groupId>
+                <artifactId>poi</artifactId>
+                <version>5.2.5</version>
+              </dependency>
+              <dependency>
+                <groupId>org.apache.poi</groupId>
+                <artifactId>poi-ooxml</artifactId>
+                <version>5.2.5</version>
+              </dependency>
+              <dependency>
+                <groupId>org.apache.commons</groupId>
+                <artifactId>commons-lang3</artifactId>
+                <version>3.14.0</version>
+              </dependency>
+            </dependencies>
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-compiler-plugin</artifactId>
+                  <version>3.13.0</version>
+                  <configuration><release>21</release></configuration>
+                </plugin>
+                <plugin>
+                  <groupId>org.apache.maven.plugins</groupId>
+                  <artifactId>maven-shade-plugin</artifactId>
+                  <version>3.5.3</version>
+                  <executions>
+                    <execution>
+                      <phase>package</phase>
+                      <goals><goal>shade</goal></goals>
+                      <configuration>
+                        <createDependencyReducedPom>false</createDependencyReducedPom>
+                        <transformers>
+                          <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                            <mainClass>com.example.BankLedger</mainClass>
+                          </transformers>
+                        </configuration>
+                    </execution>
+                  </executions>
+                </plugin>
+              </plugins>
+            </build>
+          </project>
+          POM
+
+          # Java 소스 생성/갱신
+          cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
+          // ⬇️ 이 파일은 .github 경로 엑셀 자동 탐색 기능 포함 (아래 2) Java 코드 참고)
+          package com.example;
+
+          import org.apache.commons.csv.CSVFormat;
+          import org.apache.commons.csv.CSVParser;
+          import org.apache.commons.csv.CSVRecord;
+          import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+          import org.apache.poi.ss.usermodel.*;
+          import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+          import java.io.*;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.*;
+          import java.time.LocalDate;
+          import java.time.format.DateTimeFormatter;
+          import java.util.*;
+          import java.util.stream.Stream;
+
+          public class BankLedger {
+              record Row(LocalDate date, String time, String type, long amount, String memo, Long balance, String account){}
+
+              static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
+                      DateTimeFormatter.ofPattern("yyyy-MM-dd"),
+                      DateTimeFormatter.ofPattern("yyyy.M.d"),
+                      DateTimeFormatter.ofPattern("yyyy/M/d")
+              };
+
+              public static void main(String[] args) throws Exception {
+                  String path = argOrEnv(args, 0, "LEDGER_PATH", "");
+                  String from = argOrEnv(args, 1, "FROM_DATE", "");
+                  String to   = argOrEnv(args, 2, "TO_DATE", "");
+                  String sheetName = System.getenv().getOrDefault("SHEET_NAME", "");
+
+                  // ✅ 입력이 비어 있으면 .github/ 아래에서 자동 탐색 (xlsx → xls → csv)
+                  if (path.isBlank()) {
+                      Optional<Path> found = autoDiscover();
+                      if (found.isPresent()) {
+                          path = found.get().toString();
+                          System.out.println("🔎 Auto-discovered ledger: " + path);
+                      } else {
+                          System.out.println("⚠️ .github/ 내 통장 파일을 찾지 못해 샘플 CSV를 생성합니다: data/sample_ledger.csv");
+                          Path p = Paths.get("data"); Files.createDirectories(p);
+                          Path csv = p.resolve("sample_ledger.csv");
+                          String sample = String.join("\n", List.of(
+                                  "date,time,type,amount,memo,balance,account",
+                                  "2025-10-11,16:36:58,체크카드,10860,Google handj,1673419,원신한",
+                                  "2025-10-09,14:15:58,체크카드,53692,Google handj,190880,원신한",
+                                  "2025-10-09,12:41:23,체크카드,2682,Google Pokemon,144572,원신한",
+                                  "2025-10-08,15:40:43,체크카드,10731,Google handj,179288,원신한",
+                                  "2025-10-08,14:52:20,체크카드,32222,Google handj,190019,원신한"
+                          ));
+                          Files.writeString(csv, sample, StandardCharsets.UTF_8);
+                          path = csv.toString();
+                      }
+                  }
+
+                  LocalDate fromDate = parseDateOrNull(from);
+                  LocalDate toDate   = parseDateOrNull(to);
+
+                  List<Row> rows;
+                  String lower = path.toLowerCase(Locale.ROOT);
+                  if (lower.endsWith(".csv")) {
+                      rows = readCsv(path);
+                  } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
+                      rows = readExcel(path, sheetName);
+                  } else {
+                      System.out.println("❌ 지원하지 않는 확장자: " + path);
+                      return;
+                  }
+
+                  // 날짜 필터
+                  rows = filterByDate(rows, fromDate, toDate);
+
+                  // 출력
+                  printTable(rows);
+
+                  // 요약
+                  long totalOut = rows.stream().mapToLong(r -> r.amount).sum();
+                  Long lastBalance = rows.stream().filter(r -> r.balance != null).reduce((a,b)->b).map(r->r.balance).orElse(null);
+
+                  System.out.println();
+                  System.out.println("==== 요약 ====");
+                  System.out.printf("거래 건수  : %,d%n", rows.size());
+                  System.out.printf("총 출금합계: %,d원 (amount 컬럼 합)%n", totalOut);
+                  if (lastBalance != null) {
+                      System.out.printf("마지막 잔액: %,d원%n", lastBalance);
+                  }
+              }
+
+              // .github/에서 최신 파일 1개 자동 탐색
+              static Optional<Path> autoDiscover() {
+                  List<String> patterns = List.of(".github/**/*.xlsx", ".github/**/*.xls", ".github/**/*.csv");
+                  return patterns.stream()
+                          .map(BankLedger::globLatest)
+                          .filter(Objects::nonNull)
+                          .findFirst();
+              }
+
+              // glob으로 가장 최근 수정된 파일
+              static Path globLatest(String pattern) {
+                  try {
+                      Path root = Paths.get(".");
+                      try (Stream<Path> s = Files.find(root, Integer.MAX_VALUE,
+                              (p, attr) -> p.toString().replace('\\','/').matches(globToRegex(pattern)) && attr.isRegularFile())) {
+                          return s.max(Comparator.comparingLong(p -> p.toFile().lastModified())).orElse(null);
+                      }
+                  } catch (Exception ignore) {
+                      return null;
+                  }
+              }
+
+              // 간단한 glob -> regex (**, *, ?)
+              static String globToRegex(String glob) {
+                  String g = glob.replace(".", "\\.")
+                          .replace("**/", "(.*/)?")
+                          .replace("**", ".*")
+                          .replace("*", "[^/]*")
+                          .replace("?", ".");
+                  return "^" + g + "$";
+              }
+
+              static String argOrEnv(String[] args, int idx, String env, String def) {
+                  if (args.length > idx && args[idx] != null && !args[idx].isBlank()) return args[idx];
+                  return System.getenv().getOrDefault(env, def);
+              }
+
+              static LocalDate parseDateOrNull(String s) {
+                  if (s == null || s.isBlank()) return null;
+                  for (var fmt: DATE_FMTS) {
+                      try { return LocalDate.parse(s.trim(), fmt); } catch (Exception ignore) {}
+                  }
+                  try { return LocalDate.parse(s.trim()); } catch (Exception ignore) {}
+                  return null;
+              }
+
+              static List<Row> readCsv(String path) throws IOException {
+                  try (Reader in = Files.newBufferedReader(Paths.get(path), StandardCharsets.UTF_8)) {
+                      CSVParser p = CSVFormat.DEFAULT.builder()
+                              .setHeader()
+                              .setSkipHeaderRecord(true)
+                              .setTrim(true)
+                              .build().parse(in);
+                      List<Row> out = new ArrayList<>();
+                      for (CSVRecord r: p) {
+                          LocalDate d = parseDateOrNull(r.get("date"));
+                          String time = getSafe(r, "time");
+                          String type = getSafe(r, "type");
+                          long amount = parseLongSafe(getSafe(r, "amount"));
+                          String memo = getSafe(r, "memo");
+                          Long bal = parseLongSafeNullable(getSafe(r, "balance"));
+                          String account = getSafe(r, "account");
+                          if (d != null) out.add(new Row(d,time,type,amount,memo,bal,account));
+                      }
+                      return out;
+                  }
+              }
+
+              static List<Row> readExcel(String path, String sheetName) throws IOException {
+                  try (InputStream is = Files.newInputStream(Paths.get(path))) {
+                      Workbook wb = path.toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
+                      Sheet sheet = null;
+                      if (sheetName != null && !sheetName.isBlank()) {
+                          sheet = wb.getSheet(sheetName);
+                      }
+                      if (sheet == null) sheet = wb.getSheetAt(0);
+
+                      // 헤더 맵핑
+                      Map<String,Integer> idx = new HashMap<>();
+                      Iterator<Row> it = sheet.rowIterator();
+                      if (!it.hasNext()) return List.of();
+                      org.apache.poi.ss.usermodel.Row hr = it.next();
+                      for (Cell c: hr) {
+                          c.setCellType(CellType.STRING);
+                          idx.put(c.getStringCellValue().toLowerCase(Locale.ROOT), c.getColumnIndex());
+                      }
+
+                      List<Row> out = new ArrayList<>();
+                      while (it.hasNext()) {
+                          org.apache.poi.ss.usermodel.Row rr = it.next();
+                          LocalDate d = parseDateOrNull(cellStr(rr, idx.getOrDefault("date",-1)));
+                          if (d == null) continue;
+                          String time = cellStr(rr, idx.getOrDefault("time",-1));
+                          String type = cellStr(rr, idx.getOrDefault("type",-1));
+                          long amount = parseLongSafe(cellStr(rr, idx.getOrDefault("amount",-1)));
+                          String memo = cellStr(rr, idx.getOrDefault("memo",-1));
+                          Long bal = parseLongSafeNullable(cellStr(rr, idx.getOrDefault("balance",-1)));
+                          String account = cellStr(rr, idx.getOrDefault("account",-1));
+                          out.add(new Row(d,time,type,amount,memo,bal,account));
+                      }
+                      wb.close();
+                      return out;
+                  }
+              }
+
+              static String cellStr(org.apache.poi.ss.usermodel.Row r, int cidx) {
+                  if (cidx < 0) return "";
+                  Cell c = r.getCell(cidx);
+                  if (c == null) return "";
+                  return switch (c.getCellType()) {
+                      case STRING -> c.getStringCellValue();
+                      case NUMERIC -> {
+                          if (DateUtil.isCellDateFormatted(c)) {
+                              var ld = c.getLocalDateTimeCellValue().toLocalDate();
+                              yield ld.toString();
+                          } else {
+                              yield String.valueOf(Math.round(c.getNumericCellValue()));
+                          }
+                      }
+                      case BOOLEAN -> String.valueOf(c.getBooleanCellValue());
+                      default -> "";
+                  };
+              }
+
+              static String getSafe(CSVRecord r, String key) {
+                  try { return r.get(key); } catch (Exception e) { return ""; }
+              }
+
+              static long parseLongSafe(String s) {
+                  if (s == null) return 0L;
+                  String t = s.replaceAll("[^0-9-]", "");
+                  if (t.isBlank() || t.equals("-")) return 0L;
+                  try { return Long.parseLong(t); } catch (Exception e) { return 0L; }
+              }
+              static Long parseLongSafeNullable(String s) {
+                  String t = (s==null) ? "" : s.replaceAll("[^0-9-]", "");
+                  if (t.isBlank() || t.equals("-")) return null;
+                  try { return Long.parseLong(t); } catch (Exception e) { return null; }
+              }
+
+              static List<Row> filterByDate(List<Row> in, LocalDate from, LocalDate to) {
+                  if (from == null && to == null) return in;
+                  List<Row> out = new ArrayList<>();
+                  for (Row r: in) {
+                      boolean ok = true;
+                      if (from != null && r.date.isBefore(from)) ok = false;
+                      if (to != null && r.date.isAfter(to)) ok = false;
+                      if (ok) out.add(r);
+                  }
+                  return out;
+              }
+
+              static void printTable(List<Row> rows) {
+                  System.out.println("date       | time     | type   | amount  | memo             | balance   | account");
+                  System.out.println("-----------+----------+--------+---------+------------------+-----------+--------");
+                  for (Row r: rows) {
+                      System.out.printf("%-10s | %-8s | %-6s | %8s | %-16s | %9s | %s%n",
+                              r.date, nv(r.time), nv(r.type), fmt(r.amount), nv(r.memo),
+                              r.balance==null? "-" : fmt(r.balance), nv(r.account));
+                  }
+              }
+              static String nv(String s){ return (s==null||s.isBlank())?"-":s; }
+              static String fmt(long v){ return String.format("%,d", v); }
+          }
+          JAVA
 
       - name: Setup Java (Temurin 21) + Maven cache
         uses: actions/setup-java@v4
@@ -58,348 +400,56 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Bootstrap minimal Maven project (if missing)
+      - name: Build (auto-detect pom path)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          if [[ ! -f pom.xml ]]; then
-            echoe "pom.xml이 없어 최소 Maven 프로젝트를 생성합니다."
-            mkdir -p src/main/java/com/example src/main/resources
-            cat > pom.xml <<'POM'
-            <?xml version="1.0" encoding="UTF-8"?>
-            <project xmlns="http://maven.apache.org/POM/4.0.0"
-                     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                     xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
-              <modelVersion>4.0.0</modelVersion>
-              <groupId>com.example</groupId>
-              <artifactId>bank-ledger</artifactId>
-              <version>1.0.0</version>
-              <properties>
-                <maven.compiler.source>21</maven.compiler.source>
-                <maven.compiler.target>21</maven.compiler.target>
-                <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-              </properties>
-              <dependencies>
-                <!-- CSV 파싱 -->
-                <dependency>
-                  <groupId>org.apache.commons</groupId>
-                  <artifactId>commons-csv</artifactId>
-                  <version>1.11.0</version>
-                </dependency>
-                <!-- Excel(XLS/XLSX) 파싱 -->
-                <dependency>
-                  <groupId>org.apache.poi</groupId>
-                  <artifactId>poi</artifactId>
-                  <version>5.2.5</version>
-                </dependency>
-                <dependency>
-                  <groupId>org.apache.poi</groupId>
-                  <artifactId>poi-ooxml</artifactId>
-                  <version>5.2.5</version>
-                </dependency>
-                <!-- 날짜 파싱 편의 -->
-                <dependency>
-                  <groupId>org.apache.commons</groupId>
-                  <artifactId>commons-lang3</artifactId>
-                  <version>3.14.0</version>
-                </dependency>
-              </dependencies>
-              <build>
-                <plugins>
-                  <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-compiler-plugin</artifactId>
-                    <version>3.13.0</version>
-                    <configuration>
-                      <release>21</release>
-                    </configuration>
-                  </plugin>
-                  <plugin>
-                    <groupId>org.apache.maven.plugins</groupId>
-                    <artifactId>maven-shade-plugin</artifactId>
-                    <version>3.5.3</version>
-                    <executions>
-                      <execution>
-                        <phase>package</phase>
-                        <goals><goal>shade</goal></goals>
-                        <configuration>
-                          <createDependencyReducedPom>false</createDependencyReducedPom>
-                          <transformers>
-                            <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                              <mainClass>com.example.BankLedger</mainClass>
-                            </transformer>
-                          </transformers>
-                        </configuration>
-                      </execution>
-                    </executions>
-                  </plugin>
-                </plugins>
-              </build>
-            </project>
-            POM
-
-            cat > src/main/java/com/example/BankLedger.java <<'JAVA'
-            package com.example;
-
-            import org.apache.commons.csv.CSVFormat;
-            import org.apache.commons.csv.CSVParser;
-            import org.apache.commons.csv.CSVRecord;
-            import org.apache.poi.hssf.usermodel.HSSFWorkbook;
-            import org.apache.poi.ss.usermodel.*;
-            import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-
-            import java.io.*;
-            import java.nio.charset.StandardCharsets;
-            import java.nio.file.*;
-            import java.time.LocalDate;
-            import java.time.format.DateTimeFormatter;
-            import java.util.*;
-
-            public class BankLedger {
-                record Row(LocalDate date, String time, String type, long amount, String memo, Long balance, String account){}
-
-                static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
-                        DateTimeFormatter.ofPattern("yyyy-MM-dd"),
-                        DateTimeFormatter.ofPattern("yyyy.M.d"),
-                        DateTimeFormatter.ofPattern("yyyy/M/d")
-                };
-
-                public static void main(String[] args) throws Exception {
-                    String path = argOrEnv(args, 0, "LEDGER_PATH", "");
-                    String from = argOrEnv(args, 1, "FROM_DATE", "");
-                    String to   = argOrEnv(args, 2, "TO_DATE", "");
-                    String sheetName = System.getenv().getOrDefault("SHEET_NAME", "");
-
-                    if (path.isBlank()) {
-                        System.out.println("⚠️ ledger_path 미지정 → 예시 CSV 생성 후 실행합니다: data/sample_ledger.csv");
-                        Path p = Paths.get("data"); Files.createDirectories(p);
-                        Path csv = p.resolve("sample_ledger.csv");
-                        String sample = String.join("\n", List.of(
-                                "date,time,type,amount,memo,balance,account",
-                                "2025-10-11,16:36:58,체크카드,10860,Google handj,1673419,원신한",
-                                "2025-10-09,14:15:58,체크카드,53692,Google handj,190880,원신한",
-                                "2025-10-09,12:41:23,체크카드,2682,Google Pokemon,144572,원신한",
-                                "2025-10-08,15:40:43,체크카드,10731,Google handj,179288,원신한",
-                                "2025-10-08,14:52:20,체크카드,32222,Google handj,190019,원신한"
-                        ));
-                        Files.writeString(csv, sample, StandardCharsets.UTF_8);
-                        path = csv.toString();
-                    }
-
-                    LocalDate fromDate = parseDateOrNull(from);
-                    LocalDate toDate   = parseDateOrNull(to);
-
-                    List<Row> rows;
-                    String lower = path.toLowerCase(Locale.ROOT);
-                    if (lower.endsWith(".csv")) {
-                        rows = readCsv(path);
-                    } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
-                        rows = readExcel(path, sheetName);
-                    } else {
-                        System.out.println("❌ 지원하지 않는 확장자: " + path);
-                        return;
-                    }
-
-                    // 날짜 필터
-                    rows = filterByDate(rows, fromDate, toDate);
-
-                    // 출력
-                    printTable(rows);
-
-                    // 요약
-                    long totalOut = rows.stream().mapToLong(r -> r.amount).sum();
-                    Long lastBalance = rows.stream().filter(r -> r.balance != null).reduce((a,b)->b).map(r->r.balance).orElse(null);
-
-                    System.out.println();
-                    System.out.println("==== 요약 ====");
-                    System.out.printf("거래 건수  : %,d%n", rows.size());
-                    System.out.printf("총 출금합계: %,d원 (amount 컬럼 합)%n", totalOut);
-                    if (lastBalance != null) {
-                        System.out.printf("마지막 잔액: %,d원%n", lastBalance);
-                    }
-                }
-
-                static String argOrEnv(String[] args, int idx, String env, String def) {
-                    if (args.length > idx && args[idx] != null && !args[idx].isBlank()) return args[idx];
-                    return System.getenv().getOrDefault(env, def);
-                }
-
-                static LocalDate parseDateOrNull(String s) {
-                    if (s == null || s.isBlank()) return null;
-                    for (var fmt: DATE_FMTS) {
-                        try { return LocalDate.parse(s.trim(), fmt); } catch (Exception ignore) {}
-                    }
-                    try { return LocalDate.parse(s.trim()); } catch (Exception ignore) {}
-                    return null;
-                }
-
-                static List<Row> readCsv(String path) throws IOException {
-                    try (Reader in = Files.newBufferedReader(Paths.get(path), StandardCharsets.UTF_8)) {
-                        CSVParser p = CSVFormat.DEFAULT.builder()
-                                .setHeader()
-                                .setSkipHeaderRecord(true)
-                                .setTrim(true)
-                                .build().parse(in);
-                        List<Row> out = new ArrayList<>();
-                        for (CSVRecord r: p) {
-                            LocalDate d = parseDateOrNull(r.get("date"));
-                            String time = getSafe(r, "time");
-                            String type = getSafe(r, "type");
-                            long amount = parseLongSafe(getSafe(r, "amount"));
-                            String memo = getSafe(r, "memo");
-                            Long bal = parseLongSafeNullable(getSafe(r, "balance"));
-                            String account = getSafe(r, "account");
-                            if (d != null) out.add(new Row(d,time,type,amount,memo,bal,account));
-                        }
-                        return out;
-                    }
-                }
-
-                static List<Row> readExcel(String path, String sheetName) throws IOException {
-                    try (InputStream is = Files.newInputStream(Paths.get(path))) {
-                        Workbook wb = path.toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
-                        Sheet sheet = null;
-                        if (sheetName != null && !sheetName.isBlank()) {
-                            sheet = wb.getSheet(sheetName);
-                        }
-                        if (sheet == null) sheet = wb.getSheetAt(0);
-
-                        // 헤더 맵핑
-                        Map<String,Integer> idx = new HashMap<>();
-                        Iterator<Row> it = sheet.rowIterator();
-                        if (!it.hasNext()) return List.of();
-                        org.apache.poi.ss.usermodel.Row hr = it.next();
-                        for (Cell c: hr) {
-                            idx.put(c.getStringCellValue().toLowerCase(Locale.ROOT), c.getColumnIndex());
-                        }
-
-                        List<Row> out = new ArrayList<>();
-                        while (it.hasNext()) {
-                            org.apache.poi.ss.usermodel.Row rr = it.next();
-                            LocalDate d = parseDateOrNull(cellStr(rr, idx.getOrDefault("date",-1)));
-                            if (d == null) continue;
-                            String time = cellStr(rr, idx.getOrDefault("time",-1));
-                            String type = cellStr(rr, idx.getOrDefault("type",-1));
-                            long amount = parseLongSafe(cellStr(rr, idx.getOrDefault("amount",-1)));
-                            String memo = cellStr(rr, idx.getOrDefault("memo",-1));
-                            Long bal = parseLongSafeNullable(cellStr(rr, idx.getOrDefault("balance",-1)));
-                            String account = cellStr(rr, idx.getOrDefault("account",-1));
-                            out.add(new Row(d,time,type,amount,memo,bal,account));
-                        }
-                        wb.close();
-                        return out;
-                    }
-                }
-
-                static String cellStr(org.apache.poi.ss.usermodel.Row r, int cidx) {
-                    if (cidx < 0) return "";
-                    Cell c = r.getCell(cidx);
-                    if (c == null) return "";
-                    return switch (c.getCellType()) {
-                        case STRING -> c.getStringCellValue();
-                        case NUMERIC -> {
-                            if (DateUtil.isCellDateFormatted(c)) {
-                                var ld = c.getLocalDateTimeCellValue().toLocalDate();
-                                yield ld.toString();
-                            } else {
-                                yield String.valueOf(Math.round(c.getNumericCellValue()));
-                            }
-                        }
-                        case BOOLEAN -> String.valueOf(c.getBooleanCellValue());
-                        default -> "";
-                    };
-                }
-
-                static String getSafe(CSVRecord r, String key) {
-                    try { return r.get(key); } catch (Exception e) { return ""; }
-                }
-
-                static long parseLongSafe(String s) {
-                    if (s == null) return 0L;
-                    String t = s.replaceAll("[^0-9-]", "");
-                    if (t.isBlank() || t.equals("-")) return 0L;
-                    try { return Long.parseLong(t); } catch (Exception e) { return 0L; }
-                }
-                static Long parseLongSafeNullable(String s) {
-                    String t = (s==null) ? "" : s.replaceAll("[^0-9-]", "");
-                    if (t.isBlank() || t.equals("-")) return null;
-                    try { return Long.parseLong(t); } catch (Exception e) { return null; }
-                }
-
-                static List<Row> filterByDate(List<Row> in, LocalDate from, LocalDate to) {
-                    if (from == null && to == null) return in;
-                    List<Row> out = new ArrayList<>();
-                    for (Row r: in) {
-                        boolean ok = true;
-                        if (from != null && r.date.isBefore(from)) ok = false;
-                        if (to != null && r.date.isAfter(to)) ok = false;
-                        if (ok) out.add(r);
-                    }
-                    return out;
-                }
-
-                static void printTable(List<Row> rows) {
-                    System.out.println("date       | time     | type   | amount  | memo             | balance   | account");
-                    System.out.println("-----------+----------+--------+---------+------------------+-----------+--------");
-                    for (Row r: rows) {
-                        System.out.printf("%-10s | %-8s | %-6s | %8s | %-16s | %9s | %s%n",
-                                r.date, nv(r.time), nv(r.type), fmt(r.amount), nv(r.memo),
-                                r.balance==null? "-" : fmt(r.balance), nv(r.account));
-                    }
-                }
-                static String nv(String s){ return (s==null||s.isBlank())?"-":s; }
-                static String fmt(long v){ return String.format("%,d", v); }
-            }
-            JAVA
-          else
-            echo "pom.xml이 이미 존재합니다. (사용자 프로젝트 우선)"
+          POM_PATH="$(git ls-files '**/pom.xml' | head -n1 || true)"
+          if [[ -z "${POM_PATH}" ]]; then
+            faile "pom.xml을 찾지 못했습니다."
+            exit 1
           fi
+          WORKDIR="$(dirname "${POM_PATH}")"
+          echo "Detected pom: ${POM_PATH}"
+          run mvn -B -q -DskipTests -f "${POM_PATH}" package
 
-      - name: Build (Maven + Shade)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          run mvn -B -q -DskipTests package
-          echoe "패키징 완료: target/bank-ledger-1.0.0-shaded.jar (또는 사용자 설정)"
+          JAR="$(ls -1 "${WORKDIR}"/target/*-shaded.jar 2>/dev/null | head -n1 || true)"
+          if [[ -z "${JAR}" ]]; then
+            JAR="$(ls -1 "${WORKDIR}"/target/*jar-with-dependencies.jar 2>/dev/null | head -n1 || true)"
+          fi
+          if [[ -z "${JAR}" ]]; then
+            faile "실행 JAR을 찾지 못했습니다 (shade 산출물 없음)."
+            exit 1
+          fi
+          echo "JAR=${JAR}" >> $GITHUB_ENV
 
-      - name: Run viewer (자바 명령어 실행)
+      - name: Run viewer (자바 명령 실행)
         shell: bash
         env:
-          LEDGER_PATH: ${{ inputs.ledger_path }}
+          LEDGER_PATH: ${{ inputs.ledger_path }}   # 비어 있으면 .github 자동 탐색
           FROM_DATE: ${{ inputs.from_date }}
           TO_DATE: ${{ inputs.to_date }}
           SHEET_NAME: ${{ inputs.sheet_name }}
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          JAR="$(ls -1 target/*-shaded.jar 2>/dev/null | head -n1 || true)"
-          if [[ -z "${JAR}" ]]; then
-            # shade 결과명이 다를 경우 fallback (artifactId가 다를 때)
-            JAR="$(ls -1 target/*jar-with-dependencies.jar 2>/dev/null | head -n1 || true)"
-          fi
-          if [[ -z "${JAR}" ]]; then
-            faile "실행 JAR을 찾지 못했습니다. shade 플러그인 산출물이 없습니다."
-            exit 1
-          fi
-
-          echo "----- 실행 파라미터 요약 -----"
-          echo "LEDGER_PATH=${LEDGER_PATH:-'(빈값: 샘플 CSV 자동 생성)'}"
+          echo "LEDGER_PATH=${LEDGER_PATH:-'(빈값: .github/ 자동탐색)'}"
           echo "FROM_DATE=${FROM_DATE}"
           echo "TO_DATE=${TO_DATE}"
           echo "SHEET_NAME=${SHEET_NAME}"
-          echo "------------------------------"
-
           run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
-      - name: Upload logs/artifacts (optional)
+      - name: Upload artifacts (logs + jars + discovered files)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: java-ledger-logs
+          name: java-ledger-artifacts
           path: |
             ${LOG_DIR}
-            target/*.jar
+            **/target/*.jar
             data/*.csv
+            .github/**/*.xlsx
+            .github/**/*.xls
+            .github/**/*.csv
           if-no-files-found: ignore
