@@ -1,4 +1,4 @@
-name: "🎧 Vibe Coding Pilot — MUST Create + Perm/Server + Bulk Modify + Safe-Continue + Always-Success (≤10 inputs)"
+name: "🎧 Vibe Coding Pilot — MUST Create + Perm/Upgrade + Server+DB Init + Bulk Modify + Safe-Continue + Always-Success (≤10 inputs)"
 
 on:
   workflow_dispatch:
@@ -14,7 +14,7 @@ on:
         type: boolean
         default: true
       install_servers:
-        description: "Nginx/Apache/Redis/PostgreSQL 설치·기동 시도(실패해도 통과)"
+        description: "Nginx/Apache/Redis/PostgreSQL 설치·기동·초기화(실패해도 통과)"
         type: boolean
         default: true
       auto_commit:
@@ -69,7 +69,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}"
+          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" .github/scripts
           cat > /tmp/safe_run.sh <<'SH'
           #!/usr/bin/env bash
           set +e
@@ -87,19 +87,65 @@ jobs:
           chmod +x /tmp/safe_run.sh
           echo "ok=1" >> "$GITHUB_OUTPUT"
 
-      # ---------- 기본 도구 + 권한 정리 ----------
-      - name: Base toolchain & permission normalize
-        if: steps.helpers.outputs.ok == '1'
+      # ---------- 필수 파일/디렉토리/권한 스크립트 사전 배치 ----------
+      - name: Create MUST files & permission scripts (no-skip)
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/safe_run.sh
+          # 필수 디렉토리
+          safe_run "mkdir -p ${DIRS_ROOT} ${FILES_ROOT} app tests docs/adr docs/api .github/scripts .github/echo_artifacts"
+          # 필수 파일(레포 표준)
+          cat > .gitignore <<'EOF'
+          __pycache__/
+          .venv/
+          node_modules/
+          .DS_Store
+          .env
+          EOF
+          cat > .gitattributes <<'EOF'
+          * text=auto eol=lf
+          EOF
+          cat > .editorconfig <<'EOF'
+          root = true
+          [*]
+          end_of_line = lf
+          insert_final_newline = true
+          charset = utf-8
+          indent_style = space
+          indent_size = 2
+          EOF
+          cat > .env.sample <<'EOF'
+          APP_ENV=dev
+          DB_HOST=127.0.0.1
+          DB_PORT=5432
+          DB_NAME=vibe_db
+          DB_USER=vibe_user
+          DB_PASS=vibe_pass_123
+          EOF
+          # 권한 적용 스크립트 & 매니페스트
+          cat > .github/scripts/permissions.sh <<'BASH'
+          #!/usr/bin/env bash
+          set +e
+          find . -type d -not -path './.git/*' -exec chmod 755 {} +
+          find . -type f -not -path './.git/*' -exec chmod ${CHMOD_MODE:-644} {} +
+          chmod +x .github/scripts/*.sh 2>/dev/null || true
+          BASH
+          chmod +x .github/scripts/permissions.sh
+          # 매니페스트(현재 적용 내역 스냅샷)
+          (echo "# PERMISSIONS_APPLIED"; date -Is; ) > ${ARTIFACT_DIR}/PERMISSIONS_APPLIED.txt
+          summarize
+
+      # ---------- 시스템 업그레이드(스킵 없이 진행) ----------
+      - name: System upgrade & cleanup (no-skip)
         shell: bash
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
           safe_run "sudo apt-get update -y"
-          safe_run "sudo apt-get install -y jq moreutils zip coreutils curl rsync python3-venv"
-          safe_run "corepack enable || true"
-          WS="${GITHUB_WORKSPACE}"
-          safe_run "sudo chown -R $USER:$USER \"$WS\" || true"
-          safe_run "chmod -R u+rwX,go+rX \"$WS\" || true"
+          safe_run "sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confnew full-upgrade"
+          safe_run "sudo apt-get -y autoremove"
+          safe_run "sudo apt-get -y autoclean"
           summarize
 
       # ---------- 생성 규모 매핑 ----------
@@ -115,15 +161,13 @@ jobs:
             xlarge) echo "DIRS=400" >> $GITHUB_OUTPUT; echo "FILES=800" >> $GITHUB_OUTPUT ;;
           esac
 
-      # ---------- MUST: 디렉토리/파일 생성 ----------
+      # ---------- MUST: 대량 디렉토리/파일 생성 ----------
       - name: MUST — Bulk directory create
         shell: bash
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          ROOT="${DIRS_ROOT}"; COUNT="${{ steps.scale.outputs.DIRS }}"
-          safe_run "mkdir -p \"$ROOT\" \"${FILES_ROOT}\" .github/echo_artifacts app tests docs/adr docs/api"
-          safe_run "i=1; while [ \$i -le \"$COUNT\" ]; do d=\$(printf '%s/d%04d' \"$ROOT\" \"\$i\"); mkdir -p \"\$d\" || true; i=\$((i+1)); done"
+          safe_run "i=1; while [ \$i -le '${{ steps.scale.outputs.DIRS }}' ]; do d=\$(printf '%s/d%04d' '${DIRS_ROOT}' \"\$i\"); mkdir -p \"\$d\" || true; i=\$((i+1)); done"
           summarize
 
       - name: MUST — Bulk file create
@@ -131,12 +175,22 @@ jobs:
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          FROOT="${FILES_ROOT}"; FCOUNT="${{ steps.scale.outputs.FILES }}"
-          safe_run "mkdir -p \"$FROOT\""
-          safe_run "i=1; while [ \$i -le \"$FCOUNT\" ]; do f=\$(printf '%s/file%04d.txt' \"$FROOT\" \"\$i\"); echo \"echo-file-\$i $(date -Iseconds)\" > \"\$f\" || true; i=\$((i+1)); done"
+          safe_run "i=1; while [ \$i -le '${{ steps.scale.outputs.FILES }}' ]; do f=\$(printf '%s/file%04d.txt' '${FILES_ROOT}' \"\$i\"); echo \"echo-file-\$i $(date -Iseconds)\" > \"\$f\" || true; i=\$((i+1)); done"
           safe_run "printf '# Vibe Coding Pilot\n- Created: %s\n' \"$(date -Iseconds)\" > README.md"
           safe_run "printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md"
           safe_run "printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md"
+          summarize
+
+      # ---------- 레포 권한 일괄 반영 ----------
+      - name: Apply repository permissions (no-skip)
+        env:
+          CHMOD_MODE: ${{ inputs.chmod_mode }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/safe_run.sh
+          safe_run "bash .github/scripts/permissions.sh"
+          safe_run "find . -maxdepth 3 -printf '%M %u:%g %p\n' | head -n 300 >> ${ARTIFACT_DIR}/PERMISSIONS_APPLIED.txt"
           summarize
 
       # ---------- 프레임워크 스캐폴드 ----------
@@ -214,37 +268,77 @@ jobs:
           fi
           summarize
 
-      # ---------- 서버 설치·기동 ----------
-      - name: Server stack install & start (nginx/apache/redis/postgres)
+      # ---------- 서버(웹/캐시/DB) 설치·업그레이드·기동 ----------
+      - name: Server stack install/upgrade/start (nginx/apache/redis/postgres)
         if: ${{ inputs.install_servers == 'true' || inputs.install_servers == true }}
         shell: bash
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
+          # 설치 및 업그레이드
           safe_run "sudo apt-get update -y"
           safe_run "sudo apt-get install -y nginx apache2 redis-server postgresql postgresql-contrib"
+          safe_run "sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade"
+          # 기본 페이지/권한
           safe_run "echo 'OK NGINX $(date -Iseconds)' | sudo tee /var/www/html/index.html >/dev/null"
           safe_run "echo '<h1>OK APACHE $(date -Iseconds)</h1>' | sudo tee /var/www/html/index-apache.html >/dev/null"
+          # 서비스 기동
           safe_run "sudo systemctl daemon-reload || true"
           safe_run "sudo systemctl enable --now nginx || sudo service nginx start || true"
           safe_run "sudo systemctl enable --now apache2 || sudo service apache2 start || true"
           safe_run "sudo systemctl enable --now redis-server || sudo service redis-server start || true"
           safe_run "sudo systemctl enable --now postgresql || sudo service postgresql start || true"
+          # 확인
           safe_run "curl -fsS http://127.0.0.1/ | head -n 1 | tee ${LOG_DIR}/nginx_check.txt"
           safe_run "redis-cli ping | tee ${LOG_DIR}/redis_check.txt || true"
           safe_run "psql --version | tee ${LOG_DIR}/psql_ver.txt || true"
           summarize
 
-      # ---------- 대량 수정 프로필 매핑 ----------
-      - name: Resolve bulk profile (globs/replace/append/rename/dup)
+      # ---------- ✅ DB 초기화/시드/덤프(필수) ----------
+      - name: PostgreSQL init + seed + dump (no-skip)
+        if: ${{ inputs.install_servers == 'true' || inputs.install_servers == true }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/safe_run.sh
+          DB_NAME="vibe_db"; DB_USER="vibe_user"; DB_PASS="vibe_pass_123"
+          cat > /tmp/init.sql <<'SQL'
+          -- role/db 생성(존재 시 에러 무시)
+          DO $$ BEGIN
+            IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'vibe_user') THEN
+              CREATE ROLE vibe_user LOGIN PASSWORD 'vibe_pass_123';
+            END IF;
+          END $$;
+          CREATE DATABASE vibe_db OWNER vibe_user;
+          \connect vibe_db
+          CREATE TABLE IF NOT EXISTS items(
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT now()
+          );
+          INSERT INTO items(name) VALUES ('seed-1'), ('seed-2') ON CONFLICT DO NOTHING;
+          SQL
+          # 실행(이미 존재하면 실패 메시지만 출력 후 진행)
+          safe_run "sudo -u postgres psql -v ON_ERROR_STOP=0 -f /tmp/init.sql"
+          # 권한/접속 확인
+          cat > /tmp/test.sql <<'SQL'
+          \connect vibe_db
+          \dt
+          SELECT count(*) AS item_cnt FROM items;
+          SQL
+          safe_run "sudo -u postgres psql -v ON_ERROR_STOP=0 -f /tmp/test.sql | tee ${LOG_DIR}/pg_test.txt"
+          # 덤프
+          safe_run "sudo -u postgres pg_dump -Fc -d vibe_db -f ${ARTIFACT_DIR}/vibe_db.dump || true"
+          summarize
+
+      # ---------- 대량 수정 프로필 ----------
+      - name: Resolve bulk profile
         id: bulkvars
         shell: bash
         continue-on-error: true
         run: |
           if [ "${{ inputs.bulk_enable }}" != "true" ]; then
-            echo "ENABLE=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+            echo "ENABLE=false" >> $GITHUB_OUTPUT; exit 0; fi
           case "${{ inputs.bulk_profile }}" in
             basic)
               echo "GLOBS=.github/echo_files/*.txt docs/**/*.md README.md" >> $GITHUB_OUTPUT
@@ -276,14 +370,13 @@ jobs:
           esac
           echo "ENABLE=true" >> $GITHUB_OUTPUT
 
-      # ---------- ✅ 대량 수정 ----------
+      # ---------- 대량 수정 ----------
       - name: BULK MODIFY — replace/append/rename/duplicate/chmod
         if: steps.bulkvars.outputs.ENABLE == 'true'
         shell: bash
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-
           GLOBS="${{ steps.bulkvars.outputs.GLOBS }}"
           FROM="${{ steps.bulkvars.outputs.FROM }}"
           TO="${{ steps.bulkvars.outputs.TO }}"
@@ -292,11 +385,8 @@ jobs:
           RSUF="${{ steps.bulkvars.outputs.RSUF }}"
           COPIES="${{ steps.bulkvars.outputs.COPIES }}"
           FMODE="${{ inputs.chmod_mode }}"
-
-          # 글롭 확장
           mapfile -t TARGETS < <(bash -lc "shopt -s nullglob globstar; for g in ${GLOBS}; do echo \$g; done")
-          if [ ${#TARGETS[@]} -eq 0 ]; then
-            warne "대상 글롭(${GLOBS})에 해당하는 파일이 없습니다."
+          if [ ${#TARGETS[@]} -eq 0 ]; then warne "대상 글롭(${GLOBS})에 해당하는 파일이 없습니다."
           else
             for g in "${TARGETS[@]}"; do
               for f in $g; do
@@ -304,23 +394,13 @@ jobs:
                 [ -n "$FROM" ] && safe_run "sed -i 's/${FROM//\//\\/}/${TO//\//\\/}/g' \"$f\""
                 [ -n "$APPEND_LINE" ] && safe_run "printf '%s\n' \"$APPEND_LINE\" >> \"$f\""
                 dir=$(dirname "$f"); base=$(basename "$f")
-                name="${base%.*}"; ext="${base##*.}"; dot="."
-                [ "$base" = "$ext" ] && dot=""
+                name="${base%.*}"; ext="${base##*.}"; dot="."; [ "$base" = "$ext" ] && dot=""
                 new="${dir}/${RPRE}${name}${RSUF}${dot}${ext}"
-                if [ -n "$RPRE" ] || [ -n "$RSUF" ]; then
-                  safe_run "mv \"$f\" \"$new\""; f="$new"
-                fi
-                if [ "$COPIES" -gt 0 ]; then
-                  idx=1; while [ $idx -le "$COPIES" ]; do
-                    clone="${f%.*}_copy${idx}${dot}${ext}"
-                    safe_run "cp -f \"$f\" \"$clone\""
-                    idx=$((idx+1))
-                  done
-                fi
+                if [ -n "$RPRE" ] || [ -n "$RSUF" ]; then safe_run "mv \"$f\" \"$new\""; f="$new"; fi
+                if [ "$COPIES" -gt 0 ]; then idx=1; while [ $idx -le "$COPIES" ]; do clone="${f%.*}_copy${idx}${dot}${ext}"; safe_run "cp -f \"$f\" \"$clone\""; idx=$((idx+1)); done; fi
               done
             done
           fi
-
           safe_run "find . -type f -not -path './.git/*' -exec chmod ${FMODE} {} + || true"
           safe_run "find . -type d -not -path './.git/*' -exec chmod 755 {} + || true"
           safe_run "git status --porcelain | tee ${LOG_DIR}/bulk_modify_changes.txt || true"
@@ -333,7 +413,6 @@ jobs:
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          safe_run "mkdir -p docs/adr docs/api"
           safe_run "zip -qr ${ARTIFACT_DIR}/docs.zip docs || true"
           summarize
 
@@ -365,7 +444,7 @@ jobs:
           source /tmp/safe_run.sh
           WS="${GITHUB_WORKSPACE}"
           mkdir -p "${GATHER_DIR}"
-          for p in ".github/echo_logs" ".github/artifacts" "${DIRS_ROOT}" "${FILES_ROOT}" "app" "tests" "docs" "nodeapp" "demo" "README.md"; do
+          for p in ".github/echo_logs" ".github/artifacts" "${DIRS_ROOT}" "${FILES_ROOT}" "app" "tests" "docs" "nodeapp" "demo" "README.md" ".env.sample" ".editorconfig" ".gitattributes" ".gitignore"; do
             [ -e "$p" ] || continue
             R="$(realpath -s "$p" 2>/dev/null || echo '')"
             case "$R" in "$WS"/*) ;; *) warne "워크스페이스 밖 경로 스킵: $p -> $R"; continue;; esac
@@ -396,14 +475,15 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "chore(vibe): create/perm/server/bulk & artifacts [skip ci]" || true
+          git commit -m "chore(vibe): must-create/perm/upgrade/server+db/bulk & artifacts [skip ci]" || true
           git push || true
 
       - name: ✅ Always-success banner
         if: ${{ inputs.force_success_message == 'true' || inputs.force_success_message == true }}
         shell: bash
         run: |
-          echo "## ✅ 전체 파이프라인 완료 (실패는 메시지 출력 후 정상 처리·스킵 없이 진행)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- creation_scale=${{ inputs.creation_scale }}, bulk_enable=${{ inputs.bulk_enable }}, bulk_profile=${{ inputs.bulk_profile }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ✅ 전체 파이프라인 완료 (스킵 없이 전 구간 실행 — 실패는 메시지 출력 후 정상 처리)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- creation_scale=${{ inputs.creation_scale }}, framework=${{ inputs.framework }}, bulk_profile=${{ inputs.bulk_profile }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- chmod: 파일 ${{ inputs.chmod_mode }}, 디렉토리 755" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 아티팩트: vibe-artifacts (logs/lists/sbom/trivy/prototype/bulk_modify_changes.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- DB: vibe_db(+role, table, seed, dump) 초기화·점검 완료(환경 제약 시 메시지 후 계속)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 아티팩트: vibe-artifacts (logs/lists/sbom/trivy/prototype/pg_dump/permissions)" >> "$GITHUB_STEP_SUMMARY"
