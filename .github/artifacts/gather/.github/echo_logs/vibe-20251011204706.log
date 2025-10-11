@@ -1,0 +1,2 @@
+✅ ▶ i=1; while [ $i -le '50' ]; do d=$(printf '%s/d%04d' '.github/echo_dirs' "$i"); mkdir -p "$d" || true; i=$((i+1)); done
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

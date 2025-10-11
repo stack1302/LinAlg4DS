@@ -1,0 +1,14 @@
+✅ ▶ sudo apt-get update -y
+✅ ▶ sudo apt-get install -y nginx apache2 redis-server postgresql postgresql-contrib
+✅ ▶ sudo DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
+✅ ▶ echo 'OK NGINX 2025-10-11T20:47:30+09:00' | sudo tee /var/www/html/index.html >/dev/null
+✅ ▶ echo '<h1>OK APACHE 2025-10-11T20:47:31+09:00</h1>' | sudo tee /var/www/html/index-apache.html >/dev/null
+✅ ▶ sudo systemctl daemon-reload || true
+✅ ▶ sudo systemctl enable --now nginx || sudo service nginx start || true
+✅ ▶ sudo systemctl enable --now apache2 || sudo service apache2 start || true
+✅ ▶ sudo systemctl enable --now redis-server || sudo service redis-server start || true
+✅ ▶ sudo systemctl enable --now postgresql || sudo service postgresql start || true
+✅ ▶ curl -fsS http://127.0.0.1/ | head -n 1 | tee .github/echo_logs/nginx_check.txt
+✅ ▶ redis-cli ping | tee .github/echo_logs/redis_check.txt || true
+✅ ▶ psql --version | tee .github/echo_logs/psql_ver.txt || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).
