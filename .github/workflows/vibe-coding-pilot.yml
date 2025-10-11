@@ -1,155 +1,139 @@
-name: "🎧 Vibe Coding Pilot — Skip-on-Fail + Dir/File Create + Always-Success"
+name: "🎧 Vibe Coding Pilot — MUST Create + Perm Fix + Server Install + Safe-Continue + Always-Success"
 
 on:
   workflow_dispatch:
     inputs:
       framework:
-        description: "샘플 프로토타입 프레임워크"
         type: choice
-        required: true
         default: "fastapi"
         options: ["fastapi", "springboot", "node-express"]
       run_security:
-        description: "SBOM/취약점(Trivy) 실행"
         type: boolean
         default: true
       run_docs:
-        description: "문서(ADR/설계/API 스펙) 자동 생성"
         type: boolean
         default: true
       dirs_root:
-        description: "대량 디렉토리 루트(예: .github/echo_dirs)"
-        required: true
         default: ".github/echo_dirs"
       dirs_count:
-        description: "생성할 디렉토리 개수"
-        required: true
-        default: "25"
+        default: "50"
       files_root:
-        description: "대량 파일 루트(예: .github/echo_files)"
-        required: true
         default: ".github/echo_files"
       files_count:
-        description: "생성할 파일 개수"
-        required: true
-        default: "30"
-      force_success_message:
-        description: "마지막에 ✅ 성공 배너 강제 출력"
+        default: "80"
+      install_servers:
+        description: "Nginx/Apache/Redis/PostgreSQL 설치·기동 시도(실패해도 통과)"
         type: boolean
         default: true
-  push:
-    paths:
-      - ".github/workflows/vibe-coding-pilot.yml"
+      auto_commit:
+        type: boolean
+        default: false
+      force_success_message:
+        type: boolean
+        default: true
 
 permissions:
   contents: write
-  actions: read
-  checks: read
   security-events: write
 
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
   ARTIFACT_DIR: .github/artifacts
+  GATHER_DIR: .github/artifacts/gather
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
 
 jobs:
-  setup-generate-create:
-    name: "0) 준비 · 프로토타입 · 디렉토리/파일 생성(반드시) — Skip-on-Fail"
+  all-in-one:
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Echo helpers (skip-safe)
-        id: echo_helpers
+      # ---------- 공통 헬퍼: 실패해도 0으로 마스킹 ----------
+      - name: Init echo helpers (fail-safe)
+        id: helpers
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
-          cat > /tmp/echo_helpers.sh <<'SH'
+          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}"
+          cat > /tmp/safe_run.sh <<'SH'
           #!/usr/bin/env bash
           set +e
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
           LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
           FAIL_COUNT_FILE="${LOG_DIR}/.fail.count"; : > "$FAIL_COUNT_FILE"
-
           echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
           warne(){ printf '%s %s\n' "$ECHO_WARN" "$*" | tee -a "$LOG_FILE"; }
           faile(){ printf '%s %s (rc=%s)\n' "$ECHO_FAIL" "$1" "${2:-1}" | tee -a "$LOG_FILE"; }
           inc_fail(){ n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
-
-          # 실패해도 0 반환 → 파이프라인 계속 진행
-          run_cmd(){
+          safe_run(){
             local cmd="$*"
             echoe "▶ ${cmd}"
             bash -lc "$cmd"
             local rc=$?
-            if [ $rc -ne 0 ]; then faile "CMD FAILED: $cmd" $rc; inc_fail; fi
+            if [ $rc -ne 0 ]; then faile "FAILED: $cmd" $rc; inc_fail; fi
             return 0
           }
-
-          print_summary(){
+          summarize(){
             local n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)
-            echoe "현재 단계 완료(실패 ${n}건 기록됨). 파이프라인은 계속 진행됩니다."
+            echoe "단계 완료 (실패 ${n}건 기록, 파이프라인 계속 진행)."
           }
           SH
-          chmod +x /tmp/echo_helpers.sh
-          echo "helpers_ready=1" >> "$GITHUB_OUTPUT"
+          chmod +x /tmp/safe_run.sh
+          echo "ok=1" >> "$GITHUB_OUTPUT"
 
-      - name: Base tooling (Node/Python/Zip) — skip on fail
-        if: steps.echo_helpers.outputs.helpers_ready == '1'
+      # ---------- 기본 도구 + 권한 정리 ----------
+      - name: Base toolchain & permission normalize (no-skip)
+        if: steps.helpers.outputs.ok == '1'
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "sudo apt-get update -y"
-          run_cmd "sudo apt-get install -y jq moreutils zip"
-          run_cmd "corepack enable || true"
-          run_cmd "sudo apt-get install -y python3-venv || true"
-          print_summary
+          source /tmp/safe_run.sh
+          safe_run "sudo apt-get update -y"
+          safe_run "sudo apt-get install -y jq moreutils zip coreutils curl rsync python3-venv"
+          safe_run "corepack enable || true"
+          # 작업공간 권한/퍼미션 정리(작업공간 내부만)
+          WS="${GITHUB_WORKSPACE}"
+          safe_run "sudo chown -R $USER:$USER \"$WS\" || true"
+          safe_run "chmod -R u+rwX,go+rX \"$WS\" || true"
+          summarize
 
-      # ── 반드시: 대량 디렉토리 생성 ─────────────────────────────────────────────
-      - name: MUST — Create directories (bulk) — always skip-on-fail
+      # ---------- MUST: 디렉토리/파일 생성 ----------
+      - name: MUST — Bulk directory create (no-skip)
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
+          source /tmp/safe_run.sh
           ROOT="${{ inputs.dirs_root }}"; COUNT="${{ inputs.dirs_count }}"
-          run_cmd "mkdir -p \"$ROOT\""
-          run_cmd "i=1; while [ \$i -le \"$COUNT\" ]; do d=\$(printf '%s/d%04d' \"$ROOT\" \"\$i\"); mkdir -p \"\$d\" || true; i=\$((i+1)); done"
-          run_cmd "mkdir -p .github/echo_dirs .github/echo_files .github/echo_artifacts app tests docs/adr docs/api"
-          print_summary
+          safe_run "mkdir -p \"$ROOT\" .github/echo_files .github/echo_artifacts app tests docs/adr docs/api"
+          safe_run "i=1; while [ \$i -le \"$COUNT\" ]; do d=\$(printf '%s/d%04d' \"$ROOT\" \"\$i\"); mkdir -p \"\$d\" || true; i=\$((i+1)); done"
+          summarize
 
-      # ── 반드시: 대량 파일 생성 ────────────────────────────────────────────────
-      - name: MUST — Create files (bulk) — always skip-on-fail
+      - name: MUST — Bulk file create (no-skip)
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
+          source /tmp/safe_run.sh
           FROOT="${{ inputs.files_root }}"; FCOUNT="${{ inputs.files_count }}"
-          run_cmd "mkdir -p \"$FROOT\""
-          run_cmd "i=1; while [ \$i -le \"$FCOUNT\" ]; do f=\$(printf '%s/file%04d.txt' \"$FROOT\" \"\$i\"); echo \"echo-file-\$i $(date -Iseconds)\" > \"\$f\" || true; i=\$((i+1)); done"
-          # 샘플 필수 파일(README/설계/API/헬스체크)
-          run_cmd "printf '# Vibe Coding Pilot\n\n- Created at: %s\n' \"$(date -Iseconds)\" > README.md"
-          run_cmd "printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md"
-          run_cmd "printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md"
-          print_summary
+          safe_run "mkdir -p \"$FROOT\""
+          safe_run "i=1; while [ \$i -le \"$FCOUNT\" ]; do f=\$(printf '%s/file%04d.txt' \"$FROOT\" \"\$i\"); echo \"echo-file-\$i $(date -Iseconds)\" > \"\$f\" || true; i=\$((i+1)); done"
+          safe_run "printf '# Vibe Coding Pilot\n- Created: %s\n' \"$(date -Iseconds)\" > README.md"
+          safe_run "printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md"
+          safe_run "printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md"
+          summarize
 
-      # ── 프레임워크 스캐폴드(옵션) ─────────────────────────────────────────────
-      - name: Framework scaffold — FastAPI
+      # ---------- 프레임워크 스캐폴드 ----------
+      - name: Scaffold — FastAPI
         if: ${{ inputs.framework == 'fastapi' }}
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip"
-          run_cmd ". .venv/bin/activate && pip -q install fastapi uvicorn[standard] pytest httpx"
+          source /tmp/safe_run.sh
+          safe_run "python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx"
           cat > app/main.py <<'PY'
           from fastapi import FastAPI
           app = FastAPI()
@@ -165,26 +149,26 @@ jobs:
           def test_health(): assert c.get("/health").json()["status"] == "ok"
           def test_item(): assert c.get("/items/7").json()["id"] == 7
           PY
-          print_summary
+          summarize
 
-      - name: Framework scaffold — Spring (guarded)
+      - name: Scaffold — Spring demo
         if: ${{ inputs.framework == 'springboot' }}
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "sudo apt-get install -y maven"
-          run_cmd "mkdir -p demo && cd demo && mvn -q -B archetype:generate -DgroupId=com.example -DartifactId=demo -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.5"
-          run_cmd "sed -i 's/junit:junit:4.11/junit:junit:4.13.2/' demo/pom.xml || true"
-          print_summary
+          source /tmp/safe_run.sh
+          safe_run "sudo apt-get install -y maven"
+          safe_run "mkdir -p demo && cd demo && mvn -q -B archetype:generate -DgroupId=com.example -DartifactId=demo -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.5"
+          safe_run "sed -i 's/junit:junit:4.11/junit:junit:4.13.2/' demo/pom.xml || true"
+          summarize
 
-      - name: Framework scaffold — Node/Express
+      - name: Scaffold — Node/Express
         if: ${{ inputs.framework == 'node-express' }}
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "mkdir -p nodeapp && cd nodeapp && npm init -y"
+          source /tmp/safe_run.sh
+          safe_run "mkdir -p nodeapp && cd nodeapp && npm init -y"
           cat > nodeapp/index.js <<'JS'
           const express = require('express'); const app = express();
           app.get('/health', (_,res)=>res.json({status:'ok'}));
@@ -195,187 +179,132 @@ jobs:
           {"name":"nodeapp","version":"1.0.0","main":"index.js",
            "scripts":{"start":"node index.js","test":"node -e \"process.exit(0)\""}}
           JSON
-          print_summary
+          summarize
 
-      - name: MUST — Verify created items (listing) — skip on fail
+      - name: Smoke run — FastAPI/Node (no-skip)
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "echo '### Created directories/files (top 100)'; find '${{ inputs.dirs_root }}' '${{ inputs.files_root }}' -maxdepth 2 | head -n 100 | tee -a ${LOG_DIR}/created-list.txt"
-          run_cmd "find . -maxdepth 2 -type f -name 'README.md' -o -name '*.md' | head -n 50 | tee -a ${LOG_DIR}/created-list.txt"
-          print_summary
-
-      - name: Proto run smoke (FastAPI/Node) — skip on fail
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh
+          source /tmp/safe_run.sh
           if [ "${{ inputs.framework }}" = "fastapi" ]; then
-            run_cmd ". .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &"
+            safe_run ". .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &"
             sleep 2
-            run_cmd "curl -fsSL http://127.0.0.1:8000/health | tee ${LOG_DIR}/health.json"
-            run_cmd "pkill -f uvicorn || true"
+            safe_run "curl -fsSL http://127.0.0.1:8000/health | tee ${LOG_DIR}/health.json"
+            safe_run "pkill -f uvicorn || true"
           elif [ "${{ inputs.framework }}" = "node-express" ]; then
-            run_cmd "cd nodeapp && npm run -s start &"
+            safe_run "cd nodeapp && npm run -s start &"
             sleep 2
-            run_cmd "curl -fsSL http://127.0.0.1:3000/health | tee ${LOG_DIR}/health-node.json"
-            run_cmd "pkill -f node || true"
+            safe_run "curl -fsSL http://127.0.0.1:3000/health | tee ${LOG_DIR}/health-node.json"
+            safe_run "pkill -f node || true"
           else
-            warne "spring scaffold는 빌드만 시연"
+            warne "spring demo는 빌드만 시연"
           fi
-          print_summary
+          summarize
 
-      - name: Zip prototype artifact
+      # ---------- 서버(권한/서비스) 설치·기동 (실패 시 메시지 후 계속) ----------
+      - name: Server stack install & start (nginx/apache/redis/postgres)
+        if: ${{ inputs.install_servers == 'true' || inputs.install_servers == true }}
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "zip -qr ${ARTIFACT_DIR}/prototype-${{ inputs.framework }}.zip app nodeapp demo || true"
+          source /tmp/safe_run.sh
+          # 설치
+          safe_run "sudo apt-get update -y"
+          safe_run "sudo apt-get install -y nginx apache2 redis-server postgresql postgresql-contrib"
+          # 퍼미션/테스트 페이지
+          safe_run "echo 'OK NGINX $(date -Iseconds)' | sudo tee /var/www/html/index.html >/dev/null"
+          safe_run "echo '<h1>OK APACHE $(date -Iseconds)</h1>' | sudo tee /var/www/html/index-apache.html >/dev/null"
+          # 서비스 기동(시스템 환경에 따라 일부는 무시되고 메시지만 출력됨)
+          safe_run "sudo systemctl daemon-reload || true"
+          safe_run "sudo systemctl enable --now nginx || sudo service nginx start || true"
+          safe_run "sudo systemctl enable --now apache2 || sudo service apache2 start || true"
+          safe_run "sudo systemctl enable --now redis-server || sudo service redis-server start || true"
+          safe_run "sudo systemctl enable --now postgresql || sudo service postgresql start || true"
+          # 간단 점검
+          safe_run "curl -fsS http://127.0.0.1/ | head -n 1 | tee ${LOG_DIR}/nginx_check.txt"
+          safe_run "redis-cli ping | tee ${LOG_DIR}/redis_check.txt || true"
+          safe_run "psql --version | tee ${LOG_DIR}/psql_ver.txt || true"
+          summarize
 
-      - name: Upload prototype artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: prototype-${{ inputs.framework }}
-          path: .github/artifacts/prototype-${{ inputs.framework }}.zip
-          if-no-files-found: ignore
-
-      - name: ✅ Always-success banner (job tail)
-        if: ${{ inputs.force_success_message == 'true' || inputs.force_success_message == true }}
+      # ---------- 보안/문서(옵션) ----------
+      - name: Docs pack (ADR/API)
+        if: ${{ inputs.run_docs == 'true' || inputs.run_docs == true }}
         shell: bash
+        continue-on-error: true
         run: |
-          echo "## ✅ Setup/Generate/Create 단계 완료 (실패는 모두 스킵됨 & 성공 메시지 강제 출력)" >> "$GITHUB_STEP_SUMMARY"
+          source /tmp/safe_run.sh
+          safe_run "mkdir -p docs/adr docs/api"
+          safe_run "zip -qr ${ARTIFACT_DIR}/docs.zip docs || true"
+          summarize
 
-  test-docs-security:
-    name: "1) 테스트 · 문서 · 보안(SBOM/Scan) — Skip-on-Fail"
-    runs-on: ubuntu-24.04
-    needs: setup-generate-create
+      - name: SBOM (Syft)
+        if: ${{ inputs.run_security == 'true' || inputs.run_security == true }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/safe_run.sh
+          safe_run "curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true"
+          safe_run "syft packages dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || true"
+          summarize
 
-    steps:
-      - uses: actions/checkout@v4
+      - name: Vulnerability scan (Trivy)
+        if: ${{ inputs.run_security == 'true' || inputs.run_security == true }}
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/safe_run.sh
+          safe_run "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || true"
+          safe_run "trivy fs --scanners vuln,secret,misconfig --timeout 10m --no-progress -f json -o ${ARTIFACT_DIR}/trivy.json . || true"
+          summarize
 
-      - name: Echo helpers (reuse)
+      # ---------- 안전 수집 & 업로드 (워크스페이스 내부만) ----------
+      - name: SAFE gather workspace artifacts
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/safe_run.sh
+          WS="${GITHUB_WORKSPACE}"
+          mkdir -p "${GATHER_DIR}"
+          for p in ".github/echo_logs" ".github/artifacts" "${{ inputs.dirs_root }}" "${{ inputs.files_root }}" "app" "tests" "docs" "nodeapp" "demo" "README.md"; do
+            [ -e "$p" ] || continue
+            R="$(realpath -s "$p" 2>/dev/null || echo '')"
+            case "$R" in "$WS"/*) ;; *) warne "워크스페이스 밖 경로 스킵: $p -> $R"; continue;; esac
+            safe_run "rsync -a --relative \"$p\" \"${GATHER_DIR}/\" || true"
+          done
+          safe_run "find '${{ inputs.files_root }}' -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -I{} sha256sum '{}' | tee ${GATHER_DIR}/files.sha256 || true"
+          safe_run "find '${{ inputs.dirs_root }}' -maxdepth 2 2>/dev/null | head -n 200 | tee ${GATHER_DIR}/created-list.txt || true"
+          safe_run "zip -qr ${GATHER_DIR}/prototype-${{ inputs.framework }}.zip app nodeapp demo 2>/dev/null || true"
+          summarize
+
+      - name: Upload gathered artifacts (workspace-only)
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: vibe-artifacts
+          path: .github/artifacts/gather/**
+          if-no-files-found: warn
+          compression-level: 6
+          overwrite: false
+          include-hidden-files: true
+
+      # ---------- 선택: 자동 커밋 ----------
+      - name: Auto-commit generated files (optional)
+        if: ${{ inputs.auto_commit == 'true' || inputs.auto_commit == true }}
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          if [ ! -f /tmp/echo_helpers.sh ]; then
-            mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}"
-            cat > /tmp/echo_helpers.sh <<'SH'
-            #!/usr/bin/env bash
-            set +e
-            ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
-            LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-            LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
-            FAIL_COUNT_FILE="${LOG_DIR}/.fail.count"; : > "$FAIL_COUNT_FILE"
-            echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
-            warne(){ printf '%s %s\n' "$ECHO_WARN" "$*" | tee -a "$LOG_FILE"; }
-            faile(){ printf '%s %s (rc=%s)\n' "$ECHO_FAIL" "$1" "${2:-1}" | tee -a "$LOG_FILE"; }
-            inc_fail(){ n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
-            run_cmd(){ local cmd="$*"; echoe "▶ ${cmd}"; bash -lc "$cmd"; local rc=$?; if [ $rc -ne 0 ]; then faile "CMD FAILED: $cmd" $rc; inc_fail; fi; return 0; }
-            print_summary(){ local n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); echoe "현재 단계 완료(실패 ${n}건). 계속 진행."; }
-            SH
-            chmod +x /tmp/echo_helpers.sh
-          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore(vibe): create/perm/server/scaffold & artifacts [skip ci]" || true
+          git push || true
 
-      - name: Python tests (FastAPI) — skip on fail
-        if: ${{ github.event.inputs.framework == 'fastapi' }}
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip pytest httpx fastapi uvicorn[standard]"
-          run_cmd ". .venv/bin/activate && pytest -q || true"
-          print_summary
-
-      - name: Maven test (Spring) — guarded
-        if: ${{ github.event.inputs.framework == 'springboot' && hashFiles('demo/pom.xml') != '' }}
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "sudo apt-get install -y maven"
-          run_cmd "cd demo && mvn -q -B -e -DskipTests=false test || true"
-          print_summary
-
-      - name: Node test (Express) — skip on fail
-        if: ${{ github.event.inputs.framework == 'node-express' && hashFiles('nodeapp/package.json') != '' }}
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "cd nodeapp && npm i --silent || true"
-          run_cmd "cd nodeapp && npm test || true"
-          print_summary
-
-      - name: Docs (ADR/설계/API) — skip on fail
-        if: ${{ github.event.inputs.run_docs == 'true' || github.event.inputs.run_docs == true }}
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "mkdir -p docs/adr docs/api"
-          run_cmd "zip -qr ${ARTIFACT_DIR}/docs.zip docs || true"
-          print_summary
-
-      - name: SBOM (Syft) — skip on fail
-        if: ${{ github.event.inputs.run_security == 'true' || github.event.inputs.run_security == true }}
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true"
-          run_cmd "syft packages dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || true"
-          print_summary
-
-      - name: Vulnerability scan (Trivy) — skip on fail
-        if: ${{ github.event.inputs.run_security == 'true' || github.event.inputs.run_security == true }}
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh
-          run_cmd "curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || true"
-          run_cmd "trivy fs --scanners vuln,secret,misconfig --timeout 10m --no-progress -f json -o ${ARTIFACT_DIR}/trivy.json . || true"
-          print_summary
-
-      - name: Upload artifacts (logs/docs/sbom/scan)
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: vibe-artifacts
-          path: |
-            .github/echo_logs/**
-            .github/artifacts/**
-            ${{ inputs.dirs_root }}/**
-            ${{ inputs.files_root }}/**
-            app/**
-            tests/**
-            docs/**
-            nodeapp/**
-            demo/**
-          if-no-files-found: warn
-
-      - name: ✅ Always-success banner (job tail)
-        if: ${{ github.event.inputs.force_success_message == 'true' || github.event.inputs.force_success_message == true }}
+      # ---------- 항상 성공 메시지 ----------
+      - name: ✅ Always-success banner
+        if: ${{ inputs.force_success_message == 'true' || inputs.force_success_message == true }}
         shell: bash
         run: |
-          echo "## ✅ Test/Docs/Security 단계 완료 (파일/디렉토리 생성 포함, 실패는 모두 스킵됨)" >> "$GITHUB_STEP_SUMMARY"
-
-  summary:
-    name: "2) 최종 요약 (항상 성공 메세지)"
-    runs-on: ubuntu-24.04
-    needs: [setup-generate-create, test-docs-security]
-    steps:
-      - name: ✅ Final SUCCESS banner
-        shell: bash
-        run: |
-          echo "## ✅ 전체 워크플로우 완료 (FAIL SAFE)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Framework: ${{ github.event.inputs.framework }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Docs: ${{ github.event.inputs.run_docs }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Security: ${{ github.event.inputs.run_security }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Dirs Root: ${{ github.event.inputs.dirs_root }} (count=${{ github.event.inputs.dirs_count }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Files Root: ${{ github.event.inputs.files_root }} (count=${{ github.event.inputs.files_count }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "아티팩트(prototype-*, vibe-artifacts)에서 생성된 디렉토리/파일과 로그·SBOM·스캔 결과를 확인하세요."
+          echo "## ✅ 전체 파이프라인 완료 (실패는 메시지 출력 후 정상 처리, 스킵 없이 진행)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 디렉토리·파일 생성, 권한 정리, 서버 설치·기동(가능한 항목)까지 시도했습니다." >> "$GITHUB_STEP_SUMMARY"
+          echo "- 아티팩트: vibe-artifacts 에서 로그/결과 확인" >> "$GITHUB_STEP_SUMMARY"
