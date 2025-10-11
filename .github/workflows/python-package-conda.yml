@@ -1,4 +1,4 @@
-name: "🏦 Java Ledger Viewer (Ultra Echo, LFS, .github Excel Auto-Discovery, Maven/Gradle, Release)"
+name: "🏦 Java Ledger Viewer (Ultra Echo + .github Excel Auto-Discovery + LFS + Maven/Gradle + Self-Heal + Release)"
 
 on:
   workflow_dispatch:
@@ -34,7 +34,7 @@ env:
   ECHO_FAIL: "❌"
 
 permissions:
-  contents: write   # 릴리즈/아티팩트 업로드용
+  contents: write
   actions: read
 
 jobs:
@@ -46,7 +46,7 @@ jobs:
         with:
           lfs: true
 
-      - name: Ensure Git LFS (optional)
+      - name: Ensure Git LFS (safe)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -72,7 +72,7 @@ jobs:
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      # ===== 1) 프로젝트 부트스트랩 (pom.xml 없으면 생성) =====
+      # 1) pom.xml이 없으면 정상 POM + 자동탐색 자바코드 생성
       - name: Bootstrap minimal Maven project when pom.xml is missing
         if: hashFiles('**/pom.xml') == ''
         shell: bash
@@ -123,7 +123,9 @@ jobs:
                   <groupId>org.apache.maven.plugins</groupId>
                   <artifactId>maven-compiler-plugin</artifactId>
                   <version>3.13.0</version>
-                  <configuration><release>21</release></configuration>
+                  <configuration>
+                    <release>21</release>
+                  </configuration>
                 </plugin>
                 <plugin>
                   <groupId>org.apache.maven.plugins</groupId>
@@ -132,14 +134,17 @@ jobs:
                   <executions>
                     <execution>
                       <phase>package</phase>
-                      <goals><goal>shade</goal></goals>
+                      <goals>
+                        <goal>shade</goal>
+                      </goals>
                       <configuration>
                         <createDependencyReducedPom>false</createDependencyReducedPom>
                         <transformers>
                           <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                             <mainClass>com.example.BankLedger</mainClass>
-                          </transformers>
-                        </configuration>
+                          </transformer>
+                        </transformers>
+                      </configuration>
                     </execution>
                   </executions>
                 </plugin>
@@ -148,7 +153,7 @@ jobs:
           </project>
           POM
 
-          # 자바 소스(자동탐색 완전판)
+          # 자동탐색/표출/요약 포함 Java 본문
           cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
           package com.example;
 
@@ -373,11 +378,48 @@ jobs:
           }
           JAVA
 
-          # 🔑 생성된 pom 경로를 전역 환경에 저장 (git 미추적이어도 후속 스텝에서 인식)
           echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
+          echo "JAVA_MAIN=com.example.BankLedger" >> "$GITHUB_ENV"
 
-      # ===== 2) JDK + 캐시 =====
-      - name: Setup Java (Temurin 21) + Maven cache (if pom exists)
+      # 2) (기존/외부 POM 방어) shade <transformer> 태그 자동 치유
+      - name: Self-heal POM shade <transformer> tag if broken
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          POM_PATH="${POM_PATH:-}"
+          if [[ -z "${POM_PATH}" ]]; then
+            POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
+          fi
+          if [[ -z "${POM_PATH}" ]]; then
+            warne "POM 미발견 → Self-heal 스킵"
+            exit 0
+          fi
+          echo "Target POM: ${POM_PATH}"
+
+          # transformer 종료태그 누락 케이스 방어
+          NEED_FIX="$(
+            awk '
+              /<transformers>/ {inT=1}
+              inT && /<\/transformers>/ { if (count==0) { print "MISSING"; } inT=0; count=0 }
+              inT && /<transformer[ >]/ { count++ }
+            ' "${POM_PATH}" || true
+          )"
+
+          if [[ "${NEED_FIX:-}" == "MISSING" ]]; then
+            awk '
+              /<transformers>/ {print; inT=1; next}
+              inT && /<\/transformers>/ {print "                    </transformer>"; print; inT=0; next}
+              {print}
+            ' "${POM_PATH}" > "${POM_PATH}.fixed"
+            mv "${POM_PATH}.fixed" "${POM_PATH}"
+            echoe "POM transformer 태그 자동 보정 완료"
+          else
+            echoe "POM transformer 태그 정상"
+          fi
+
+      # 3) JDK/캐시
+      - name: Setup Java (Temurin 21 + Maven cache if pom exists)
         if: hashFiles('**/pom.xml') != ''
         uses: actions/setup-java@v4
         with:
@@ -385,17 +427,22 @@ jobs:
           java-version: '21'
           cache: maven
 
-      # ===== 3) Build (Maven 또는 Gradle 자동 감지) =====
+      - name: Setup Gradle cache (if Gradle only)
+        if: hashFiles('**/pom.xml') == '' && (hashFiles('**/build.gradle') != '' || hashFiles('**/build.gradle.kts') != '')
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      # 4) Build (Maven 또는 Gradle 자동 감지)
       - name: Build (auto-detect Maven/Gradle; include untracked)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
 
-          # 1) bootstrap 단계에서 설정한 값 우선
           POM_PATH="${POM_PATH:-}"
-
-          # 2) find로 검색 (git 미추적 포함)
           if [[ -z "${POM_PATH}" ]]; then
             POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
           fi
@@ -415,11 +462,9 @@ jobs:
             fi
             echo "JAR=${JAR}" >> "$GITHUB_ENV"
           else
-            # Maven 없음 → Gradle 시도
             if [[ -f gradlew || -f build.gradle || -f build.gradle.kts ]]; then
               if [[ -f gradlew ]]; then
                 run chmod +x gradlew
-                # shadow 플러그인이 있으면 shadowJar, 없으면 build
                 if ./gradlew tasks | grep -q '^shadowJar'; then
                   run ./gradlew -q shadowJar
                   JAR="$(ls -1 build/libs/*-all.jar 2>/dev/null | head -n1 || true)"
@@ -431,7 +476,6 @@ jobs:
                   [[ -z "$JAR" ]] && JAR="$(ls -1 build/libs/*.jar 2>/dev/null | head -n1 || true)"
                 fi
               else
-                # 시스템 gradle
                 run sudo apt-get update -y
                 run sudo apt-get install -y gradle || true
                 run gradle -q build
@@ -451,7 +495,7 @@ jobs:
             fi
           fi
 
-      # ===== 4) Run Viewer =====
+      # 5) Run Viewer
       - name: Run viewer (java -jar)
         shell: bash
         env:
@@ -469,7 +513,7 @@ jobs:
           test -n "${JAR:-}" || { faile "JAR 환경변수가 비어 있습니다."; exit 1; }
           run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
-      # ===== 5) (옵션) 릴리즈 생성 =====
+      # 6) (옵션) 릴리즈 생성
       - name: Create GitHub Release (optional)
         if: ${{ inputs.create_release == true }}
         uses: softprops/action-gh-release@v2
@@ -483,7 +527,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ===== 6) 아티팩트 업로드 =====
+      # 7) 아티팩트 업로드
       - name: Upload artifacts (logs + jars + discovered files)
         if: always()
         uses: actions/upload-artifact@v4
