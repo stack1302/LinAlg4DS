@@ -1,4 +1,4 @@
-name: "🎧 Vibe Coding Pilot — All Services + DB + Bulk Modify + Safe-Continue + Always-Success"
+name: "🎧 Vibe Coding Pilot — All Services + DB + Bulk Modify + Release & Publish + Safe-Continue"
 
 on:
   workflow_dispatch:
@@ -35,6 +35,7 @@ on:
 permissions:
   contents: write
   security-events: write
+  packages: write
 
 env:
   TZ: Asia/Seoul
@@ -44,6 +45,7 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
+
   # ----- 대량 수정 기본값(필요시 변경) -----
   BULK_GLOBS: ".github/echo_files/*.txt docs/**/*.md README.md"
   REPLACE_FROM: "echo-file"
@@ -53,14 +55,39 @@ env:
   RENAME_SUFFIX: ""
   DUPLICATE_COPIES: "2"
   CHMOD_MODE: "644"
+
   # Apache 충돌 회피용 포트
   APACHE_PORT: "8080"
+
+  # =========================
+  #  Release & Publish (env)
+  # =========================
+  DO_RELEASE: "false"           # true 면 태그/릴리즈 수행
+  VERSION_BUMP: "patch"         # major | minor | patch | none(수동)
+  RELEASE_TAG_PREFIX: "v"       # 태그 접두사 (예: v1.2.3)
+
+  # NPM 대량 발행
+  NPM_PUBLISH: "false"          # true 면 npm publish
+  NPM_DIRS: "nodeapp"           # 공백 구분 다중 디렉토리
+  NPM_REGISTRY_URL: "https://registry.npmjs.org"
+
+  # PyPI 대량 발행
+  PYPI_PUBLISH: "false"         # true 면 PyPI 발행
+  PYPI_DIRS: "app"              # pyproject.toml / setup.cfg/py 존재 경로(공백 구분)
+
+  # Maven 대량 배포 (GitHub Packages 예시)
+  MVN_PUBLISH: "false"          # true 면 mvn deploy
+  MVN_DIRS: "demo"
+  MVN_DIST_URL: "https://maven.pkg.github.com/${{ github.repository }}"
+  MVN_SERVER_ID: "github"       # settings.xml의 server id
 
 jobs:
   all-in-one:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 태그/로그용
 
       # ---------- 공통 헬퍼 ----------
       - name: Init echo helpers (fail-safe)
@@ -97,7 +124,7 @@ jobs:
           SH
           chmod +x /tmp/safe_run.sh
 
-          # 권한 스크립트(파일/디렉토리 권한 표준화)
+          # 권한 스크립트
           cat > .github/scripts/permissions.sh <<'BASH'
           #!/usr/bin/env bash
           set +e
@@ -110,7 +137,7 @@ jobs:
 
           echo "ok=1" >> "$GITHUB_OUTPUT"
 
-      # ---------- 시스템 업그레이드(필수 패키지 포함) ----------
+      # ---------- 시스템 업그레이드 ----------
       - name: OS full-upgrade & base toolchain (no-skip)
         if: steps.helpers.outputs.ok == '1'
         shell: bash
@@ -128,7 +155,7 @@ jobs:
           safe_run "chmod -R u+rwX,go+rX \"$WS\" || true"
           summarize
 
-      # ---------- 디렉토리/파일 필수 생성 ----------
+      # ---------- 디렉토리/파일 ----------
       - name: MUST — Directories create
         shell: bash
         continue-on-error: true
@@ -165,7 +192,7 @@ jobs:
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          safe_run "python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx"
+          safe_run "python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx build"
           cat > app/main.py <<'PY'
           from fastapi import FastAPI
           app = FastAPI()
@@ -181,6 +208,19 @@ jobs:
           def test_health(): assert c.get("/health").json()["status"] == "ok"
           def test_item(): assert c.get("/items/7").json()["id"] == 7
           PY
+          # pyproject(minimal) — PyPI 테스트용
+          cat > app/pyproject.toml <<'TOML'
+          [project]
+          name = "vibe-app"
+          version = "0.0.1"
+          description = "Vibe demo package"
+          readme = "README.md"
+          requires-python = ">=3.10"
+          dependencies = ["fastapi"]
+          [build-system]
+          requires = ["setuptools>=68","wheel","build"]
+          build-backend = "setuptools.build_meta"
+          TOML
           summarize
 
       - name: Scaffold — Spring demo
@@ -207,13 +247,15 @@ jobs:
           app.get('/items/:id', (req,res)=>res.json({id:+req.params.id, name:`item-${req.params.id}`}));
           app.listen(3000, ()=>console.log('up'));
           JS
-          cat > nodeapp/package.json <<'JSON'
-          {"name":"nodeapp","version":"1.0.0","main":"index.js",
-           "scripts":{"start":"node index.js","test":"node -e \"process.exit(0)\""}}
-          JSON
+          # npm version scaffolding
+          jq '.version="0.0.1" | .name="vibe-nodeapp"' nodeapp/package.json > nodeapp/package.tmp && mv nodeapp/package.tmp nodeapp/package.json
+          cat > nodeapp/.npmrc <<'NPM'
+          registry=https://registry.npmjs.org
+          always-auth=false
+          NPM
           summarize
 
-      # ---------- 스모크 실행(종료 경고 제거) ----------
+      # ---------- 스모크 ----------
       - name: Smoke run — FastAPI/Node
         shell: bash
         continue-on-error: true
@@ -223,15 +265,12 @@ jobs:
             safe_run ". .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &"
             sleep 2
             safe_run "curl -fsSL http://127.0.0.1:8000/health | tee ${LOG_DIR}/health.json"
-            # 종료 경고(rc=143) 제거
             safe_run "lsof -ti:8000 | xargs -r kill"
-            safe_run "sleep 1"
           elif [ "${{ inputs.framework }}" = "node-express" ]; then
             safe_run "cd nodeapp && npm run -s start &"
             sleep 2
             safe_run "curl -fsSL http://127.0.0.1:3000/health | tee ${LOG_DIR}/health-node.json"
             safe_run "lsof -ti:3000 | xargs -r kill"
-            safe_run "sleep 1"
           else
             warne "spring demo는 빌드만 시연"
           fi
@@ -258,8 +297,7 @@ jobs:
           safe_run "psql --version | tee ${LOG_DIR}/psql_ver.txt || true"
           summarize
 
-      # ---------- Apache 8080 전환 + 헬스체크 ----------
-      - name: Apache move to ${{ env.APACHE_PORT }} (avoid 80 conflict) + check
+      - name: Apache move to ${{ env.APACHE_PORT }} + check
         if: ${{ inputs.install_servers == 'true' || inputs.install_servers == true }}
         shell: bash
         continue-on-error: true
@@ -269,49 +307,33 @@ jobs:
           safe_run "sudo sed -i 's@<VirtualHost \\*:80>@<VirtualHost *:${APACHE_PORT}>@' /etc/apache2/sites-available/000-default.conf"
           safe_run "sudo systemctl daemon-reload || true"
           safe_run "sudo systemctl restart apache2"
-          safe_run "sudo systemctl status --no-pager apache2 | tee ${LOG_DIR}/apache_status.txt || true"
-          safe_run "sudo journalctl -u apache2 --no-pager -n 200 | tee ${LOG_DIR}/apache_journal_tail.txt || true"
           safe_run "curl -fsS http://127.0.0.1:${APACHE_PORT}/ | head -n 2 | tee ${LOG_DIR}/apache_check.txt"
           summarize
 
-      # ---------- PostgreSQL 초기화/시드/덤프(권한 문제 해결 포함) ----------
+      # ---------- PostgreSQL 초기화/시드/덤프 ----------
       - name: PostgreSQL init + seed + dump (no-skip)
         shell: bash
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          # SQL 스크립트 작성
-          cat > /tmp/init.sql <<'SQL'
-          DO $$ BEGIN
-            PERFORM 1 FROM pg_database WHERE datname='vibe_db';
-            IF NOT FOUND THEN PERFORM dblink_exec('dbname=postgres', 'CREATE DATABASE vibe_db'); END IF;
-          END $$;
-          SQL
-          # dblink 없이 생성(존재하면 오류 무시)
           safe_run "sudo -u postgres psql -v ON_ERROR_STOP=0 -c \"CREATE DATABASE vibe_db;\" || true"
-
           cat > /tmp/seed.sql <<'SQL'
-          \\c vibe_db
+          \c vibe_db
           CREATE TABLE IF NOT EXISTS items(id serial primary key, name text);
           INSERT INTO items(name) VALUES ('hello'), ('world') ON CONFLICT DO NOTHING;
           SQL
-
           cat > /tmp/test.sql <<'SQL'
-          \\c vibe_db
-          \\dt
+          \c vibe_db
+          \dt
           SELECT COUNT(*) AS item_cnt FROM items;
           SQL
-
           safe_run "sudo -u postgres psql -v ON_ERROR_STOP=0 -f /tmp/seed.sql"
           safe_run "sudo -u postgres psql -v ON_ERROR_STOP=0 -f /tmp/test.sql | tee ${LOG_DIR}/pg_test.txt"
-
-          # 덤프: /tmp에 생성 후 아티팩트로 이동(권한 보정)
           safe_run "sudo -u postgres pg_dump -Fc -d vibe_db -f /tmp/vibe_db.dump"
-          safe_run "sudo cp /tmp/vibe_db.dump ${ARTIFACT_DIR}/vibe_db.dump"
-          safe_run "sudo chown $USER:$USER ${ARTIFACT_DIR}/vibe_db.dump"
+          safe_run "sudo cp /tmp/vibe_db.dump ${ARTIFACT_DIR}/vibe_db.dump && sudo chown $USER:$USER ${ARTIFACT_DIR}/vibe_db.dump"
           summarize
 
-      # ---------- (옵션) MariaDB/MySQL 시도: 실패해도 계속 ----------
+      # ---------- (옵션) MariaDB ----------
       - name: Try MariaDB (optional best-effort)
         shell: bash
         continue-on-error: true
@@ -325,7 +347,7 @@ jobs:
           safe_run "sudo mysql -e \"SELECT COUNT(*) AS cnt FROM vibe_mysql.items;\" | tee ${LOG_DIR}/mysql_check.txt || true"
           summarize
 
-      # ---------- 대량 수정(치환/추가/리네임/복제/권한) ----------
+      # ---------- 대량 수정 ----------
       - name: BULK MODIFY — replace/append/rename/duplicate/chmod
         shell: bash
         continue-on-error: true
@@ -343,31 +365,20 @@ jobs:
           shopt -s nullglob globstar
           FILES=()
           for g in ${GLOBS}; do for f in $g; do [ -f "$f" ] && FILES+=("$f"); done; done
-          if [ ${#FILES[@]} -eq 0 ]; then
-            warne "대상(${GLOBS}) 파일이 없습니다."
+          if [ ${#FILES[@]} -eq 0 ]; then warne "대상(${GLOBS}) 파일이 없습니다."
           else
             for f in "${FILES[@]}"; do
-              # 치환
-              if [ -n "$FROM" ]; then safe_run "sed -i 's/${FROM//\//\\/}/${TO//\//\\/}/g' \"$f\""; fi
-              # 끝에 라인 추가
-              if [ -n "$APPEND_LINE" ]; then safe_run "printf '%s\n' \"$APPEND_LINE\" >> \"$f\""; fi
-              # 리네임
-              dir=$(dirname "$f"); base=$(basename "$f")
-              name="${base%.*}"; ext="${base##*.}"; dot="."
+              [ -n "$FROM" ] && safe_run "sed -i 's/${FROM//\//\\/}/${TO//\//\\/}/g' \"$f\""
+              [ -n "$APPEND_LINE" ] && safe_run "printf '%s\n' \"$APPEND_LINE\" >> \"$f\""
+              dir=$(dirname "$f"); base=$(basename "$f"); name="${base%.*}"; ext="${base##*.}"; dot="."
               [ "$base" = "$ext" ] && dot=""
               new="${dir}/${RPRE}${name}${RSUF}${dot}${ext}"
               if [ -n "$RPRE" ] || [ -n "$RSUF" ]; then safe_run "mv \"$f\" \"$new\""; f="$new"; fi
-              # 복제
               if [ "${COPIES:-0}" -gt 0 ]; then
-                idx=1; while [ $idx -le "${COPIES}" ]; do
-                  clone="${f%.*}_copy${idx}${dot}${ext}"
-                  safe_run "cp -f \"$f\" \"$clone\""
-                  idx=$((idx+1))
-                done
+                idx=1; while [ $idx -le "${COPIES}" ]; do clone="${f%.*}_copy${idx}${dot}${ext}"; safe_run "cp -f \"$f\" \"$clone\""; idx=$((idx+1)); done
               fi
             done
           fi
-          # 권한 일괄
           safe_run "find . -type f -not -path './.git/*' -exec chmod ${FMODE} {} + || true"
           safe_run "find . -type d -not -path './.git/*' -exec chmod 755 {} + || true"
           safe_run "git status --porcelain | tee ${LOG_DIR}/bulk_modify_changes.txt || true"
@@ -434,6 +445,182 @@ jobs:
           overwrite: false
           include-hidden-files: true
 
+      # =======================================================
+      # ================ Release & Publish =====================
+      # =======================================================
+
+      # 1) 버전 산출 + 대량 동기화(package.json / pyproject.toml / pom.xml)
+      - name: Version bump & bulk sync
+        if: env.DO_RELEASE == 'true'
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          source /tmp/safe_run.sh
+          CUR_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          CUR_VER="${CUR_TAG#${RELEASE_TAG_PREFIX}}"
+          if [ -z "$CUR_VER" ]; then CUR_VER="0.0.0"; fi
+          IFS='.' read -r MA MI PA <<< "$CUR_VER"
+          case "${VERSION_BUMP}" in
+            major) MA=$((MA+1)); MI=0; PA=0;;
+            minor) MI=$((MI+1)); PA=0;;
+            patch) PA=$((PA+1));;
+            none)  :;;
+            *) PA=$((PA+1));;
+          esac
+          NEW_VER="${MA}.${MI}.${PA}"
+          echo "$NEW_VER" > VERSION
+          echoe "New version: ${NEW_VER}"
+
+          # Bulk sync: package.json
+          shopt -s globstar nullglob
+          for f in **/package.json; do
+            safe_run "jq '.version=\"${NEW_VER}\"' \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\""
+          done
+
+          # Bulk sync: pyproject.toml (단순 치환)
+          for f in **/pyproject.toml; do
+            safe_run "awk 'BEGIN{p=1} {if(\$0 ~ /^version *=/){sub(/version *=.*/,\"version = \\\"${NEW_VER}\\\"\"); p=0} print} END{if(p) print \"version = \\\"${NEW_VER}\\\"\"}' \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\""
+          done
+
+          # Bulk sync: pom.xml
+          for f in **/pom.xml; do
+            safe_run "sed -i -E '0,/<version>.*<\\/version>/{s/<version>[^<]*<\\/version>/<version>${NEW_VER}<\\/version>/}' \"$f\""
+          done
+
+          safe_run "git add -A"
+          safe_run "git commit -m \"chore(release): v${NEW_VER}\" || true"
+
+      # 2) 태그 생성 & 체인지로그 생성
+      - name: Create tag & changelog
+        if: env.DO_RELEASE == 'true'
+        id: rel
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/safe_run.sh
+          NEW_VER="$(cat VERSION)"
+          NEW_TAG="${RELEASE_TAG_PREFIX}${NEW_VER}"
+          # changelog (마지막 태그~HEAD)
+          LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
+          if [ -n "$LAST_TAG" ]; then
+            RANGE="${LAST_TAG}..HEAD"
+          else
+            RANGE="$(git rev-list --max-parents=0 HEAD)..HEAD"
+          fi
+          safe_run "git tag -a \"$NEW_TAG\" -m \"Release $NEW_TAG\" || true"
+          safe_run "git push --follow-tags || true"
+          safe_run "git log --pretty=format:'* %s (%h)' ${RANGE} > ${ARTIFACT_DIR}/CHANGELOG_${NEW_TAG}.md"
+          echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+
+      # 3) GitHub Release 생성 + 아티팩트 첨부
+      - name: Create GitHub Release
+        if: env.DO_RELEASE == 'true'
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: ${{ steps.rel.outputs.tag }}
+          name: ${{ steps.rel.outputs.tag }}
+          body_path: .github/artifacts/CHANGELOG_${{ steps.rel.outputs.tag }}.md
+          files: |
+            .github/artifacts/gather/**/*.zip
+            .github/artifacts/sbom.json
+            .github/artifacts/trivy.json
+            .github/artifacts/vibe_db.dump
+            .github/artifacts/docs.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 4) NPM 대량 발행
+      - name: NPM publish (bulk)
+        if: env.NPM_PUBLISH == 'true'
+        shell: bash
+        continue-on-error: true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          source /tmp/safe_run.sh
+          IFS=' ' read -r -a DIRS <<< "${NPM_DIRS}"
+          for d in "${DIRS[@]}"; do
+            [ -d "$d" ] || { warne "npm 디렉토리 없음: $d"; continue; }
+            safe_run "jq '.version = \"'$(cat VERSION)'\"' \"$d/package.json\" > \"$d/package.tmp\" && mv \"$d/package.tmp\" \"$d/package.json\""
+            safe_run "npm --prefix \"$d\" config set registry ${NPM_REGISTRY_URL}"
+            safe_run "npm --prefix \"$d\" publish --access public || npm --prefix \"$d\" publish"
+          done
+
+      # 5) PyPI 대량 발행
+      - name: PyPI publish (bulk)
+        if: env.PYPI_PUBLISH == 'true'
+        shell: bash
+        continue-on-error: true
+        env:
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          source /tmp/safe_run.sh
+          NEW_VER="$(cat VERSION)"
+          IFS=' ' read -r -a DIRS <<< "${PYPI_DIRS}"
+          for d in "${DIRS[@]}"; do
+            [ -d "$d" ] || { warne "PyPI 디렉토리 없음: $d"; continue; }
+            if [ -f "$d/pyproject.toml" ]; then
+              safe_run "sed -i -E 's/^version *=.*/version = \"'\"$NEW_VER\"'\"/' \"$d/pyproject.toml\" || true"
+            fi
+            safe_run "python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade build twine"
+            safe_run ". .venv/bin/activate && python -m build \"$d\""
+            # dist 경로 추정
+            DIST_DIR=\"$d/dist\"
+            [ -d \"$DIST_DIR\" ] || DIST_DIR=\"dist\"
+            safe_run ". .venv/bin/activate && python -m twine upload -u __token__ -p \"${PYPI_API_TOKEN}\" ${DIST_DIR}/* || true"
+          done
+
+      # 6) Maven 대량 배포 (GitHub Packages 예시)
+      - name: Maven publish (bulk)
+        if: env.MVN_PUBLISH == 'true'
+        shell: bash
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAVEN_USERNAME: ${{ secrets.MAVEN_USERNAME }}
+          MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
+        run: |
+          source /tmp/safe_run.sh
+          safe_run "sudo apt-get update -y && sudo apt-get install -y maven"
+          # settings.xml 생성 (GitHub Packages or custom repo)
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<XML
+          <settings>
+            <servers>
+              <server>
+                <id>${MVN_SERVER_ID}</id>
+                <username>${MAVEN_USERNAME:-x-oauth-basic}</username>
+                <password>${MAVEN_PASSWORD:-${GITHUB_TOKEN}}</password>
+              </server>
+            </servers>
+            <mirrors/>
+          </settings>
+          XML
+          NEW_VER="$(cat VERSION)"
+          IFS=' ' read -r -a DIRS <<< "${MVN_DIRS}"
+          for d in "${DIRS[@]}"; do
+            [ -d "$d" ] || { warne "Maven 디렉토리 없음: $d"; continue; }
+            if [ -f "$d/pom.xml" ]; then
+              safe_run "mvn -q -f \"$d/pom.xml\" -DnewVersion=${NEW_VER} versions:set -DgenerateBackupPoms=false || true"
+              # 배포 리포지토리 추가(없으면 추가)
+              if ! grep -q "<distributionManagement>" "$d/pom.xml"; then
+                awk -v url="${MVN_DIST_URL}" -v id="${MVN_SERVER_ID}" '
+                  /<\/project>/ && !printed {
+                    print "  <distributionManagement>\n    <repository>\n      <id>"id"</id>\n      <url>"url"</url>\n    </repository>\n  </distributionManagement>";
+                    printed=1
+                  } {print}
+                ' "$d/pom.xml" > "$d/pom.tmp" && mv "$d/pom.tmp" "$d/pom.xml"
+              fi
+              safe_run "mvn -q -f \"$d/pom.xml\" -DskipTests deploy -s ~/.m2/settings.xml || true"
+            else
+              warne "pom.xml 없음: $d"
+            fi
+          done
+
+      # ---------- Auto-commit(옵션) ----------
       - name: Auto-commit generated files (optional)
         if: ${{ inputs.auto_commit == 'true' || inputs.auto_commit == true }}
         shell: bash
@@ -450,10 +637,12 @@ jobs:
         if: ${{ inputs.force_success_message == 'true' || inputs.force_success_message == true }}
         shell: bash
         run: |
-          echo "## ✅ 전체 파이프라인 완료 (대량 수정 포함·실패는 메시지 출력 후 정상 처리·스킵 없이 진행)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ✅ 전체 파이프라인 완료 (대량 수정·릴리즈/출시 옵션 포함·실패는 메시지 출력 후 정상 처리·스킵 없이 진행)" >> "$GITHUB_STEP_SUMMARY"
           echo "- 수정 대상: '${BULK_GLOBS}'" >> "$GITHUB_STEP_SUMMARY"
           echo "- 치환: '${REPLACE_FROM}' → '${REPLACE_TO}', 추가 라인: '${APPEND_LINE}'" >> "$GITHUB_STEP_SUMMARY"
           echo "- 리네임 prefix/suffix: '${RENAME_PREFIX}' / '${RENAME_SUFFIX}', 복제본: ${DUPLICATE_COPIES}" >> "$GITHUB_STEP_SUMMARY"
           echo "- chmod: 파일 ${CHMOD_MODE}, 디렉토리 755" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Apache 포트: ${APACHE_PORT}, 덤프: ${ARTIFACT_DIR}/vibe_db.dump" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 아티팩트: vibe-artifacts (logs / lists / sbom / trivy / prototype / bulk_modify_changes.txt / DB dump)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Apache 포트: ${APACHE_PORT}, DB 덤프: ${ARTIFACT_DIR}/vibe_db.dump" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: ${DO_RELEASE} (bump=${VERSION_BUMP}, tag prefix=${RELEASE_TAG_PREFIX})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Publish: npm=${NPM_PUBLISH} pypi=${PYPI_PUBLISH} maven=${MVN_PUBLISH}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 아티팩트: vibe-artifacts (logs / lists / sbom / trivy / prototype / bulk_modify_changes.txt / DB dump / changelog)" >> "$GITHUB_STEP_SUMMARY"
