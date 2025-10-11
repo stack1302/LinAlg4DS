@@ -1,0 +1,89 @@
+name: "📒 Bank Statement → Excel/CSV (Echo + Artifact + Tx Log)"
+
+on:
+  workflow_dispatch: {}   # 수동 실행
+  push:
+    paths:
+      - "make_statement.py"
+      - ".github/workflows/bank-statement.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      TZ: Asia/Seoul
+      ECHO_OK: "✅"
+      ECHO_WARN: "⚠️"
+      ECHO_FAIL: "❌"
+      LOG_DIR: .github/echo_logs
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare echo logs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "$LOG_DIR"
+          echo "${ECHO_OK} Start bank-statement job" | tee -a "$LOG_DIR/flow.log"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps (pandas,xlsxwriter)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python -V | tee -a "$LOG_DIR/flow.log"
+          pip install --upgrade pip >/dev/null
+          pip install pandas xlsxwriter >/dev/null
+          echo "${ECHO_OK} Deps installed" | tee -a "$LOG_DIR/flow.log"
+
+      - name: Run script (generate Excel/CSV)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [ ! -f make_statement.py ]; then
+            echo "${ECHO_FAIL} make_statement.py not found" | tee -a "$LOG_DIR/flow.log"
+            exit 1
+          fi
+          python make_statement.py 2>&1 | tee -a "$LOG_DIR/flow.log"
+          echo "${ECHO_OK} Script done" | tee -a "$LOG_DIR/flow.log"
+
+      - name: Echo transactions into logs (자동 포함)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # CSV가 생성됐는지 확인
+          if [ ! -f out/transactions_clean.csv ]; then
+            echo "${ECHO_FAIL} out/transactions_clean.csv not found" | tee -a "$LOG_DIR/flow.log"
+            exit 1
+          fi
+
+          # 거래내역 CSV 전체를 flow.log에 에코 + 별도 트랜잭션 로그 파일 생성
+          {
+            echo "=== BEGIN TRANSACTIONS CSV ==="
+            cat out/transactions_clean.csv
+            echo "=== END TRANSACTIONS CSV ==="
+          } | tee -a "$LOG_DIR/flow.log" > "$LOG_DIR/transactions.log"
+
+          # 무결성 체크(선택)
+          (cd out && sha256sum bank_statement_summary.xlsx transactions_clean.csv) \
+            | tee -a "$LOG_DIR/flow.log" > "$LOG_DIR/checksums.sha256"
+
+          echo "${ECHO_OK} Transactions echoed to $LOG_DIR/transactions.log" | tee -a "$LOG_DIR/flow.log"
+
+      - name: Upload artifacts (Excel/CSV + logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-statement-artifacts
+          path: |
+            out/bank_statement_summary.xlsx
+            out/transactions_clean.csv
+            .github/echo_logs/flow.log
+            .github/echo_logs/transactions.log
+            .github/echo_logs/checksums.sha256
+          if-no-files-found: error
