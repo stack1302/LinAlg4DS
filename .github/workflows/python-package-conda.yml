@@ -1,4 +1,4 @@
-name: "🏦 Java Ledger Viewer (Multi-file + All-dates + Filters + Reports + Release URLs + Safe Bulk)"
+name: "🏦 Java Ledger Viewer (Multi-file + All-dates + Filters + Reports + Release URLs)"
 
 on:
   workflow_dispatch:
@@ -7,8 +7,12 @@ on:
         description: "단일 통장 파일 경로 (CSV/XLS/XLSX). 비우면 자동 탐색"
         required: false
         default: ""
-      date_range:
-        description: "조회기간 'YYYY-MM-DD..YYYY-MM-DD' (all_dates=true면 무시)"
+      from_date:
+        description: "조회 시작일 (YYYY-MM-DD). all_dates=true면 무시"
+        required: false
+        default: ""
+      to_date:
+        description: "조회 종료일 (YYYY-MM-DD). all_dates=true면 무시"
         required: false
         default: ""
       sheet_name:
@@ -41,10 +45,10 @@ on:
         description: "리포트 포맷: console,csv,html (콤마 복수)"
         required: false
         default: "console,csv,html"
-      report_options:
-        description: "JSON: {\"top_n\":10, \"category_map_json\":\"{\\\"카페\\\":[\\\"커피\\\"]}\"}"
-        required: false
-        default: ""
+
+  # ⏱️ 5분 주기(UTC 기준)
+  schedule:
+    - cron: "*/5 * * * *"
 
 env:
   TZ: Asia/Seoul
@@ -55,24 +59,26 @@ env:
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
 
-  # ===== 전범위 BULK (안전 가드 장착) =====
+  # ===== 전 범위 고정 대량 수정(안전 설정) =====
   BULK_ENABLE: "true"
-  # 전범위 기본 + 확장자 필터(쉼표) — 빈값이면 전체
-  BULK_EXTS: "md,txt,yml,yaml,java,xml,csv"
-  # 제외 디렉토리(쉼표, 전역 고정). artifacts/target/node_modules/.git/.venv 등은 프루닝
   BULK_EXCLUDES: ".git,.github/artifacts,target,node_modules,.venv,.m2"
   REPLACE_FROM: "echo-file"
   REPLACE_TO:   "vibe-file"
-  APPEND_LINE:  "<!-- appended-by-ledger-workflow -->"
+  APPEND_LINE:  "<!-- appended-by-workflow -->"
   RENAME_PREFIX: "bulk_"
   RENAME_SUFFIX: ""
-  DUPLICATE_COPIES: "0"  # 0 이면 복제 안 함
+  DUPLICATE_COPIES: "0"
   CHMOD_MODE: "644"
+
+  # ===== Ledger 고급 옵션(입력 10개 제한 회피: ENV 사용) =====
+  TOP_N: "10"
+  CATEGORY_MAP_JSON: ""
 
 permissions:
   contents: write
   actions: read
 
+# 🔒 겹치는 실행 방지
 concurrency:
   group: ledger-${{ github.ref }}
   cancel-in-progress: true
@@ -86,176 +92,106 @@ jobs:
         with:
           lfs: true
 
-      - name: Ensure base dirs + Git LFS
+      - name: Echo helpers (global-safe)
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${DL_DIR}" "${REPORT_DIR}" app/src/main/java/com/example app/src/main/resources data
-          git lfs install
-          git lfs pull || true
-
-      - name: Echo helpers
-        shell: bash
-        run: |
-          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR:-.github/echo_logs}"
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           log(){ printf '%s %s\n' "$1" "$2" | tee -a "${LOG_DIR}/echo.log"; }
           echoe(){ log "${ECHO_OK}" "$*"; }
           warne(){ log "${ECHO_WARN}" "$*"; }
           faile(){ log "${ECHO_FAIL}" "$*"; }
-          run(){ printf '▶ %s\n' "$*"; eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo.log"; }
+          # 복잡한 쉘 구문도 안전 실행 (eval → bash -lc)
+          run(){
+            printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/echo.log"
+            bash -lc "$*" 2>&1 | tee -a "${LOG_DIR}/echo.log"
+          }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      # 새 입력을 기존 ENV로 투영 (FROM/TO, TOP_N, CATEGORY_MAP_JSON)
-      - name: Derive legacy env from date_range & report_options
+      - name: Ensure base dirs + Git LFS
         shell: bash
         run: |
           set -Eeuo pipefail
-          DATE_RANGE="${{ inputs.date_range }}"
-          FROM=""; TO=""
-          if [[ -n "$DATE_RANGE" && "$DATE_RANGE" == *..* ]]; then
-            FROM="${DATE_RANGE%%..*}"; TO="${DATE_RANGE##*..}"
-          fi
-          echo "FROM_DATE=$FROM" >> "$GITHUB_ENV"
-          echo "TO_DATE=$TO" >> "$GITHUB_ENV"
-          RO='${{ inputs.report_options }}'
-          TOP_N="10"; CAT_JSON=""
-          if command -v jq >/dev/null 2>&1 && [[ -n "$RO" ]]; then
-            TOP_N="$(jq -r '.top_n // empty' <<<"$RO" 2>/dev/null || echo '')"
-            CAT_JSON="$(jq -r '.category_map_json // empty' <<<"$RO" 2>/dev/null || echo '')"
-          fi
-          [[ -z "$TOP_N" ]] && TOP_N="10"
-          echo "TOP_N=$TOP_N" >> "$GITHUB_ENV"
-          echo "CATEGORY_MAP_JSON=$CAT_JSON" >> "$GITHUB_ENV"
+          source /tmp/echo_helpers.sh
+          run "mkdir -p '${LOG_DIR}' '${DL_DIR}' '${REPORT_DIR}' app/src/main/java/com/example app/src/main/resources data"
+          run "git lfs install"
+          run "git lfs pull || true"
 
-      # ===== 안전 전범위 BULK =====
-      - name: BULK MODIFY — safe global replace/append/rename/duplicate/chmod
+      # ===== 전 범위 고정: 대량 수정 스텝 =====
+      - name: BULK MODIFY — global-safe (replace/append/rename/duplicate/chmod)
         if: env.BULK_ENABLE == 'true'
         shell: bash
-        env:
-          EXTS: "${{ env.BULK_EXTS }}"
-          EXCLUDES: "${{ env.BULK_EXCLUDES }}"
-          FROM:  "${{ env.REPLACE_FROM }}"
-          TO:    "${{ env.REPLACE_TO }}"
-          APPEND_LINE: "${{ env.APPEND_LINE }}"
-          RPRE:  "${{ env.RENAME_PREFIX }}"
-          RSUF:  "${{ env.RENAME_SUFFIX }}"
-          COPIES: "${{ env.DUPLICATE_COPIES }}"
-          FMODE: "${{ env.CHMOD_MODE }}"
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
 
-          # --- 빌드/아티팩트/벤더 디렉토리 프루닝 목록 구성
-          IFS=',' read -r -a EX_ARR <<< "${EXCLUDES}"
-          PRUNE_EXPR=()
-          for d in "${EX_ARR[@]}"; do
-            d="$(echo "$d" | xargs)" ; [[ -z "$d" ]] && continue
-            PRUNE_EXPR+=( -path "./${d}/*" -prune -o )
+          IFS=',' read -r -a EXCLUDES <<< "${BULK_EXCLUDES}"
+          EXPR=""
+          for p in "${EXCLUDES[@]}"; do
+            [[ -z "$p" ]] && continue
+            [[ -n "$EXPR" ]] && EXPR="${EXPR} -o "
+            EXPR="${EXPR}-path './${p}/*'"
           done
 
-          # --- 확장자 정규식
-          EXT_RE=""
-          if [[ -n "${EXTS// /}" ]]; then
-            IFS=',' read -r -a E_ARR <<< "${EXTS}"
-            for e in "${E_ARR[@]}"; do
-              e="$(echo "$e" | xargs)"
-              [[ -z "$e" ]] && continue
-              EXT_RE="${EXT_RE:+${EXT_RE}|}\.${e}$"
-            done
-          fi
-
-          # --- 전범위 파일 수집 (프루닝 + 확장자 필터 + 정규 파일)
-          #     _copyN.* 및 이미 prefix/suffix 적용된 파일은 원본 목록에서 제외 → 1회성 처리 보장
-          mapfile -d '' CANDIDATES < <(
-            find . \
-              "${PRUNE_EXPR[@]}" \
-              -type f -o -false \
-              -print0 2>/dev/null
-          )
-
-          FILES=()
-          for f in "${CANDIDATES[@]}"; do
-            [[ -z "$f" ]] && continue
-            # 확장자 필터
-            if [[ -n "$EXT_RE" ]]; then
-              [[ "$f" =~ $EXT_RE ]] || continue
-            fi
-            base="$(basename "$f")"
-            dir="$(dirname "$f")"
-            # 복제본/이미 리네임된 파일은 소스에서 제외
-            if [[ "$base" =~ _copy[0-9]+(\..*)?$ ]]; then continue; fi
-            if [[ -n "$RPRE" && "$base" == "$RPRE"* ]]; then
-              # 이미 prefix가 붙었지만 suffix 미적용이면 후처리만 허용
-              if [[ -n "$RSUF" && "$base" != *"$RSUF".* && "$base" != *"$RSUF" ]]; then
-                :  # 통과(후술 rename에서 suffix만 붙음)
-              else
-                # 완전 적용된 파일은 건너뜀
-                continue
-              fi
-            fi
-            if [[ -n "$RSUF" && ( "$base" == *"$RSUF".* || "$base" == *"$RSUF" ) ]]; then
-              # suffix 이미 붙어있고 prefix도 붙어있으면 스킵
-              if [[ -z "$RPRE" || "$base" == "$RPRE"* ]]; then continue; fi
-            fi
-            FILES+=("$f")
-          done
+          # 1) 텍스트 파일 전수 수집 (전 범위 고정, 제외 경로 -prune)
+          mapfile -t FILES < <(bash -lc "find . \\( ${EXPR} \\) -prune -o -type f -print0 | xargs -0 -I{} bash -lc 'file --mime \"{}\" 2>/dev/null | grep -q \"text/\" && echo {}'")
 
           echo "대상 파일(원본) 수: ${#FILES[@]}"
 
-          # --- 치환 + 줄추가 + (필요시) 리네임 + (옵션) 복제
+          # 2) 내용 치환 + 라인 추가(중복 방지)
           for f in "${FILES[@]}"; do
-            # 본문 치환
-            if [[ -n "$FROM" ]]; then
-              run sed -i "s/${FROM//\//\\/}/${TO//\//\\/}/g" "$f"
+            if [[ -n "${REPLACE_FROM}" && -n "${REPLACE_TO}" ]]; then
+              run "perl -0777 -pe 's/\\Q${REPLACE_FROM}\\E/${REPLACE_TO}/g' -i \"$f\""
             fi
-            # 줄 추가
-            if [[ -n "$APPEND_LINE" ]]; then
-              printf '%s\n' "$APPEND_LINE" >> "$f"
-            fi
-            # 리네임 (idempotent)
-            dir="$(dirname "$f")"; base="$(basename "$f")"
-            name="${base%.*}"; ext="${base##*.}"
-            dot="."; [[ "$base" = "$ext" ]] && dot=""
-            new_base="$base"
-
-            if [[ -n "$RPRE" && "$base" != "$RPRE"* ]]; then
-              new_base="${RPRE}${new_base}"
-            fi
-            if [[ -n "$RSUF" && "$base" != *"$RSUF".* && "$base" != *"$RSUF" ]]; then
-              # 확장자 없는 파일도 안전 처리
-              if [[ "$dot" = "." ]]; then new_base="${new_base%.*}${RSUF}${dot}${ext}"
-              else new_base="${new_base}${RSUF}"
-              fi
-            fi
-
-            if [[ "$new_base" != "$base" ]]; then
-              run mv "$f" "${dir}/${new_base}"
-              f="${dir}/${new_base}"
-            fi
-
-            # 복제 (오직 원본 목록에서만 1회)
-            if [[ "${COPIES:-0}" -gt 0 ]]; then
-              for ((i=1;i<=COPIES;i++)); do
-                clone="${f%.*}_copy${i}${dot}${ext}"
-                run cp -f "$f" "$clone"
-              done
+            if [[ -n "${APPEND_LINE}" ]]; then
+              grep -Fxq "${APPEND_LINE}" "$f" || echo "${APPEND_LINE}" >> "$f"
             fi
           done
 
-          # 권한 정리 (프루닝 + 인용으로 안전)
-          run find . \( -path './.git/*' -o -path './.github/artifacts/*' -o -path '*/target/*' -o -path '*/node_modules/*' -o -path './.venv/*' -o -path './.m2/*' \) -prune -o -type f -exec chmod "${FMODE}" {} +
-          run find . \( -path './.git/*' -o -path './.github/artifacts/*' -o -path '*/target/*' -o -path '*/node_modules/*' -o -path './.venv/*' -o -path './.m2/*' \) -prune -o -type d -exec chmod 755 {} +
+          # 3) 파일명 변경(재실행 안전: bulk_시작 또는 _copyN 는 skip)
+          RENAMED=()
+          for f in "${FILES[@]}"; do
+            dir="$(dirname "$f")"
+            base="$(basename "$f")"
+            ext="${base##*.}"; name="${base%.*}"
+            dot="."; [[ "$base" = "$ext" ]] && dot=""
+            if [[ "$name" == ${RENAME_PREFIX}* ]] || [[ "$name" =~ _copy[0-9]+$ ]]; then
+              continue
+            fi
+            new="${dir}/${RENAME_PREFIX}${name}${RENAME_SUFFIX}${dot}${ext}"
+            if [[ "${RENAME_PREFIX}${RENAME_SUFFIX}" != "" && "$f" != "$new" ]]; then
+              run "mv -f \"$f\" \"$new\""
+              RENAMED+=("$new")
+            fi
+          done
 
-          git status --porcelain | tee "${LOG_DIR}/bulk_modify_changes.txt" || true
+          # 4) 복제(옵션)
+          if [[ "${DUPLICATE_COPIES:-0}" =~ ^[0-9]+$ && "${DUPLICATE_COPIES}" -gt 0 ]]; then
+            for f in "${RENAMED[@]}"; do
+              dir="$(dirname "$f")"
+              base="$(basename "$f")"
+              ext="${base##*.}"; name="${base%.*}"
+              dot="."; [[ "$base" = "$ext" ]] && dot=""
+              for ((i=1; i<=DUPLICATE_COPIES; i++)); do
+                clone="${dir}/${name}_copy${i}${dot}${ext}"
+                run "cp -f \"$f\" \"$clone\""
+              done
+            done
+          fi
 
-      # 1) pom.xml 부트스트랩
+          # 5) 권한 통일(파일/디렉토리) — 괄호/경로 패턴 안전
+          run "find . \\( ${EXPR} \\) -prune -o -type f -exec chmod '${CHMOD_MODE:-644}' {} +"
+          run "find . \\( ${EXPR} \\) -prune -o -type d -exec chmod 755 {} +"
+
+      # ===== Maven POM 부트스트랩 =====
       - name: Bootstrap Maven project if missing
         if: hashFiles('**/pom.xml') == ''
         shell: bash
@@ -263,7 +199,7 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           echoe "pom.xml 미존재 → app/에 생성"
-          run mkdir -p app/src/main/java/com/example app/src/main/resources
+          run "mkdir -p app/src/main/java/com/example app/src/main/resources"
           cat > app/pom.xml <<'POM'
           <?xml version="1.0" encoding="UTF-8"?>
           <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -336,9 +272,9 @@ jobs:
             </build>
           </project>
           POM
+          echo 'package com.example; public class BankLedger{public static void main(String[]a){System.out.println("placeholder");}}' > app/src/main/java/com/example/BankLedger.java
           echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
 
-      # 2) POM self-heal
       - name: Self-heal POM shade <transformer> tag if broken
         shell: bash
         run: |
@@ -366,29 +302,513 @@ jobs:
             echo "✅ POM transformer 태그 정상"
           fi
 
-      # 3) BankLedger.java 보장 (최소 폴백)
-      - name: Ensure BankLedger.java exists (fallback if missing)
+      # ===== 자바 본문(다국어 헤더/입·출금/월별·타입별·메모별/카테고리/랭킹/HTML+CSV) =====
+      - name: Patch BankLedger.java (multi-file + KR headers + debit/credit/net + rankings)
         shell: bash
         run: |
           set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-          FILE="app/src/main/java/com/example/BankLedger.java"
-          if [[ ! -f "$FILE" ]] || ! grep -q "class BankLedger" "$FILE"; then
-            echoe "BankLedger.java 미존재 또는 비정상 → 최소 구현 생성"
-            mkdir -p app/src/main/java/com/example
-            cat > "$FILE" <<'JAVA'
-            package com.example;
-            public class BankLedger {
-              public static void main(String[] a) {
-                System.out.println("Ledger Viewer minimal fallback running…");
+          mkdir -p app/src/main/java/com/example
+          cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
+          package com.example;
+          import org.apache.commons.csv.*;
+          import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+          import org.apache.poi.ss.usermodel.*;
+          import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+          import com.fasterxml.jackson.databind.ObjectMapper;
+          import java.io.*;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.*;
+          import java.time.LocalDate;
+          import java.time.YearMonth;
+          import java.time.format.DateTimeFormatter;
+          import java.util.*;
+          import java.util.stream.Collectors;
+          import java.util.stream.Stream;
+          public class BankLedger {
+              record LedgerRow(LocalDate date, String time, String type,
+                               long debit, long credit, long net,
+                               String memo, Long balance, String account, String source){}
+              static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
+                      DateTimeFormatter.ofPattern("yyyy-MM-dd"),
+                      DateTimeFormatter.ofPattern("yyyy.M.d"),
+                      DateTimeFormatter.ofPattern("yyyy/M/d")
+              };
+              public static void main(String[] args) throws Exception {
+                  String pathSingle   = argOrEnv(args, 0, "LEDGER_PATH", "");
+                  String from         = argOrEnv(args, 1, "FROM_DATE", "");
+                  String to           = argOrEnv(args, 2, "TO_DATE", "");
+                  String sheetName    = env("SHEET_NAME", "");
+                  String extsPref     = env("LEDGER_EXTS", "").trim();
+                  String rootsPref    = env("LEDGER_SEARCH_ROOTS", env("SEARCH_ROOT", ".github")).trim();
+                  String nameFilters  = env("LEDGER_NAME_FILTERS", env("NAME_FILTERS", "")).trim();
+                  boolean aggregateAll= Boolean.parseBoolean(env("AGGREGATE_ALL_FILES", "true"));
+                  boolean allDates    = Boolean.parseBoolean(env("ALL_DATES", "true"));
+                  String outFormats   = env("OUTPUT_FORMATS", "console,csv,html").toLowerCase(Locale.ROOT);
+                  int topN            = parseInt(env("TOP_N", env("top_n", "10")), 10);
+                  String categoryJson = env("CATEGORY_MAP_JSON", env("category_map_json", "")).trim();
+                  Path reportDir      = Paths.get(env("REPORT_DIR", "target/reports"));
+                  Files.createDirectories(reportDir);
+                  LocalDate fromDate = allDates ? null : parseDateOrNull(from);
+                  LocalDate toDate   = allDates ? null : parseDateOrNull(to);
+                  // 파일 탐색
+                  List<Path> files = new ArrayList<>();
+                  if (!pathSingle.isBlank()) files.add(Paths.get(pathSingle));
+                  else files = discoverFiles(extsPref, rootsPref, nameFilters, aggregateAll);
+                  if (files.isEmpty()) {
+                      System.out.println("⚠️ 탐색된 파일이 없어 샘플 CSV 생성: data/sample_ledger.csv");
+                      Path p = Paths.get("data"); Files.createDirectories(p);
+                      Path csv = p.resolve("sample_ledger.csv");
+                      String sample = String.join("\n", List.of(
+                              "date,time,type,debit,credit,memo,balance,account",
+                              "2025-10-11,16:36:58,체크카드,10860,0,Google handj,1673419,원신한",
+                              "2025-10-09,14:15:58,체크카드,53692,0,Google handj,190880,원신한",
+                              "2025-10-09,12:41:23,체크카드,2682,0,Google Pokemon,144572,원신한",
+                              "2025-10-08,15:40:43,체크카드,10731,0,Google handj,179288,원신한",
+                              "2025-10-08,14:52:20,체크카드,32222,0,Google handj,190019,원신한"
+                      ));
+                      Files.writeString(csv, sample, StandardCharsets.UTF_8);
+                      files = List.of(csv);
+                  }
+                  // 읽기/정규화
+                  List<LedgerRow> allRows = new ArrayList<>();
+                  for (Path f: files) {
+                      String lower = f.toString().toLowerCase(Locale.ROOT);
+                      List<LedgerRow> rows;
+                      if (lower.endsWith(".csv")) rows = readCsv(f);
+                      else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) rows = readExcel(f, sheetName);
+                      else { System.out.println("⏭️ 지원하지 않는 확장자: " + f); continue; }
+                      allRows.addAll(rows);
+                  }
+                  // 기간 필터
+                  List<LedgerRow> rows = filterByDate(allRows, fromDate, toDate);
+                  // 요약
+                  Map<LocalDate, Sum> byDate = summarizeByDate(rows);
+                  Map<String, Sum> byType = summarizeByType(rows);
+                  Map<String, Sum> byMemo = summarizeByMemo(rows);
+                  Map<YearMonth, Sum> byMonth = summarizeByMonth(rows);
+                  Map<String, List<String>> catMap = parseCategoryMap(categoryJson);
+                  Map<String, Sum> byCategory = summarizeByCategory(rows, catMap);
+                  // 출력
+                  if (outFormats.contains("console")) printTable(rows, topN, byMemo);
+                  if (outFormats.contains("csv")) {
+                      writeCsv(reportDir.resolve("ledger_consolidated.csv"), rows);
+                      writeCsvSumDate(reportDir.resolve("summary_by_date.csv"), byDate);
+                      writeCsvSumType(reportDir.resolve("summary_by_type.csv"), byType);
+                      writeCsvSumMemo(reportDir.resolve("summary_by_memo.csv"), byMemo, topN);
+                      writeCsvSumMonth(reportDir.resolve("summary_monthly.csv"), byMonth);
+                      if (!byCategory.isEmpty())
+                        writeCsvSumCat(reportDir.resolve("summary_by_category.csv"), byCategory);
+                      writeFilesUsed(reportDir.resolve("files_used.txt"), files);
+                  }
+                  if (outFormats.contains("html")) {
+                      writeHtmlSummary(reportDir.resolve("summary.html"), rows, byDate, byType, byMemo, byMonth, byCategory, files, topN);
+                  }
+                  // 합계
+                  long outSum = rows.stream().mapToLong(r -> r.debit).sum();
+                  long inSum  = rows.stream().mapToLong(r -> r.credit).sum();
+                  long netSum = rows.stream().mapToLong(r -> r.net).sum();
+                  Long lastBalance = rows.stream().filter(r -> r.balance != null).reduce((a,b)->b).map(r->r.balance).orElse(null);
+                  System.out.println();
+                  System.out.println("==== 요약 ====");
+                  System.out.printf("파일 수     : %,d%n", files.size());
+                  System.out.printf("거래 건수   : %,d%n", rows.size());
+                  System.out.printf("총 출금합계 : %,d원%n", outSum);
+                  System.out.printf("총 입금합계 : %,d원%n", inSum);
+                  System.out.printf("순증감(net) : %,d원%n", netSum);
+                  if (lastBalance != null) System.out.printf("마지막 잔액 : %,d원%n", lastBalance);
+                  System.out.println("리포트 위치 : " + reportDir.toAbsolutePath());
               }
-            }
-            JAVA
-          else
-            echo "기존 BankLedger.java 유지"
-          fi
+              // ===== Discover & Filters =====
+              static List<Path> discoverFiles(String extsPref, String rootsPref, String nameFilters, boolean all) throws IOException {
+                  List<String> exts = parseExts(extsPref);
+                  List<String> pats = toPatterns(exts);
+                  List<Path> roots = parseRoots(rootsPref);
+                  Set<String> nameTokens = parseTokens(nameFilters);
+                  List<Path> found = new ArrayList<>();
+                  for (Path root: roots) {
+                      for (String pat: pats) {
+                          PathMatcher m = FileSystems.getDefault().getPathMatcher("regex:" + globToRegex(root + "/" + pat));
+                          try (Stream<Path> s = Files.walk(root).filter(Files::isRegularFile)) {
+                              List<Path> matches = s.filter(p -> m.matches(p))
+                                      .filter(p -> nameTokens.isEmpty() || containsAllTokens(p.getFileName().toString(), nameTokens))
+                                      .collect(Collectors.toList());
+                              found.addAll(matches);
+                          } catch (Exception ignore) {}
+                      }
+                  }
+                  found.sort(Comparator.comparingLong((Path p) -> p.toFile().lastModified()).reversed());
+                  if (found.isEmpty()) return List.of();
+                  return all ? found : List.of(found.get(0));
+              }
+              static boolean containsAllTokens(String name, Set<String> tokens) {
+                  String n = name.toLowerCase(Locale.ROOT);
+                  for (String t: tokens) if (!n.contains(t)) return false;
+                  return true;
+              }
+              static Set<String> parseTokens(String s) {
+                  if (s == null || s.isBlank()) return Set.of();
+                  String[] parts = s.toLowerCase(Locale.ROOT).split("[,;\\s]+");
+                  Set<String> out = new LinkedHashSet<>();
+                  for (String p: parts) if (!p.isBlank()) out.add(p.trim());
+                  return out;
+              }
+              static List<Path> parseRoots(String rootsPref) {
+                  if (rootsPref == null || rootsPref.isBlank()) return List.of(Paths.get(".github"));
+                  String[] parts = rootsPref.split("[,;\\s]+");
+                  List<Path> out = new ArrayList<>();
+                  for (String p: parts) { Path r = Paths.get(p.trim()); if (Files.exists(r)) out.add(r); }
+                  if (out.isEmpty()) out.add(Paths.get(".github"));
+                  return out;
+              }
+              static List<String> toPatterns(List<String> exts) {
+                  if (exts.isEmpty()) return List.of("**/*.xlsx","**/*.xls","**/*.csv");
+                  List<String> patterns = new ArrayList<>();
+                  for (String ext: exts) patterns.add("**/*." + ext);
+                  return patterns;
+              }
+              static List<String> parseExts(String s) {
+                  if (s == null || s.isBlank()) return List.of();
+                  String[] parts = s.toLowerCase(Locale.ROOT).split("[,;\\s]+");
+                  List<String> out = new ArrayList<>();
+                  for (String p: parts) if (p.equals("xlsx")||p.equals("xls")||p.equals("csv")) out.add(p);
+                  return out;
+              }
+              // ===== Parsing =====
+              static List<LedgerRow> readCsv(Path path) throws IOException {
+                  try (Reader in = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                      CSVParser p = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).build().parse(in);
+                      Map<String, Integer> idx = headerIndex(p.getHeaderMap().keySet());
+                      List<LedgerRow> out = new ArrayList<>();
+                      for (CSVRecord r: p) out.add(convertRow(
+                              parseDateOrNull(get(r, idx, "date")),
+                              get(r, idx, "time"),
+                              get(r, idx, "type"),
+                              parseLongSafe(get(r, idx, "debit")),
+                              parseLongSafe(get(r, idx, "credit")),
+                              get(r, idx, "memo", get(r, idx, "desc")),
+                              parseLongSafeNullable(get(r, idx, "balance")),
+                              get(r, idx, "account"),
+                              path.toString()
+                      ));
+                      return out;
+                  }
+              }
+              static List<LedgerRow> readExcel(Path path, String sheetName) throws IOException {
+                  try (InputStream is = Files.newInputStream(path)) {
+                      Workbook wb = path.toString().toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
+                      Sheet sheet = (sheetName != null && !sheetName.isBlank()) ? wb.getSheet(sheetName) : wb.getSheetAt(0);
+                      if (sheet == null) return List.of();
+                      Iterator<org.apache.poi.ss.usermodel.Row> it = sheet.iterator();
+                      if (!it.hasNext()) return List.of();
+                      org.apache.poi.ss.usermodel.Row hr = it.next();
+                      Map<String,Integer> idxRaw = new HashMap<>();
+                      for (Cell c: hr) { c.setCellType(CellType.STRING); idxRaw.put(safeLower(c.getStringCellValue()), c.getColumnIndex()); }
+                      Map<String,Integer> idx = normalizeHeaderIndex(idxRaw);
+                      List<LedgerRow> out = new ArrayList<>();
+                      while (it.hasNext()) {
+                          org.apache.poi.ss.usermodel.Row rr = it.next();
+                          LocalDate d = parseDateOrNull(cellStr(rr, idx.getOrDefault("date",-1)));
+                          if (d == null) continue;
+                          String time = cellStr(rr, idx.getOrDefault("time",-1));
+                          String type = cellStr(rr, idx.getOrDefault("type",-1));
+                          long debit  = parseLongSafe(cellStr(rr, idx.getOrDefault("debit",-1)));
+                          long credit = parseLongSafe(cellStr(rr, idx.getOrDefault("credit",-1)));
+                          String memo = firstNonEmpty(
+                                  cellStr(rr, idx.getOrDefault("memo",-1)),
+                                  cellStr(rr, idx.getOrDefault("desc",-1)),
+                                  cellStr(rr, idx.getOrDefault("내용",-1))
+                          );
+                          Long bal    = parseLongSafeNullable(cellStr(rr, idx.getOrDefault("balance",-1)));
+                          String acct = cellStr(rr, idx.getOrDefault("account",-1));
+                          out.add(convertRow(d, time, type, debit, credit, memo, bal, acct, path.toString()));
+                      }
+                      wb.close();
+                      return out;
+                  }
+              }
+              static LedgerRow convertRow(LocalDate d, String time, String type, long debit, long credit, String memo, Long bal, String acct, String src){
+                  long net = credit - debit; // 입금(+), 출금(-)
+                  return new LedgerRow(d, nv(time), nv(type), Math.max(debit,0), Math.max(credit,0), net, nv(memo), bal, nv(acct), src);
+              }
+              // ===== Header utils =====
+              static Map<String,Integer> headerIndex(Set<String> keys){
+                  Map<String,Integer> m = new HashMap<>();
+                  int i=0; for (String k: keys){ m.put(safeLower(k), i++); }
+                  return normalizeHeaderIndex(m);
+              }
+              static Map<String,Integer> normalizeHeaderIndex(Map<String,Integer> raw){
+                  Map<String,Integer> out = new HashMap<>();
+                  for (var e: raw.entrySet()){
+                      String k = e.getKey(); int v = e.getValue();
+                      if (k.contains("date") || k.contains("거래일")) out.put("date", v);
+                      else if (k.contains("time") || k.contains("거래시간")) out.put("time", v);
+                      else if (k.contains("type") || k.contains("적요")) out.put("type", v);
+                      else if (k.contains("debit") || k.contains("출금")) out.put("debit", v);
+                      else if (k.contains("credit")|| k.contains("입금")) out.put("credit", v);
+                      else if (k.contains("balance")||k.contains("잔액")) out.put("balance", v);
+                      else if (k.contains("memo")||k.contains("desc")||k.contains("내용")) out.put("memo", v);
+                      else if (k.contains("account")||k.contains("거래점")) out.put("account", v);
+                  }
+                  out.putIfAbsent("memo", raw.getOrDefault("내용",-1));
+                  return out;
+              }
+              static String cellStr(org.apache.poi.ss.usermodel.Row r, int cidx) {
+                  if (cidx < 0) return "";
+                  Cell c = r.getCell(cidx);
+                  if (c == null) return "";
+                  return switch (c.getCellType()) {
+                      case STRING -> c.getStringCellValue();
+                      case NUMERIC -> DateUtil.isCellDateFormatted(c)
+                              ? c.getLocalDateTimeCellValue().toLocalDate().toString()
+                              : String.valueOf(Math.round(c.getNumericCellValue()));
+                      case BOOLEAN -> String.valueOf(c.getBooleanCellValue());
+                      default -> "";
+                  };
+              }
+              // ===== Summary helpers =====
+              static class Sum { long debit=0, credit=0; long net(){ return credit - debit; } long cnt=0; }
+              static Map<LocalDate, Sum> summarizeByDate(List<LedgerRow> rows){
+                  Map<LocalDate, Sum> m = new TreeMap<>();
+                  for (var r: rows){ Sum s = m.getOrDefault(r.date, new Sum()); s.debit+=r.debit; s.credit+=r.credit; s.cnt++; m.put(r.date,s); }
+                  return m;
+              }
+              static Map<YearMonth, Sum> summarizeByMonth(List<LedgerRow> rows){
+                  Map<YearMonth, Sum> m = new TreeMap<>();
+                  for (var r: rows){ YearMonth ym = YearMonth.from(r.date); Sum s = m.getOrDefault(ym, new Sum()); s.debit+=r.debit; s.credit+=r.credit; s.cnt++; m.put(ym,s); }
+                  return m;
+              }
+              static Map<String, Sum> summarizeByType(List<LedgerRow> rows){
+                  Map<String, Sum> m = new TreeMap<>();
+                  for (var r: rows){ String k = nv(r.type); Sum s = m.getOrDefault(k,new Sum()); s.debit+=r.debit; s.credit+=r.credit; s.cnt++; m.put(k,s); }
+                  return m;
+              }
+              static Map<String, Sum> summarizeByMemo(List<LedgerRow> rows){
+                  Map<String, Sum> m = new HashMap<>();
+                  for (var r: rows){
+                      String key = nv(r.memo).toLowerCase(Locale.ROOT);
+                      if (key.isBlank()) key = "(blank)";
+                      Sum s = m.getOrDefault(key,new Sum());
+                      s.debit+=r.debit; s.credit+=r.credit; s.cnt++;
+                      m.put(key,s);
+                  }
+                  return sortByDebitDesc(m);
+              }
+              static Map<String, List<String>> parseCategoryMap(String json){
+                  if (json==null || json.isBlank()) return Map.of();
+                  try {
+                      @SuppressWarnings("unchecked")
+                      Map<String, List<String>> m = new ObjectMapper().readValue(json, Map.class);
+                      Map<String,List<String>> out = new LinkedHashMap<>();
+                      for (var e: m.entrySet()){
+                          List<String> list = new ArrayList<>();
+                          for (String s: e.getValue()) list.add(s.toLowerCase(Locale.ROOT));
+                          out.put(e.getKey(), list);
+                      }
+                      return out;
+                  } catch(Exception e){ return Map.of(); }
+              }
+              static Map<String, Sum> summarizeByCategory(List<LedgerRow> rows, Map<String,List<String>> cat){
+                  if (cat.isEmpty()) return Map.of();
+                  Map<String, Sum> m = new TreeMap<>();
+                  for (var r: rows){
+                      String memoL = nv(r.memo).toLowerCase(Locale.ROOT);
+                      String catName = null;
+                      for (var e: cat.entrySet()){
+                          for (String kw: e.getValue()){
+                              if (!kw.isBlank() && memoL.contains(kw)){ catName = e.getKey(); break; }
+                          }
+                          if (catName!=null) break;
+                      }
+                      if (catName==null) catName="(기타)";
+                      Sum s = m.getOrDefault(catName,new Sum());
+                      s.debit+=r.debit; s.credit+=r.credit; s.cnt++;
+                      m.put(catName,s);
+                  }
+                  return sortByDebitDesc(m);
+              }
+              // ===== Writers =====
+              static void printTable(List<LedgerRow> rows, int topN, Map<String, Sum> byMemo){
+                  System.out.println("date       | time     | type   | debit   | credit  | net     | memo             | balance   | account  | source");
+                  System.out.println("-----------+----------+--------+---------+---------+---------+------------------+-----------+----------+----------------");
+                  for (var r: rows) {
+                      System.out.printf("%-10s | %-8s | %-6s | %8s | %8s | %8s | %-16s | %9s | %-8s | %s%n",
+                              r.date, nv(r.time), nv(r.type),
+                              fmt(r.debit), fmt(r.credit), fmt(r.net),
+                              cut(nv(r.memo),16),
+                              r.balance==null? "-" : fmt(r.balance), nv(r.account), r.source);
+                  }
+                  System.out.println("\n== Top " + topN + " 지출(memo) ==");
+                  int i=0; for (var e: byMemo.entrySet().stream().sorted((a,b)->Long.compare(b.getValue().debit, a.getValue().debit)).toList()){
+                      if (i++>=topN) break;
+                      System.out.printf("%2d) %-24s  debit:%10s  credit:%10s  net:%10s  (cnt:%d)%n",
+                              i, cut(e.getKey(),24), fmt(e.getValue().debit), fmt(e.getValue().credit), fmt(e.getValue().net()), e.getValue().cnt);
+                  }
+              }
+              static void writeCsv(Path out, List<LedgerRow> rows) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("date","time","type","debit","credit","net","memo","balance","account","source"))) {
+                      for (var r: rows) p.printRecord(r.date, r.time, r.type, r.debit, r.credit, r.net, r.memo, r.balance==null?"":r.balance, r.account, r.source);
+                  }
+              }
+              static void writeCsvSumDate(Path out, Map<LocalDate, Sum> map) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("date","count","debit_sum","credit_sum","net"))) {
+                      for (var e: map.entrySet()) p.printRecord(e.getKey(), e.getValue().cnt, e.getValue().debit, e.getValue().credit, e.getValue().net());
+                  }
+              }
+              static void writeCsvSumType(Path out, Map<String, Sum> map) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("type","count","debit_sum","credit_sum","net"))) {
+                      for (var e: map.entrySet()) p.printRecord(e.getKey(), e.getValue().cnt, e.getValue().debit, e.getValue().credit, e.getValue().net());
+                  }
+              }
+              static void writeCsvSumMemo(Path out, Map<String, Sum> map, int topN) throws IOException {
+                  List<Map.Entry<String,Sum>> list = map.entrySet().stream()
+                          .sorted((a,b)->Long.compare(b.getValue().debit, a.getValue().debit))
+                          .limit(topN).toList();
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("memo","count","debit_sum","credit_sum","net"))) {
+                      for (var e: list) p.printRecord(e.getKey(), e.getValue().cnt, e.getValue().debit, e.getValue().credit, e.getValue().net());
+                  }
+              }
+              static void writeCsvSumMonth(Path out, Map<YearMonth, Sum> map) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("year_month","count","debit_sum","credit_sum","net"))) {
+                      for (var e: map.entrySet()) p.printRecord(e.getKey(), e.getValue().cnt, e.getValue().debit, e.getValue().credit, e.getValue().net());
+                  }
+              }
+              static void writeCsvSumCat(Path out, Map<String, Sum> map) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("category","count","debit_sum","credit_sum","net"))) {
+                      for (var e: map.entrySet()) p.printRecord(e.getKey(), e.getValue().cnt, e.getValue().debit, e.getValue().credit, e.getValue().net());
+                  }
+              }
+              static void writeFilesUsed(Path out, List<Path> files) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
+                      for (Path f: files) w.write(f.toString() + System.lineSeparator());
+                  }
+              }
+              static void writeHtmlSummary(Path out, List<LedgerRow> rows,
+                                           Map<LocalDate, Sum> byDate,
+                                           Map<String, Sum> byType,
+                                           Map<String, Sum> byMemo,
+                                           Map<YearMonth, Sum> byMonth,
+                                           Map<String, Sum> byCat,
+                                           List<Path> files, int topN) throws IOException {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("<!doctype html><meta charset='utf-8'><title>Ledger Summary</title>");
+                  sb.append("<style>table{border-collapse:collapse}th,td{border:1px solid #ccc;padding:4px 8px}code{background:#f6f8fa;padding:2px 4px}</style>");
+                  sb.append("<h1>Ledger Summary</h1>");
+                  sb.append("<h2>Files used (").append(files.size()).append(")</h2><ul>");
+                  for (Path f: files) sb.append("<li>").append(esc(f.toString())).append("</li>");
+                  sb.append("</ul>");
+                  sb.append("<h2>By Date</h2>").append(htmlSumTableDate(byDate));
+                  sb.append("<h2>By Type</h2>").append(htmlSumTableKV(byType, "Type"));
+                  sb.append("<h2>By Memo (Top ").append(topN).append(" by debit)</h2>").append(htmlSumTableTop(byMemo, topN));
+                  sb.append("<h2>By Month</h2>").append(htmlSumTableMonth(byMonth));
+                  if (!byCat.isEmpty()) { sb.append("<h2>By Category</h2>").append(htmlSumTableKV(byCat, "Category")); }
+                  sb.append("<h2>First 100 rows</h2><table><tr><th>date</th><th>time</th><th>type</th><th>debit</th><th>credit</th><th>net</th><th>memo</th><th>balance</th><th>account</th><th>source</th></tr>");
+                  int i=0;
+                  for (var r: rows) {
+                      if (i++>=100) break;
+                      sb.append("<tr>")
+                        .append(td(r.date.toString())).append(td(esc(nv(r.time)))).append(td(esc(nv(r.type))))
+                        .append(td(fm(r.debit))).append(td(fm(r.credit))).append(td(fm(r.net)))
+                        .append(td(esc(nv(r.memo)))).append(td(r.balance==null?"":fm(r.balance))).append(td(esc(nv(r.account)))).append(td(esc(r.source)))
+                        .append("</tr>");
+                  }
+                  sb.append("</table>");
+                  Files.writeString(out, sb.toString(), StandardCharsets.UTF_8);
+              }
+              static String htmlSumTableDate(Map<LocalDate, Sum> m){
+                  StringBuilder sb = new StringBuilder("<table><tr><th>Date</th><th>Count</th><th>Debit</th><th>Credit</th><th>Net</th></tr>");
+                  for (var e: m.entrySet()) sb.append("<tr>").append(td(e.getKey().toString()))
+                          .append(td(String.valueOf(e.getValue().cnt))).append(td(fm(e.getValue().debit)))
+                          .append(td(fm(e.getValue().credit))).append(td(fm(e.getValue().net()))).append("</tr>");
+                  return sb.append("</table>").toString();
+              }
+              static String htmlSumTableMonth(Map<YearMonth, Sum> m){
+                  StringBuilder sb = new StringBuilder("<table><tr><th>Year-Month</th><th>Count</th><th>Debit</th><th>Credit</th><th>Net</th></tr>");
+                  for (var e: m.entrySet()) sb.append("<tr>").append(td(e.getKey().toString()))
+                          .append(td(String.valueOf(e.getValue().cnt))).append(td(fm(e.getValue().debit)))
+                          .append(td(fm(e.getValue().credit))).append(td(fm(e.getValue().net()))).append("</tr>");
+                  return sb.append("</table>").toString();
+              }
+              static String htmlSumTableTop(Map<String, Sum> m, int topN){
+                  List<Map.Entry<String,Sum>> list = m.entrySet().stream()
+                          .sorted((a,b)->Long.compare(b.getValue().debit, a.getValue().debit)).limit(topN).toList();
+                  StringBuilder sb = new StringBuilder("<table><tr><th>Memo</th><th>Count</th><th>Debit</th><th>Credit</th><th>Net</th></tr>");
+                  for (var e: list) sb.append("<tr>").append(td(esc(e.getKey())))
+                          .append(td(String.valueOf(e.getValue().cnt))).append(td(fm(e.getValue().debit)))
+                          .append(td(fm(e.getValue().credit))).append(td(fm(e.getValue().net()))).append("</tr>");
+                  return sb.append("</table>").toString();
+              }
+              static String htmlSumTableKV(Map<String, Sum> m, String key){
+                  StringBuilder sb = new StringBuilder("<table><tr><th>"+esc(key)+"</th><th>Count</th><th>Debit</th><th>Credit</th><th>Net</th></tr>");
+                  for (var e: m.entrySet()) sb.append("<tr>").append(td(esc(e.getKey())))
+                          .append(td(String.valueOf(e.getValue().cnt))).append(td(fm(e.getValue().debit)))
+                          .append(td(fm(e.getValue().credit))).append(td(fm(e.getValue().net()))).append("</tr>");
+                  return sb.append("</table>").toString();
+              }
+              // ===== Utils =====
+              static String env(String k, String d){ return System.getenv().getOrDefault(k, d); }
+              static String get(CSVRecord r, Map<String,Integer> idx, String k){ return get(r, idx, k, ""); }
+              static String get(CSVRecord r, Map<String,Integer> idx, String k, String def){
+                  Integer i = idx.get(k); if (i==null) return def;
+                  try { return r.get(i); } catch(Exception e){ return def; }
+              }
+              static String nv(String s){ return (s==null||s.isBlank())?"-":s; }
+              static String cut(String s, int n){ return s!=null && s.length()>n ? s.substring(0,n-1)+"…" : s; }
+              static String esc(String s){ return s==null?"":s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"); }
+              static String td(String s){ return "<td>"+s+"</td>"; }
+              static String fm(long v){ return String.format("%,d", v); }
+              static long parseLongSafe(String s){
+                  if (s == null) return 0L;
+                  String t = s.replaceAll("[^0-9-]","");
+                  if (t.isBlank() || t.equals("-")) return 0L;
+                  try { return Long.parseLong(t); } catch(Exception e){ return 0L; }
+              }
+              static Long parseLongSafeNullable(String s){
+                  String t = (s==null) ? "" : s.replaceAll("[^0-9-]","");
+                  if (t.isBlank() || t.equals("-")) return null;
+                  try { return Long.parseLong(t); } catch(Exception e){ return null; }
+              }
+              static LocalDate parseDateOrNull(String s){
+                  if (s == null || s.isBlank()) return null;
+                  for (var fmt: DATE_FMTS) try { return LocalDate.parse(s.trim(), fmt); } catch(Exception ignore){}
+                  try { return LocalDate.parse(s.trim()); } catch(Exception ignore){}
+                  return null;
+              }
+              static List<LedgerRow> filterByDate(List<LedgerRow> in, LocalDate from, LocalDate to){
+                  if (from==null && to==null) return in;
+                  List<LedgerRow> out = new ArrayList<>();
+                  for (var r: in){
+                      boolean ok = true;
+                      if (from!=null && r.date.isBefore(from)) ok=false;
+                      if (to!=null && r.date.isAfter(to)) ok=false;
+                      if (ok) out.add(r);
+                  }
+                  return out;
+              }
+              static String safeLower(String s){ return s==null?"":s.trim().toLowerCase(Locale.ROOT); }
+              static String firstNonEmpty(String... a){ for (String s: a){ if (s!=null && !s.isBlank()) return s; } return ""; }
+              static String argOrEnv(String[] args, int idx, String env, String def){ return (args.length>idx && args[idx]!=null && !args[idx].isBlank()) ? args[idx] : env(env, def); }
+              static Map<String, Sum> sortByDebitDesc(Map<String, Sum> in){
+                  return in.entrySet().stream().sorted((a,b)->Long.compare(b.getValue().debit, a.getValue().debit))
+                          .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue, (x,y)->x, LinkedHashMap::new));
+              }
+              static String globToRegex(String glob) {
+                  String g = glob.replace("\\","/").replace(".", "\\.")
+                          .replace("**/", "(.*/)?").replace("**", ".*").replace("*", "[^/]*").replace("?", ".");
+                  if (!g.startsWith("^")) g = "^" + g;
+                  if (!g.endsWith("$")) g = g + "$";
+                  return g;
+              }
+          }
+          JAVA
+          head -n 3 app/src/main/java/com/example/BankLedger.java
 
-      # 4) Java 설정
+      # ===== Java 설정 & 캐시 =====
       - name: Setup Java (Temurin 21 + maven cache)
         uses: actions/setup-java@v4
         with:
@@ -396,8 +816,8 @@ jobs:
           java-version: '21'
           cache: maven
 
-      # 5) 빌드 & JAR 고르기 + 무결성 점검
-      - name: Build & pick JAR + Sanity check
+      # ===== 빌드 & Shaded JAR 선택(보장) =====
+      - name: Build & pick JAR (shaded-first)
         id: pickjar
         shell: bash
         run: |
@@ -405,35 +825,27 @@ jobs:
           source /tmp/echo_helpers.sh
           POM_PATH="${POM_PATH:-}"
           [[ -z "${POM_PATH}" ]] && POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
+          [[ -z "$POM_PATH" ]] && { faile "pom.xml을 찾지 못했습니다."; exit 1; }
+          WORKDIR="$(dirname "${POM_PATH}")"
+          run "mvn -B -q -DskipTests -f '${POM_PATH}' package"
           JAR=""
-          if [[ -n "${POM_PATH}" ]]; then
-            WORKDIR="$(dirname "${POM_PATH}")"
-            echo "Detected pom: ${POM_PATH}"
-            run mvn -B -q -DskipTests -f "${POM_PATH}" package
-            for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar" "*.jar"; do
-              CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | grep -v 'original-' | head -n1 || true)"
-              [[ -n "${CAND}" ]] && JAR="${CAND}" && break
-            done
-            [[ -z "${JAR}" ]] && { faile "실행 JAR을 찾지 못했습니다."; ls -al "${WORKDIR}/target" || true; exit 1; }
-          else
-            faile "pom.xml을 찾지 못했습니다."; exit 1
-          fi
+          for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar"; do
+            CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | head -n1 || true)"
+            [[ -n "${CAND}" ]] && JAR="${CAND}" && break
+          done
+          [[ -z "${JAR}" ]] && JAR="$(ls -1 "${WORKDIR}"/target/*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)"
+          [[ -z "${JAR}" ]] && { faile "실행 JAR을 찾지 못했습니다."; ls -al "${WORKDIR}/target" || true; exit 1; }
           echo "JAR=${JAR}" >> "$GITHUB_ENV"
           echo "jar_path=${JAR}" >> "$GITHUB_OUTPUT"
-          echo "✅ Picked JAR: ${JAR}"
-          if ! (jar tf "${JAR}" | grep -q '^com/example/BankLedger.class$'); then
-            faile "JAR에 com/example/BankLedger.class 없음"; jar tf "${JAR}" | head -n 200; exit 1
-          fi
-          echo "— Manifest —"
-          (unzip -p "${JAR}" META-INF/MANIFEST.MF || true) | sed -n '1,60p'
+          echoe "Picked JAR: ${JAR}"
 
-      # 6) 실행 (매니페스트 우선, 실패 시 -cp 폴백)
-      - name: Run viewer (java -jar w/ fallback)
+      # ===== 실행 (항상 shaded/manifest JAR) =====
+      - name: Run viewer (java -jar shaded)
         shell: bash
         env:
           LEDGER_PATH:  ${{ inputs.ledger_path }}
-          FROM_DATE:    ${{ env.FROM_DATE }}
-          TO_DATE:      ${{ env.TO_DATE }}
+          FROM_DATE:    ${{ inputs.from_date }}
+          TO_DATE:      ${{ inputs.to_date }}
           SHEET_NAME:   ${{ inputs.sheet_name }}
           LEDGER_EXTS:  ${{ inputs.excel_exts }}
           LEDGER_SEARCH_ROOTS: ${{ inputs.search_root }}
@@ -446,23 +858,16 @@ jobs:
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
+          [[ -z "${JAR:-}" ]] && { faile "JAR 환경변수 비어 있음"; exit 1; }
           echo "LEDGER_PATH=${LEDGER_PATH:-'(빈값: 자동탐색)'}"
           echo "FROM_DATE=${FROM_DATE}   TO_DATE=${TO_DATE}   ALL_DATES=${ALL_DATES}"
           echo "SHEET_NAME=${SHEET_NAME}  LEDGER_EXTS=${LEDGER_EXTS:-'(제한 없음)'}"
           echo "SEARCH_ROOTS=${LEDGER_SEARCH_ROOTS}  NAME_FILTERS=${LEDGER_NAME_FILTERS}"
           echo "AGGREGATE_ALL_FILES=${AGGREGATE_ALL_FILES}  OUTPUT_FORMATS=${OUTPUT_FORMATS}"
-          echo "TOP_N=${TOP_N}"
-          test -n "${JAR:-}" || { echo "❌ JAR 환경변수가 비어 있습니다."; exit 1; }
-          if unzip -p "${JAR}" META-INF/MANIFEST.MF 2>/dev/null | grep -q 'Main-Class: *com.example.BankLedger'; then
-            run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}" || {
-              warne "jar 실행 실패 → -cp 폴백"; run java -cp "${JAR}" com.example.BankLedger "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
-            }
-          else
-            warne "매니페스트 Main-Class 미지정 → -cp 실행"
-            run java -cp "${JAR}" com.example.BankLedger "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
-          fi
+          echo "TOP_N=${TOP_N:-10}"
+          run "java -jar '${JAR}' '${LEDGER_PATH:-}' '${FROM_DATE:-}' '${TO_DATE:-}'"
 
-      # 7) 릴리즈 + URL 요약
+      # ===== 릴리즈 & 정식 다운로드 URL =====
       - name: Create GitHub Release (attach JAR & reports)
         id: release
         uses: softprops/action-gh-release@v2
@@ -509,7 +914,7 @@ jobs:
             if [ -n "${ASSET_URL}" ]; then echo "- First asset:  ${ASSET_URL}"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 8) 아티팩트 업로드(로그/리포트/JAR/대량수정 로그)
+      # ===== 아티팩트 업로드 =====
       - name: Upload artifacts (logs + jars + reports + sources used)
         if: always()
         uses: actions/upload-artifact@v4
@@ -526,7 +931,7 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
-      # 9) 요약
+      # ===== Job summary =====
       - name: Job summary
         shell: bash
         run: |
@@ -540,13 +945,6 @@ jobs:
             echo "- Monthly:          \`target/reports/summary_monthly.csv\`"
             echo "- By category:      \`target/reports/summary_by_category.csv\` (옵션)"
             echo "- HTML summary:     \`target/reports/summary.html\`"
-            echo "### 🔧 Bulk (global, safe)"
-            echo "- Exts:     ${{ env.BULK_EXTS }}"
-            echo "- Excludes: ${{ env.BULK_EXCLUDES }}"
-            echo "- Replace:  '${{ env.REPLACE_FROM }}' -> '${{ env.REPLACE_TO }}'"
-            echo "- Append:   '${{ env.APPEND_LINE }}'"
-            echo "- Rename:   prefix='${{ env.RENAME_PREFIX }}' suffix='${{ env.RENAME_SUFFIX }}' copies=${{ env.DUPLICATE_COPIES }}"
-            echo "- chmod:    files=${{ env.CHMOD_MODE }}, dirs=755"
             echo "### 🔗 Release"
             echo "- Page:  ${{ steps.relurls.outputs.release_page_url }}"
             echo "- Asset: ${{ steps.relurls.outputs.asset_download_url }}"
