@@ -31,11 +31,17 @@ on:
       force_success_message:
         type: boolean
         default: true
+  schedule:
+    - cron: "*/5 * * * *"   # 5분 주기
 
 permissions:
   contents: write
   security-events: write
   packages: write
+
+concurrency:
+  group: vibe-coding-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   TZ: Asia/Seoul
@@ -46,7 +52,7 @@ env:
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
 
-  # ----- 대량 수정 기본값(필요시 변경) -----
+  # ----- 대량 수정 기본값 -----
   BULK_GLOBS: ".github/echo_files/*.txt docs/**/*.md README.md"
   REPLACE_FROM: "echo-file"
   REPLACE_TO:   "vibe-file"
@@ -59,35 +65,57 @@ env:
   # Apache 충돌 회피용 포트
   APACHE_PORT: "8080"
 
-  # =========================
-  #  Release & Publish (env)
-  # =========================
+  # ===== Release & Publish =====
   DO_RELEASE: "false"           # true 면 태그/릴리즈 수행
-  VERSION_BUMP: "patch"         # major | minor | patch | none(수동)
-  RELEASE_TAG_PREFIX: "v"       # 태그 접두사 (예: v1.2.3)
+  VERSION_BUMP: "patch"         # major | minor | patch | none
+  RELEASE_TAG_PREFIX: "v"
 
   # NPM 대량 발행
-  NPM_PUBLISH: "false"          # true 면 npm publish
-  NPM_DIRS: "nodeapp"           # 공백 구분 다중 디렉토리
+  NPM_PUBLISH: "false"
+  NPM_DIRS: "nodeapp"
   NPM_REGISTRY_URL: "https://registry.npmjs.org"
 
   # PyPI 대량 발행
-  PYPI_PUBLISH: "false"         # true 면 PyPI 발행
-  PYPI_DIRS: "app"              # pyproject.toml / setup.cfg/py 존재 경로(공백 구분)
+  PYPI_PUBLISH: "false"
+  PYPI_DIRS: "app"
 
   # Maven 대량 배포 (GitHub Packages 예시)
-  MVN_PUBLISH: "false"          # true 면 mvn deploy
+  MVN_PUBLISH: "false"
   MVN_DIRS: "demo"
   MVN_DIST_URL: "https://maven.pkg.github.com/${{ github.repository }}"
-  MVN_SERVER_ID: "github"       # settings.xml의 server id
+  MVN_SERVER_ID: "github"
 
 jobs:
   all-in-one:
     runs-on: ubuntu-24.04
+
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 태그/로그용
+            fetch-depth: 0
+
+      # ---------- 캐시 (pip / npm / maven) ----------
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt', '**/pyproject.toml') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/package.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
 
       # ---------- 공통 헬퍼 ----------
       - name: Init echo helpers (fail-safe)
@@ -123,7 +151,6 @@ jobs:
           }
           SH
           chmod +x /tmp/safe_run.sh
-
           # 권한 스크립트
           cat > .github/scripts/permissions.sh <<'BASH'
           #!/usr/bin/env bash
@@ -134,7 +161,6 @@ jobs:
           safe_run "find . -type d -not -path './.git/*' -exec chmod 755 {} + || true"
           BASH
           chmod +x .github/scripts/permissions.sh
-
           echo "ok=1" >> "$GITHUB_OUTPUT"
 
       # ---------- 시스템 업그레이드 ----------
@@ -170,7 +196,7 @@ jobs:
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          i=1; while [ $i -le "${{ inputs.files_count }}" ]; do f=$(printf '%s/file%04d.txt' "${{ inputs.files_root }}" "$i"); safe_run "echo 'echo-file-$i $(date -Iseconds)' > \"$f\"" ; i=$((i+1)); done
+          i=1; while [ $i -le "${{ inputs.files_count }}" ]; do f=$(printf '%s/file%04d.txt' "${{ inputs.files_root }}" "$i"); safe_run "printf '%s\n' 'echo-file-'\"$i\"' '\"$(date -Iseconds)\" > \"$f\"" ; i=$((i+1)); done
           safe_run "printf '# Vibe Coding Pilot\n- Created: %s\n' \"$(date -Iseconds)\" > README.md"
           safe_run "printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md"
           safe_run "printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md"
@@ -208,7 +234,6 @@ jobs:
           def test_health(): assert c.get("/health").json()["status"] == "ok"
           def test_item(): assert c.get("/items/7").json()["id"] == 7
           PY
-          # pyproject(minimal) — PyPI 테스트용
           cat > app/pyproject.toml <<'TOML'
           [project]
           name = "vibe-app"
@@ -229,7 +254,7 @@ jobs:
         continue-on-error: true
         run: |
           source /tmp/safe_run.sh
-          safe_run "sudo apt-get install -y maven"
+          safe_run "sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless"
           safe_run "mkdir -p demo && cd demo && mvn -q -B archetype:generate -DgroupId=com.example -DartifactId=demo -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.5"
           safe_run "sed -i 's/junit:junit:4.11/junit:junit:4.13.2/' demo/pom.xml || true"
           summarize
@@ -241,14 +266,15 @@ jobs:
         run: |
           source /tmp/safe_run.sh
           safe_run "mkdir -p nodeapp && cd nodeapp && npm init -y"
+          safe_run "cd nodeapp && npm i express"
+          # start 스크립트 추가
+          jq '.scripts.start="node index.js" | .name="vibe-nodeapp" | .version="0.0.1"' nodeapp/package.json > nodeapp/package.tmp && mv nodeapp/package.tmp nodeapp/package.json
           cat > nodeapp/index.js <<'JS'
           const express = require('express'); const app = express();
           app.get('/health', (_,res)=>res.json({status:'ok'}));
           app.get('/items/:id', (req,res)=>res.json({id:+req.params.id, name:`item-${req.params.id}`}));
           app.listen(3000, ()=>console.log('up'));
           JS
-          # npm version scaffolding
-          jq '.version="0.0.1" | .name="vibe-nodeapp"' nodeapp/package.json > nodeapp/package.tmp && mv nodeapp/package.tmp nodeapp/package.json
           cat > nodeapp/.npmrc <<'NPM'
           registry=https://registry.npmjs.org
           always-auth=false
@@ -402,7 +428,7 @@ jobs:
         run: |
           source /tmp/safe_run.sh
           safe_run "curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true"
-          safe_run "syft scan dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || syft packages dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || true"
+          safe_run "syft dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || syft packages dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || true"
           summarize
 
       - name: Vulnerability scan (Trivy)
@@ -445,11 +471,7 @@ jobs:
           overwrite: false
           include-hidden-files: true
 
-      # =======================================================
-      # ================ Release & Publish =====================
-      # =======================================================
-
-      # 1) 버전 산출 + 대량 동기화(package.json / pyproject.toml / pom.xml)
+      # ===== Release & Publish =====
       - name: Version bump & bulk sync
         if: env.DO_RELEASE == 'true'
         shell: bash
@@ -472,27 +494,19 @@ jobs:
           NEW_VER="${MA}.${MI}.${PA}"
           echo "$NEW_VER" > VERSION
           echoe "New version: ${NEW_VER}"
-
-          # Bulk sync: package.json
           shopt -s globstar nullglob
           for f in **/package.json; do
             safe_run "jq '.version=\"${NEW_VER}\"' \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\""
           done
-
-          # Bulk sync: pyproject.toml (단순 치환)
           for f in **/pyproject.toml; do
-            safe_run "awk 'BEGIN{p=1} {if(\$0 ~ /^version *=/){sub(/version *=.*/,\"version = \\\"${NEW_VER}\\\"\"); p=0} print} END{if(p) print \"version = \\\"${NEW_VER}\\\"\"}' \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\""
+            safe_run "awk 'BEGIN{p=1} {if($0 ~ /^version *=/){sub(/version *=.*/,\"version = \\\"${NEW_VER}\\\"\"); p=0} print} END{if(p) print \"version = \\\"${NEW_VER}\\\"\"}' \"$f\" > \"$f.tmp\" && mv \"$f.tmp\" \"$f\""
           done
-
-          # Bulk sync: pom.xml
           for f in **/pom.xml; do
             safe_run "sed -i -E '0,/<version>.*<\\/version>/{s/<version>[^<]*<\\/version>/<version>${NEW_VER}<\\/version>/}' \"$f\""
           done
-
           safe_run "git add -A"
           safe_run "git commit -m \"chore(release): v${NEW_VER}\" || true"
 
-      # 2) 태그 생성 & 체인지로그 생성
       - name: Create tag & changelog
         if: env.DO_RELEASE == 'true'
         id: rel
@@ -502,19 +516,13 @@ jobs:
           source /tmp/safe_run.sh
           NEW_VER="$(cat VERSION)"
           NEW_TAG="${RELEASE_TAG_PREFIX}${NEW_VER}"
-          # changelog (마지막 태그~HEAD)
           LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo '')"
-          if [ -n "$LAST_TAG" ]; then
-            RANGE="${LAST_TAG}..HEAD"
-          else
-            RANGE="$(git rev-list --max-parents=0 HEAD)..HEAD"
-          fi
+          if [ -n "$LAST_TAG" ]; then RANGE="${LAST_TAG}..HEAD"; else RANGE="$(git rev-list --max-parents=0 HEAD)..HEAD"; fi
           safe_run "git tag -a \"$NEW_TAG\" -m \"Release $NEW_TAG\" || true"
           safe_run "git push --follow-tags || true"
           safe_run "git log --pretty=format:'* %s (%h)' ${RANGE} > ${ARTIFACT_DIR}/CHANGELOG_${NEW_TAG}.md"
           echo "tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
 
-      # 3) GitHub Release 생성 + 아티팩트 첨부
       - name: Create GitHub Release
         if: env.DO_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
@@ -532,7 +540,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 4) NPM 대량 발행
       - name: NPM publish (bulk)
         if: env.NPM_PUBLISH == 'true'
         shell: bash
@@ -549,7 +556,6 @@ jobs:
             safe_run "npm --prefix \"$d\" publish --access public || npm --prefix \"$d\" publish"
           done
 
-      # 5) PyPI 대량 발행
       - name: PyPI publish (bulk)
         if: env.PYPI_PUBLISH == 'true'
         shell: bash
@@ -567,13 +573,10 @@ jobs:
             fi
             safe_run "python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade build twine"
             safe_run ". .venv/bin/activate && python -m build \"$d\""
-            # dist 경로 추정
-            DIST_DIR=\"$d/dist\"
-            [ -d \"$DIST_DIR\" ] || DIST_DIR=\"dist\"
+            DIST_DIR=\"$d/dist\"; [ -d \"$DIST_DIR\" ] || DIST_DIR=\"dist\"
             safe_run ". .venv/bin/activate && python -m twine upload -u __token__ -p \"${PYPI_API_TOKEN}\" ${DIST_DIR}/* || true"
           done
 
-      # 6) Maven 대량 배포 (GitHub Packages 예시)
       - name: Maven publish (bulk)
         if: env.MVN_PUBLISH == 'true'
         shell: bash
@@ -584,8 +587,7 @@ jobs:
           MAVEN_PASSWORD: ${{ secrets.MAVEN_PASSWORD }}
         run: |
           source /tmp/safe_run.sh
-          safe_run "sudo apt-get update -y && sudo apt-get install -y maven"
-          # settings.xml 생성 (GitHub Packages or custom repo)
+          safe_run "sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless"
           mkdir -p ~/.m2
           cat > ~/.m2/settings.xml <<XML
           <settings>
@@ -605,7 +607,6 @@ jobs:
             [ -d "$d" ] || { warne "Maven 디렉토리 없음: $d"; continue; }
             if [ -f "$d/pom.xml" ]; then
               safe_run "mvn -q -f \"$d/pom.xml\" -DnewVersion=${NEW_VER} versions:set -DgenerateBackupPoms=false || true"
-              # 배포 리포지토리 추가(없으면 추가)
               if ! grep -q "<distributionManagement>" "$d/pom.xml"; then
                 awk -v url="${MVN_DIST_URL}" -v id="${MVN_SERVER_ID}" '
                   /<\/project>/ && !printed {
