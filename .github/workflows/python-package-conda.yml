@@ -1,4 +1,4 @@
-name: "🏦 Java Ledger Viewer (Ultra Echo + .github Excel Auto-Discovery + LFS + Maven/Gradle + Self-Heal + TypePatch + Release)"
+name: "🏦 Java Ledger Viewer (All-in-One: Auto-Discovery, LFS, Self-Heal, TypePatch, Robust JAR Pick, Release URL)"
 
 on:
   workflow_dispatch:
@@ -19,11 +19,6 @@ on:
         description: "엑셀 시트명(선택, 미지정 시 첫 시트)"
         required: false
         default: ""
-      create_release:
-        description: "빌드 산출물로 GitHub Release 생성"
-        type: boolean
-        required: false
-        default: false
 
 env:
   TZ: Asia/Seoul
@@ -46,10 +41,11 @@ jobs:
         with:
           lfs: true
 
-      - name: Ensure Git LFS (safe)
+      - name: Ensure dirs + Git LFS
         shell: bash
         run: |
           set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}" "${DL_DIR}" data app/src/main/java/com/example app/src/main/resources
           git lfs install
           git lfs pull || true
 
@@ -57,7 +53,6 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${DL_DIR}"
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
@@ -66,13 +61,13 @@ jobs:
           echoe(){ log "${ECHO_OK}" "$*"; }
           warne(){ log "${ECHO_WARN}" "$*"; }
           faile(){ log "${ECHO_FAIL}" "$*"; }
-          run(){ printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/echo.log" ; eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo.log"; }
+          run(){ printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/echo.log"; eval "$@" 2>&1 | tee -a "${LOG_DIR}/echo.log"; }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      # 1) pom.xml 없으면 정상 POM + 자바 본문 생성(자동탐색 포함)
+      # 1) pom.xml 없으면 정상 POM + (임시) Java 파일 생성
       - name: Bootstrap minimal Maven project when pom.xml is missing
         if: hashFiles('**/pom.xml') == ''
         shell: bash
@@ -135,6 +130,11 @@ jobs:
                       <goals><goal>shade</goal></goals>
                       <configuration>
                         <createDependencyReducedPom>false</createDependencyReducedPom>
+                        <!-- NOTE: 기본 설정은 shaded JAR을 원래 파일명으로 덮어쓸 수 있음 -->
+                        <!-- 필요 시 classifier를 강제로 붙이고 싶다면 아래 두 줄 해제
+                        <shadedArtifactAttached>true</shadedArtifactAttached>
+                        <shadedClassifierName>shaded</shadedClassifierName>
+                        -->
                         <transformers>
                           <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                             <mainClass>com.example.BankLedger</mainClass>
@@ -149,55 +149,21 @@ jobs:
           </project>
           POM
 
-          # 초기 Java 본문(이후 패치 스텝에서 안전하게 덮어씀)
+          # 임시 파일(곧 패치 스텝에서 본문 교체)
           cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
-          package com.example;
-
-          import org.apache.commons.csv.CSVFormat;
-          import org.apache.commons.csv.CSVParser;
-          import org.apache.commons.csv.CSVRecord;
-          import org.apache.poi.hssf.usermodel.HSSFWorkbook;
-          import org.apache.poi.ss.usermodel.*;
-          import org.apache.poi.xssf.usermodel.XSSFWorkbook;
-
-          import java.io.*;
-          import java.nio.charset.StandardCharsets;
-          import java.nio.file.*;
-          import java.time.LocalDate;
-          import java.time.format.DateTimeFormatter;
-          import java.util.*;
-          import java.util.stream.Stream;
-
-          public class BankLedger {
-              record Row(LocalDate date, String time, String type, long amount, String memo, Long balance, String account){}
-
-              static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
-                      DateTimeFormatter.ofPattern("yyyy-MM-dd"),
-                      DateTimeFormatter.ofPattern("yyyy.M.d"),
-                      DateTimeFormatter.ofPattern("yyyy/M/d")
-              };
-
-              public static void main(String[] args) throws Exception {
-                  System.out.println("Bootstrap placeholder — 다음 패치 스텝에서 본문 교체됨");
-              }
-          }
+          package com.example; public class BankLedger { public static void main(String[] a){ System.out.println("placeholder"); } }
           JAVA
-
           echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
 
-      # 2) (외부/기존 POM 방어) shade <transformer> 태그 자동 치유
+      # 2) POM self-heal (닫힘태그 보정)
       - name: Self-heal POM shade <transformer> tag if broken
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           POM_PATH="${POM_PATH:-}"
-          if [[ -z "${POM_PATH}" ]]; then
-            POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
-          fi
-          if [[ -z "${POM_PATH}" ]]; then
-            warne "POM 미발견 → Self-heal 스킵"; exit 0
-          fi
+          [[ -z "$POM_PATH" ]] && POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
+          if [[ -z "$POM_PATH" ]]; then warne "POM 미발견 → Self-heal 스킵"; exit 0; fi
           NEED_FIX="$(
             awk '
               /<transformers>/ {inT=1}
@@ -212,13 +178,13 @@ jobs:
               {print}
             ' "${POM_PATH}" > "${POM_PATH}.fixed"
             mv "${POM_PATH}.fixed" "${POM_PATH}"
-            echo "✅ POM transformer 태그 자동 보정 완료"
+            echoe "POM transformer 태그 자동 보정 완료"
           else
-            echo "✅ POM transformer 태그 정상"
+            echoe "POM transformer 태그 정상"
           fi
 
-      # 3) POI Row 타입 충돌 패치(Record Row → LedgerRow, 풀네임 사용)
-      - name: Patch BankLedger.java (fix POI Row clash + full implementation)
+      # 3) 실제 Java 본문(POI Row 충돌 해결 + .github 자동탐색)
+      - name: Patch BankLedger.java (full impl + POI Row clash fix)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -307,7 +273,6 @@ jobs:
                   }
               }
 
-              // .github 최신 파일 자동탐색: xlsx → xls → csv
               static Optional<Path> autoDiscover() {
                   List<String> patterns = List.of(".github/**/*.xlsx", ".github/**/*.xls", ".github/**/*.csv");
                   return patterns.stream().map(BankLedger::globLatest).filter(Objects::nonNull).findFirst();
@@ -456,73 +421,82 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Setup Gradle cache (if Gradle only)
-        if: hashFiles('**/pom.xml') == '' && (hashFiles('**/build.gradle') != '' || hashFiles('**/build.gradle.kts') != '')
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-          cache: gradle
-
-      # 5) Build (Maven 또는 Gradle 자동 감지)
-      - name: Build (auto-detect Maven/Gradle; include untracked)
+      # 5) Build (Maven/Gradle 자동감지) + 견고한 JAR 선택 로직
+      - name: Build and pick JAR (robust)
+        id: pickjar
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
 
           POM_PATH="${POM_PATH:-}"
-          if [[ -z "${POM_PATH}" ]]; then
-            POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
-          fi
+          [[ -z "${POM_PATH}" ]] && POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
+
+          JAR=""
 
           if [[ -n "${POM_PATH}" ]]; then
             echo "Detected pom: ${POM_PATH}"
             WORKDIR="$(dirname "${POM_PATH}")"
             run mvn -B -q -DskipTests -f "${POM_PATH}" package
-            JAR="$(ls -1 "${WORKDIR}"/target/*-shaded.jar 2>/dev/null | head -n1 || true)"
+
+            # ✅ 견고한 JAR 선택 순서
+            for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar"; do
+              CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | head -n1 || true)"
+              [[ -n "${CAND}" ]] && JAR="${CAND}" && break
+            done
+
             if [[ -z "${JAR}" ]]; then
-              JAR="$(ls -1 "${WORKDIR}"/target/*jar-with-dependencies.jar 2>/dev/null | head -n1 || true)"
+              # 마지막 fallback: 일반 *.jar (단, original-*.jar 제외)
+              CAND="$(ls -1 "${WORKDIR}"/target/*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)"
+              [[ -n "${CAND}" ]] && JAR="${CAND}"
             fi
+
             if [[ -z "${JAR}" ]]; then
-              faile "실행 JAR을 찾지 못했습니다 (shade 산출물 없음)."
+              faile "실행 JAR을 찾지 못했습니다."
               ls -al "${WORKDIR}/target" || true
               exit 1
             fi
-            echo "JAR=${JAR}" >> "$GITHUB_ENV"
+
           else
+            # Gradle
             if [[ -f gradlew || -f build.gradle || -f build.gradle.kts ]]; then
               if [[ -f gradlew ]]; then
                 run chmod +x gradlew
                 if ./gradlew tasks | grep -q '^shadowJar'; then
                   run ./gradlew -q shadowJar
-                  JAR="$(ls -1 build/libs/*-all.jar 2>/dev/null | head -n1 || true)"
-                  [[ -z "$JAR" ]] && JAR="$(ls -1 build/libs/*-shadow.jar 2>/dev/null | head -n1 || true)"
+                  for pat in "*-all.jar" "*-shadow.jar"; do
+                    CAND="$(ls -1 build/libs/${pat} 2>/dev/null | head -n1 || true)"
+                    [[ -n "${CAND}" ]] && JAR="${CAND}" && break
+                  done
                 else
                   run ./gradlew -q build
-                  JAR="$(ls -1 build/libs/*-all.jar 2>/dev/null | head -n1 || true)"
-                  [[ -z "$JAR" ]] && JAR="$(ls -1 build/libs/*-shadow.jar 2>/dev/null | head -n1 || true)"
-                  [[ -z "$JAR" ]] && JAR="$(ls -1 build/libs/*.jar 2>/dev/null | head -n1 || true)"
+                  for pat in "*-all.jar" "*-shadow.jar" "*.jar"; do
+                    CAND="$(ls -1 build/libs/${pat} 2>/dev/null | head -n1 || true)"
+                    [[ -n "${CAND}" ]] && JAR="${CAND}" && break
+                  done
                 fi
               else
-                run sudo apt-get update -y
-                run sudo apt-get install -y gradle || true
+                sudo apt-get update -y
+                sudo apt-get install -y gradle || true
                 run gradle -q build
                 JAR="$(ls -1 build/libs/*.jar 2>/dev/null | head -n1 || true)"
               fi
 
-              if [[ -z "${JAR:-}" ]]; then
+              if [[ -z "${JAR}" ]]; then
                 faile "Gradle JAR을 찾지 못했습니다."
                 ls -al build/libs || true
                 exit 1
               fi
-              echo "JAR=${JAR}" >> "$GITHUB_ENV"
             else
               faile "pom.xml/Gradle 빌드 파일을 찾지 못했습니다."
               find . -maxdepth 4 -type f \( -name pom.xml -o -name build.gradle -o -name build.gradle.kts \) -print || true
               exit 1
             fi
           fi
+
+          echoe "Picked JAR: ${JAR}"
+          echo "JAR=${JAR}" >> "$GITHUB_ENV"
+          echo "jar_path=${JAR}" >> "$GITHUB_OUTPUT"
 
       # 6) Run Viewer
       - name: Run viewer (java -jar)
@@ -542,9 +516,9 @@ jobs:
           test -n "${JAR:-}" || { faile "JAR 환경변수가 비어 있습니다."; exit 1; }
           run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
-      # 7) (옵션) 릴리즈 생성
-      - name: Create GitHub Release (optional)
-        if: ${{ inputs.create_release == true }}
+      # 7) GitHub Release 생성(항상 실행) + 다운로드 “정식 주소” 획득
+      - name: Create GitHub Release (attach JAR)
+        id: release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "ledger-${{ github.run_id }}"
@@ -552,11 +526,31 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            ${{ env.JAR }}
+            ${{ steps.pickjar.outputs.jar_path }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 8) 아티팩트 업로드
+      - name: Summarize Release URLs (정식 다운로드 주소)
+        id: relurls
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          # gh CLI는 기본 설치되어 있습니다.
+          JSON="$(gh release view "ledger-${GITHUB_RUN_ID}" --json url,assets)"
+          PAGE_URL="$(echo "$JSON" | jq -r '.url')"
+          ASSET_URL="$(echo "$JSON" | jq -r '.assets[0].url')"
+          echo "release_page_url=${PAGE_URL}" >> "$GITHUB_OUTPUT"
+          echo "asset_download_url=${ASSET_URL}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## ✅ Download Links"
+            echo "- Release page: ${PAGE_URL}"
+            echo "- Direct asset: ${ASSET_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 8) 아티팩트 업로드(런 결과 + 원본 데이터)
       - name: Upload artifacts (logs + jars + discovered files)
         if: always()
         uses: actions/upload-artifact@v4
@@ -572,3 +566,16 @@ jobs:
             .github/**/*.xls
             .github/**/*.csv
           if-no-files-found: ignore
+
+      # 9) 출력 요약
+      - name: Job summary
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          {
+            echo "### 🧪 Build Output"
+            echo "- Picked JAR: \`${JAR}\`"
+            echo "### 🔗 Download"
+            echo "- Release page: ${{ steps.relurls.outputs.release_page_url }}"
+            echo "- Direct asset: ${{ steps.relurls.outputs.asset_download_url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
