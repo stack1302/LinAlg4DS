@@ -46,6 +46,10 @@ on:
         required: false
         default: "console,csv,html"
 
+  # ⏱️ 5분 주기(UTC 기준) 스케줄
+  schedule:
+    - cron: "*/5 * * * *"
+
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
@@ -58,6 +62,11 @@ env:
 permissions:
   contents: write
   actions: read
+
+# 🔒 겹치는 실행 방지
+concurrency:
+  group: ledger-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   view-ledger:
@@ -668,7 +677,7 @@ jobs:
           echo "SHEET_NAME=${SHEET_NAME}"
           echo "LEDGER_EXTS=${LEDGER_EXTS:-'(제한 없음)'}"
           echo "LEDGER_SEARCH_ROOTS=${LEDGER_SEARCH_ROOTS}"
-          echo "LEDGER_NAME_FILTERS=${LEDGER_NAME_FILTERERS:-$LEDGER_NAME_FILTERS}"
+          echo "LEDGER_NAME_FILTERS=${LEDGER_NAME_FILTERS}"
           echo "AGGREGATE_ALL_FILES=${AGGREGATE_ALL_FILES}"
           echo "ALL_DATES=${ALL_DATES}"
           echo "OUTPUT_FORMATS=${OUTPUT_FORMATS}"
