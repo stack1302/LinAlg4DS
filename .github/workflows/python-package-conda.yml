@@ -1,4 +1,4 @@
-name: "🏦 Java Ledger Viewer (Multi-file + All-dates + Filters + Reports + Release URLs)"
+name: "🏦 Java Ledger Viewer (Multi-file + All-dates + Filters + Reports + Release URLs + Bulk Modify)"
 
 on:
   workflow_dispatch:
@@ -46,10 +46,6 @@ on:
         required: false
         default: ""
 
-  # ⏱️ 5분 주기(UTC 기준) 스케줄
-  schedule:
-    - cron: "*/5 * * * *"
-
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
@@ -58,6 +54,17 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
+
+  # ===== BULK MODIFY (입력 10개 제한 유지: 전부 ENV 제어) =====
+  BULK_ENABLE: "true"                     # 대량 수정 수행 여부
+  BULK_GLOBS: "README.md docs/**/*.md .github/**/*.md"
+  REPLACE_FROM: "echo-file"
+  REPLACE_TO:   "vibe-file"
+  APPEND_LINE:  "<!-- appended-by-ledger-workflow -->"
+  RENAME_PREFIX: "bulk_"
+  RENAME_SUFFIX: ""
+  DUPLICATE_COPIES: "0"                   # 0이면 복제 안함
+  CHMOD_MODE: "644"
 
 permissions:
   contents: write
@@ -102,7 +109,7 @@ jobs:
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      # ❗ 새 입력을 기존 ENV로 변환 (from/to, top_n, category_map_json)
+      # 🔁 새 입력을 기존 ENV로 변환 (FROM/TO, TOP_N, CATEGORY_MAP_JSON)
       - name: Derive legacy env from date_range & report_options
         shell: bash
         run: |
@@ -114,10 +121,7 @@ jobs:
           fi
           echo "FROM_DATE=$FROM" >> "$GITHUB_ENV"
           echo "TO_DATE=$TO" >> "$GITHUB_ENV"
-
-          # report_options JSON → TOP_N, CATEGORY_MAP_JSON
           RO='${{ inputs.report_options }}'
-          # jq가 없을 수 있으므로 파서 없이 기본값 적용
           TOP_N="10"; CAT_JSON=""
           if command -v jq >/dev/null 2>&1 && [[ -n "$RO" ]]; then
             TOP_N="$(jq -r '.top_n // empty' <<<"$RO" 2>/dev/null || echo '')"
@@ -126,6 +130,49 @@ jobs:
           [[ -z "$TOP_N" ]] && TOP_N="10"
           echo "TOP_N=$TOP_N" >> "$GITHUB_ENV"
           echo "CATEGORY_MAP_JSON=$CAT_JSON" >> "$GITHUB_ENV"
+
+      # ====== 🔧 BULK MODIFY (replace/append/rename/duplicate/chmod) ======
+      - name: BULK MODIFY — replace/append/rename/duplicate/chmod
+        if: env.BULK_ENABLE == 'true'
+        shell: bash
+        env:
+          GLOBS: "${{ env.BULK_GLOBS }}"
+          FROM:  "${{ env.REPLACE_FROM }}"
+          TO:    "${{ env.REPLACE_TO }}"
+          APPEND_LINE: "${{ env.APPEND_LINE }}"
+          RPRE:  "${{ env.RENAME_PREFIX }}"
+          RSUF:  "${{ env.RENAME_SUFFIX }}"
+          COPIES: "${{ env.DUPLICATE_COPIES }}"
+          FMODE: "${{ env.CHMOD_MODE }}"
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          shopt -s nullglob globstar
+          FILES=()
+          for g in ${GLOBS}; do for f in $g; do [ -f "$f" ] && FILES+=("$f"); done; done
+          if [ ${#FILES[@]} -eq 0 ]; then warne "대상(${GLOBS}) 파일이 없습니다."
+          else
+            for f in "${FILES[@]}"; do
+              # 치환
+              if [ -n "$FROM" ]; then run sed -i "s/${FROM//\//\\/}/${TO//\//\\/}/g" "$f"; fi
+              # 줄 추가
+              if [ -n "$APPEND_LINE" ]; then printf '%s\n' "$APPEND_LINE" >> "$f"; fi
+              # 리네임
+              dir=$(dirname "$f"); base=$(basename "$f"); name="${base%.*}"; ext="${base##*.}"; dot="."
+              [ "$base" = "$ext" ] && dot=""
+              new="${dir}/${RPRE}${name}${RSUF}${dot}${ext}"
+              if [ -n "$RPRE" ] || [ -n "$RSUF" ]; then run mv "$f" "$new"; f="$new"; fi
+              # 복제
+              if [ "${COPIES:-0}" -gt 0 ]; then
+                idx=1; while [ $idx -le "${COPIES}" ]; do clone="${f%.*}_copy${idx}${dot}${ext}"; run cp -f "$f" "$clone"; idx=$((idx+1)); done
+              fi
+            done
+          fi
+          # 권한 정리
+          run find . -type f -not -path './.git/*' -exec chmod ${FMODE} {} +
+          run find . -type d -not -path './.git/*' -exec chmod 755 {} +
+          # 변경사항 로그
+          git status --porcelain | tee "${LOG_DIR}/bulk_modify_changes.txt" || true
 
       # 1) pom.xml 없으면 생성
       - name: Bootstrap Maven project if missing
@@ -208,10 +255,9 @@ jobs:
             </build>
           </project>
           POM
-          echo 'package com.example; public class BankLedger{public static void main(String[]a){System.out.println("placeholder");}}' > app/src/main/java/com/example/BankLedger.java
           echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
 
-      # 2) POM self-heal
+      # 2) POM self-heal (닫힘태그 보정)
       - name: Self-heal POM shade <transformer> tag if broken
         shell: bash
         run: |
@@ -239,21 +285,34 @@ jobs:
             echo "✅ POM transformer 태그 정상"
           fi
 
-      # 3) 자바 파일 패치 (동일)
-      - name: Patch BankLedger.java (multi-file + kr-headers + debit/credit/net + rankings)
+      # 3) BankLedger.java 존재 확인 + 최소 보정 (없으면 미니멀 구현 생성)
+      - name: Ensure BankLedger.java exists (fallback if missing)
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p app/src/main/java/com/example
-          # (여기에 이전에 드린 BankLedger.java 전문을 그대로 둡니다)
-          # — 길어서 생략하지 않고 실제 리포에선 기존 버전 그대로 유지 —
+          source /tmp/echo_helpers.sh
+          FILE="app/src/main/java/com/example/BankLedger.java"
+          if [[ ! -f "$FILE" ]] || ! grep -q "class BankLedger" "$FILE"; then
+            echoe "BankLedger.java 미존재 또는 비정상 → 최소 구현 생성(기능 축약)"
+            mkdir -p app/src/main/java/com/example
+            cat > "$FILE" <<'JAVA'
+            package com.example;
+            import java.nio.file.*; import java.io.*; import java.util.*;
+            public class BankLedger {
+              public static void main(String[] a) throws Exception {
+                System.out.println("Ledger Viewer minimal fallback running…");
+                System.out.println("LEDGER_PATH=" + System.getenv().getOrDefault("LEDGER_PATH",""));
+                System.out.println("FROM_DATE=" + System.getenv().getOrDefault("FROM_DATE",""));
+                System.out.println("TO_DATE=" + System.getenv().getOrDefault("TO_DATE",""));
+                // 최소 실행 보장용, 실제 기능 구현은 기존 파일 유지 시 사용됩니다.
+              }
+            }
+            JAVA
+          else
+            echo "기존 BankLedger.java 유지"
+          fi
 
-          # 아래 한 줄만 예시로 남겨 확인
-          echo "package com.example;" > app/src/main/java/com/example/BankLedger.java
-          cat >> app/src/main/java/com/example/BankLedger.java <<'JAVA'
-          // (이미 제공된 전체 BankLedger.java 내용을 여기에 붙여넣으세요)
-          JAVA
-
+      # 4) Java 설정
       - name: Setup Java (Temurin 21 + maven cache)
         uses: actions/setup-java@v4
         with:
@@ -261,7 +320,8 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Build & pick JAR
+      # 5) 빌드 & JAR 고르기 + 무결성 점검
+      - name: Build & pick JAR + Sanity check
         id: pickjar
         shell: bash
         run: |
@@ -274,22 +334,26 @@ jobs:
             WORKDIR="$(dirname "${POM_PATH}")"
             echo "Detected pom: ${POM_PATH}"
             run mvn -B -q -DskipTests -f "${POM_PATH}" package
-            for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar"; do
-              CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | head -n1 || true)"
+            for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar" "*.jar"; do
+              CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | grep -v 'original-' | head -n1 || true)"
               [[ -n "${CAND}" ]] && JAR="${CAND}" && break
             done
-            [[ -z "${JAR}" ]] && CAND="$(ls -1 "${WORKDIR}"/target/*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)" && JAR="${CAND}"
-            if [[ -z "${JAR}" ]]; then
-              echo "❌ 실행 JAR을 찾지 못했습니다."; ls -al "${WORKDIR}/target" || true; exit 1
-            fi
+            [[ -z "${JAR}" ]] && { faile "실행 JAR을 찾지 못했습니다."; ls -al "${WORKDIR}/target" || true; exit 1; }
           else
-            echo "❌ pom.xml을 찾지 못했습니다."; exit 1
+            faile "pom.xml을 찾지 못했습니다."; exit 1
           fi
           echo "JAR=${JAR}" >> "$GITHUB_ENV"
           echo "jar_path=${JAR}" >> "$GITHUB_OUTPUT"
           echo "✅ Picked JAR: ${JAR}"
+          # ---- 무결성 점검 (클래스/매니페스트)
+          if ! (jar tf "${JAR}" | grep -q '^com/example/BankLedger.class$'); then
+            faile "JAR에 com/example/BankLedger.class 없음"; jar tf "${JAR}" | head -n 200; exit 1
+          fi
+          echo "— Manifest —"
+          (unzip -p "${JAR}" META-INF/MANIFEST.MF || true) | sed -n '1,60p'
 
-      - name: Run viewer (java -jar)
+      # 6) 실행 (매니페스트 우선, 실패 시 -cp 폴백)
+      - name: Run viewer (java -jar w/ fallback)
         shell: bash
         env:
           LEDGER_PATH:  ${{ inputs.ledger_path }}
@@ -314,8 +378,16 @@ jobs:
           echo "AGGREGATE_ALL_FILES=${AGGREGATE_ALL_FILES}  OUTPUT_FORMATS=${OUTPUT_FORMATS}"
           echo "TOP_N=${TOP_N}"
           test -n "${JAR:-}" || { echo "❌ JAR 환경변수가 비어 있습니다."; exit 1; }
-          run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
+          if unzip -p "${JAR}" META-INF/MANIFEST.MF 2>/dev/null | grep -q 'Main-Class: *com.example.BankLedger'; then
+            run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}" || {
+              warne "jar 실행 실패 → -cp 폴백"; run java -cp "${JAR}" com.example.BankLedger "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
+            }
+          else
+            warne "매니페스트 Main-Class 미지정 → -cp 실행"
+            run java -cp "${JAR}" com.example.BankLedger "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
+          fi
 
+      # 7) 릴리즈 + URL 요약
       - name: Create GitHub Release (attach JAR & reports)
         id: release
         uses: softprops/action-gh-release@v2
@@ -362,6 +434,7 @@ jobs:
             if [ -n "${ASSET_URL}" ]; then echo "- First asset:  ${ASSET_URL}"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 8) 아티팩트 업로드(로그/리포트/JAR/대량수정 로그)
       - name: Upload artifacts (logs + jars + reports + sources used)
         if: always()
         uses: actions/upload-artifact@v4
@@ -378,6 +451,7 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
+      # 9) 요약
       - name: Job summary
         shell: bash
         run: |
@@ -391,6 +465,12 @@ jobs:
             echo "- Monthly:          \`target/reports/summary_monthly.csv\`"
             echo "- By category:      \`target/reports/summary_by_category.csv\` (옵션)"
             echo "- HTML summary:     \`target/reports/summary.html\`"
+            echo "### 🔧 Bulk Modify"
+            echo "- Globs:    ${{ env.BULK_GLOBS }}"
+            echo "- Replace:  '${{ env.REPLACE_FROM }}' -> '${{ env.REPLACE_TO }}'"
+            echo "- Append:   '${{ env.APPEND_LINE }}'"
+            echo "- Rename:   prefix='${{ env.RENAME_PREFIX }}' suffix='${{ env.RENAME_SUFFIX }}' copies=${{ env.DUPLICATE_COPIES }}"
+            echo "- chmod:    files=${{ env.CHMOD_MODE }}, dirs=755"
             echo "### 🔗 Release"
             echo "- Page:  ${{ steps.relurls.outputs.release_page_url }}"
             echo "- Asset: ${{ steps.relurls.outputs.asset_download_url }}"
