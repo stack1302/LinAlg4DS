@@ -1,29 +1,56 @@
-name: "🏦 Java Ledger Viewer (All-in-One: Auto-Discovery, LFS, Self-Heal, TypePatch, Robust JAR Pick, Release URL)"
+name: "🏦 Java Ledger Viewer (All-in: Multi-file, All-dates, Ext/Name filters, Reports, Release URLs)"
 
 on:
   workflow_dispatch:
     inputs:
       ledger_path:
-        description: "통장 파일 경로 (CSV/XLS/XLSX). 비우면 .github/에서 자동탐색"
+        description: "단일 통장 파일 경로 (CSV/XLS/XLSX). 비우면 자동 탐색(아래 옵션 적용)"
         required: false
         default: ""
       from_date:
-        description: "조회 시작일 (YYYY-MM-DD)"
+        description: "조회 시작일 (YYYY-MM-DD). all_dates=true면 무시"
         required: false
         default: ""
       to_date:
-        description: "조회 종료일 (YYYY-MM-DD)"
+        description: "조회 종료일 (YYYY-MM-DD). all_dates=true면 무시"
         required: false
         default: ""
       sheet_name:
         description: "엑셀 시트명(선택, 미지정 시 첫 시트)"
         required: false
         default: ""
+      excel_exts:
+        description: "탐색 확장자 제한: xlsx / xls / csv 또는 콤마로 복수 (예: xlsx,xls). 비우면 기본순서(xlsx→xls→csv)"
+        required: false
+        default: ""
+      search_root:
+        description: "탐색 루트 경로 (기본 .github). 콤마로 복수 가능: .github,data"
+        required: false
+        default: ".github"
+      name_filters:
+        description: "파일명에 반드시 포함될 키워드(콤마 구분). 예: 통장,신한 (대소문자 무시)"
+        required: false
+        default: ""
+      aggregate_all_files:
+        description: "탐색된 모든 파일을 합산 처리(최신 1개가 아니라 전부)"
+        type: boolean
+        required: false
+        default: true
+      all_dates:
+        description: "모든 일자(기간 필터 없음)로 집계"
+        type: boolean
+        required: false
+        default: true
+      output_formats:
+        description: "리포트 포맷: console,csv,html (콤마 복수)"
+        required: false
+        default: "console,csv,html"
 
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
   DL_DIR: .github/echo_downloads
+  REPORT_DIR: target/reports
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
@@ -41,15 +68,15 @@ jobs:
         with:
           lfs: true
 
-      - name: Ensure dirs + Git LFS
+      - name: Ensure base dirs + Git LFS
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${DL_DIR}" data app/src/main/java/com/example app/src/main/resources
+          mkdir -p "${LOG_DIR}" "${DL_DIR}" "${REPORT_DIR}" app/src/main/java/com/example app/src/main/resources data
           git lfs install
           git lfs pull || true
 
-      - name: Setup Echo helpers
+      - name: Echo helpers
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -67,14 +94,14 @@ jobs:
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      # 1) pom.xml 없으면 정상 POM + (임시) Java 파일 생성
-      - name: Bootstrap minimal Maven project when pom.xml is missing
+      # 1) pom.xml 없으면 생성(정상 POM)
+      - name: Bootstrap Maven project if missing
         if: hashFiles('**/pom.xml') == ''
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          echoe "pom.xml 미존재 → 최소 Maven 프로젝트 생성 (app/)"
+          echoe "pom.xml 미존재 → app/에 생성"
           run mkdir -p app/src/main/java/com/example app/src/main/resources
           cat > app/pom.xml <<'POM'
           <?xml version="1.0" encoding="UTF-8"?>
@@ -130,11 +157,7 @@ jobs:
                       <goals><goal>shade</goal></goals>
                       <configuration>
                         <createDependencyReducedPom>false</createDependencyReducedPom>
-                        <!-- NOTE: 기본 설정은 shaded JAR을 원래 파일명으로 덮어쓸 수 있음 -->
-                        <!-- 필요 시 classifier를 강제로 붙이고 싶다면 아래 두 줄 해제
-                        <shadedArtifactAttached>true</shadedArtifactAttached>
-                        <shadedClassifierName>shaded</shadedClassifierName>
-                        -->
+                        <!-- 기본은 최종 JAR이 일반 이름으로 생성됨( original-* 백업 포함 ) -->
                         <transformers>
                           <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                             <mainClass>com.example.BankLedger</mainClass>
@@ -148,11 +171,8 @@ jobs:
             </build>
           </project>
           POM
-
-          # 임시 파일(곧 패치 스텝에서 본문 교체)
-          cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
-          package com.example; public class BankLedger { public static void main(String[] a){ System.out.println("placeholder"); } }
-          JAVA
+          # 자리채움(곧 패치 스텝이 본문 교체)
+          echo 'package com.example; public class BankLedger{public static void main(String[]a){System.out.println("placeholder");}}' > app/src/main/java/com/example/BankLedger.java
           echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
 
       # 2) POM self-heal (닫힘태그 보정)
@@ -178,13 +198,13 @@ jobs:
               {print}
             ' "${POM_PATH}" > "${POM_PATH}.fixed"
             mv "${POM_PATH}.fixed" "${POM_PATH}"
-            echoe "POM transformer 태그 자동 보정 완료"
+            echo "✅ POM transformer 태그 자동 보정 완료"
           else
-            echoe "POM transformer 태그 정상"
+            echo "✅ POM transformer 태그 정상"
           fi
 
-      # 3) 실제 Java 본문(POI Row 충돌 해결 + .github 자동탐색)
-      - name: Patch BankLedger.java (full impl + POI Row clash fix)
+      # 3) 자바 전체 본문(멀티파일 + 전일자 + 확장자/키워드/루트 필터 + 리포트 생성)
+      - name: Patch BankLedger.java (multi-file + all-dates + reports)
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -192,6 +212,7 @@ jobs:
           package com.example;
 
           import org.apache.commons.csv.CSVFormat;
+          import org.apache.commons.csv.CSVPrinter;
           import org.apache.commons.csv.CSVParser;
           import org.apache.commons.csv.CSVRecord;
           import org.apache.poi.hssf.usermodel.HSSFWorkbook;
@@ -204,10 +225,11 @@ jobs:
           import java.time.LocalDate;
           import java.time.format.DateTimeFormatter;
           import java.util.*;
+          import java.util.stream.Collectors;
           import java.util.stream.Stream;
 
           public class BankLedger {
-              record LedgerRow(LocalDate date, String time, String type, long amount, String memo, Long balance, String account){}
+              record LedgerRow(LocalDate date, String time, String type, long amount, String memo, Long balance, String account, String source){}
 
               static final DateTimeFormatter[] DATE_FMTS = new DateTimeFormatter[]{
                       DateTimeFormatter.ofPattern("yyyy-MM-dd"),
@@ -216,120 +238,190 @@ jobs:
               };
 
               public static void main(String[] args) throws Exception {
-                  String path = argOrEnv(args, 0, "LEDGER_PATH", "");
-                  String from = argOrEnv(args, 1, "FROM_DATE", "");
-                  String to   = argOrEnv(args, 2, "TO_DATE", "");
-                  String sheetName = System.getenv().getOrDefault("SHEET_NAME", "");
+                  // Inputs / Envs
+                  String pathSingle   = argOrEnv(args, 0, "LEDGER_PATH", "");
+                  String from         = argOrEnv(args, 1, "FROM_DATE", "");
+                  String to           = argOrEnv(args, 2, "TO_DATE", "");
+                  String sheetName    = System.getenv().getOrDefault("SHEET_NAME", "");
+                  String extsPref     = System.getenv().getOrDefault("LEDGER_EXTS", "").trim();       // "xlsx", "xls,csv"
+                  String rootsPref    = System.getenv().getOrDefault("LEDGER_SEARCH_ROOTS", System.getenv().getOrDefault("SEARCH_ROOT", ".github")).trim(); // ".github,data"
+                  String nameFilters  = System.getenv().getOrDefault("LEDGER_NAME_FILTERS", System.getenv().getOrDefault("NAME_FILTERS", "")).trim();        // "통장,신한"
+                  boolean aggregateAll= Boolean.parseBoolean(System.getenv().getOrDefault("AGGREGATE_ALL_FILES", "true"));
+                  boolean allDates    = Boolean.parseBoolean(System.getenv().getOrDefault("ALL_DATES", "true"));
+                  String outFormats   = System.getenv().getOrDefault("OUTPUT_FORMATS", "console,csv,html").toLowerCase(Locale.ROOT);
+                  Path reportDir      = Paths.get(System.getenv().getOrDefault("REPORT_DIR", "target/reports"));
 
-                  if (path.isBlank()) {
-                      Optional<Path> found = autoDiscover();
-                      if (found.isPresent()) {
-                          path = found.get().toString();
-                          System.out.println("🔎 Auto-discovered ledger: " + path);
-                      } else {
-                          System.out.println("⚠️ .github/ 내 통장 파일을 찾지 못해 샘플 CSV 생성: data/sample_ledger.csv");
-                          Path p = Paths.get("data"); Files.createDirectories(p);
-                          Path csv = p.resolve("sample_ledger.csv");
-                          String sample = String.join("\n", List.of(
-                                  "date,time,type,amount,memo,balance,account",
-                                  "2025-10-11,16:36:58,체크카드,10860,Google handj,1673419,원신한",
-                                  "2025-10-09,14:15:58,체크카드,53692,Google handj,190880,원신한",
-                                  "2025-10-09,12:41:23,체크카드,2682,Google Pokemon,144572,원신한",
-                                  "2025-10-08,15:40:43,체크카드,10731,Google handj,179288,원신한",
-                                  "2025-10-08,14:52:20,체크카드,32222,Google handj,190019,원신한"
-                          ));
-                          Files.writeString(csv, sample, StandardCharsets.UTF_8);
-                          path = csv.toString();
-                      }
-                  }
+                  Files.createDirectories(reportDir);
 
-                  LocalDate fromDate = parseDateOrNull(from);
-                  LocalDate toDate   = parseDateOrNull(to);
+                  LocalDate fromDate = allDates ? null : parseDateOrNull(from);
+                  LocalDate toDate   = allDates ? null : parseDateOrNull(to);
 
-                  List<LedgerRow> rows;
-                  String lower = path.toLowerCase(Locale.ROOT);
-                  if (lower.endsWith(".csv")) {
-                      rows = readCsv(path);
-                  } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
-                      rows = readExcel(path, sheetName);
+                  List<Path> files = new ArrayList<>();
+                  if (!pathSingle.isBlank()) {
+                      files.add(Paths.get(pathSingle));
                   } else {
-                      System.out.println("❌ 지원하지 않는 확장자: " + path);
-                      return;
+                      files = discoverFiles(extsPref, rootsPref, nameFilters, aggregateAll);
                   }
 
-                  rows = filterByDate(rows, fromDate, toDate);
+                  if (files.isEmpty()) {
+                      System.out.println("⚠️ 탐색된 파일이 없어 샘플 CSV 생성: data/sample_ledger.csv");
+                      Path p = Paths.get("data"); Files.createDirectories(p);
+                      Path csv = p.resolve("sample_ledger.csv");
+                      String sample = String.join("\n", List.of(
+                              "date,time,type,amount,memo,balance,account",
+                              "2025-10-11,16:36:58,체크카드,10860,Google handj,1673419,원신한",
+                              "2025-10-09,14:15:58,체크카드,53692,Google handj,190880,원신한",
+                              "2025-10-09,12:41:23,체크카드,2682,Google Pokemon,144572,원신한",
+                              "2025-10-08,15:40:43,체크카드,10731,Google handj,179288,원신한",
+                              "2025-10-08,14:52:20,체크카드,32222,Google handj,190019,원신한"
+                      ));
+                      Files.writeString(csv, sample, StandardCharsets.UTF_8);
+                      files = List.of(csv);
+                  }
 
-                  printTable(rows);
+                  List<LedgerRow> allRows = new ArrayList<>();
+                  for (Path f: files) {
+                      String lower = f.toString().toLowerCase(Locale.ROOT);
+                      List<LedgerRow> rows;
+                      if (lower.endsWith(".csv")) {
+                          rows = readCsv(f);
+                      } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
+                          rows = readExcel(f, sheetName);
+                      } else {
+                          System.out.println("⏭️ 지원하지 않는 확장자 건너뜀: " + f);
+                          continue;
+                      }
+                      allRows.addAll(rows);
+                  }
+
+                  // 기간 필터
+                  List<LedgerRow> rows = filterByDate(allRows, fromDate, toDate);
+
+                  // 콘솔 출력(옵션)
+                  if (outFormats.contains("console")) {
+                      printTable(rows);
+                  }
+
+                  // 요약: 날짜별 합계/건수
+                  Map<LocalDate, Summary> byDate = summarizeByDate(rows);
+
+                  // 보고서 산출
+                  if (outFormats.contains("csv")) {
+                      writeCsv(reportDir.resolve("ledger_consolidated.csv"), rows);
+                      writeCsvSummary(reportDir.resolve("summary_by_date.csv"), byDate);
+                      writeFilesUsed(reportDir.resolve("files_used.txt"), files);
+                  }
+                  if (outFormats.contains("html")) {
+                      writeHtmlSummary(reportDir.resolve("summary.html"), rows, byDate, files);
+                  }
 
                   long totalOut = rows.stream().mapToLong(r -> r.amount).sum();
                   Long lastBalance = rows.stream().filter(r -> r.balance != null).reduce((a,b)->b).map(r->r.balance).orElse(null);
 
                   System.out.println();
                   System.out.println("==== 요약 ====");
+                  System.out.printf("파일 수    : %,d%n", files.size());
                   System.out.printf("거래 건수  : %,d%n", rows.size());
                   System.out.printf("총 출금합계: %,d원 (amount 합)%n", totalOut);
                   if (lastBalance != null) {
                       System.out.printf("마지막 잔액: %,d원%n", lastBalance);
                   }
+                  System.out.println("리포트 위치: " + reportDir.toAbsolutePath());
               }
 
-              static Optional<Path> autoDiscover() {
-                  List<String> patterns = List.of(".github/**/*.xlsx", ".github/**/*.xls", ".github/**/*.csv");
-                  return patterns.stream().map(BankLedger::globLatest).filter(Objects::nonNull).findFirst();
-              }
+              // ===== 발견/필터 =====
+              static List<Path> discoverFiles(String extsPref, String rootsPref, String nameFilters, boolean all) throws IOException {
+                  List<String> exts = parseExts(extsPref); // []면 기본 순서로
+                  List<String> pats = toPatterns(exts);
+                  List<Path> roots = parseRoots(rootsPref);
+                  Set<String> nameTokens = parseTokens(nameFilters);
 
-              static Path globLatest(String pattern) {
-                  try {
-                      Path root = Paths.get(".");
-                      try (Stream<Path> s = Files.find(root, Integer.MAX_VALUE,
-                              (p, attr) -> p.toString().replace('\\','/').matches(globToRegex(pattern)) && attr.isRegularFile())) {
-                          return s.max(Comparator.comparingLong(p -> p.toFile().lastModified())).orElse(null);
+                  List<Path> found = new ArrayList<>();
+                  for (Path root: roots) {
+                      for (String pat: pats) {
+                          PathMatcher m = FileSystems.getDefault().getPathMatcher("regex:" + globToRegex(root + "/" + pat));
+                          try (Stream<Path> s = Files.walk(root).filter(Files::isRegularFile)) {
+                              List<Path> matches = s.filter(p -> m.matches(p))
+                                      .filter(p -> nameTokens.isEmpty() || containsAllTokens(p.getFileName().toString(), nameTokens))
+                                      .collect(Collectors.toList());
+                              found.addAll(matches);
+                          } catch (Exception ignore) {}
                       }
-                  } catch (Exception ignore) { return null; }
+                  }
+                  // 최신 우선 정렬
+                  found.sort(Comparator.comparingLong((Path p) -> p.toFile().lastModified()).reversed());
+                  if (found.isEmpty()) return List.of();
+                  return all ? found : List.of(found.get(0));
               }
 
-              static String globToRegex(String glob) {
-                  String g = glob.replace(".", "\\.")
-                          .replace("**/", "(.*/)?")
-                          .replace("**", ".*")
-                          .replace("*", "[^/]*")
-                          .replace("?", ".");
-                  return "^" + g + "$";
+              static boolean containsAllTokens(String name, Set<String> tokens) {
+                  String n = name.toLowerCase(Locale.ROOT);
+                  for (String t: tokens) if (!n.contains(t)) return false;
+                  return true;
               }
 
-              static String argOrEnv(String[] args, int idx, String env, String def) {
-                  if (args.length > idx && args[idx] != null && !args[idx].isBlank()) return args[idx];
-                  return System.getenv().getOrDefault(env, def);
+              static Set<String> parseTokens(String s) {
+                  if (s == null || s.isBlank()) return Set.of();
+                  String[] parts = s.toLowerCase(Locale.ROOT).split("[,;\\s]+");
+                  Set<String> out = new LinkedHashSet<>();
+                  for (String p: parts) if (!p.isBlank()) out.add(p.trim());
+                  return out;
               }
 
-              static LocalDate parseDateOrNull(String s) {
-                  if (s == null || s.isBlank()) return null;
-                  for (var fmt: DATE_FMTS) { try { return LocalDate.parse(s.trim(), fmt); } catch (Exception ignore) {} }
-                  try { return LocalDate.parse(s.trim()); } catch (Exception ignore) {}
-                  return null;
+              static List<Path> parseRoots(String rootsPref) {
+                  if (rootsPref == null || rootsPref.isBlank()) return List.of(Paths.get(".github"));
+                  String[] parts = rootsPref.split("[,;\\s]+");
+                  List<Path> out = new ArrayList<>();
+                  for (String p: parts) {
+                      Path r = Paths.get(p.trim());
+                      if (!Files.exists(r)) continue;
+                      out.add(r);
+                  }
+                  if (out.isEmpty()) out.add(Paths.get(".github"));
+                  return out;
               }
 
-              static List<LedgerRow> readCsv(String path) throws IOException {
-                  try (Reader in = Files.newBufferedReader(Paths.get(path), StandardCharsets.UTF_8)) {
+              static List<String> toPatterns(List<String> exts) {
+                  List<String> patterns = new ArrayList<>();
+                  if (exts.isEmpty()) {
+                      patterns = List.of("**/*.xlsx","**/*.xls","**/*.csv");
+                  } else {
+                      for (String ext: exts) patterns.add("**/*." + ext);
+                  }
+                  return patterns;
+              }
+
+              static List<String> parseExts(String s) {
+                  if (s == null || s.isBlank()) return List.of();
+                  String[] parts = s.toLowerCase(Locale.ROOT).split("[,;\\s]+");
+                  List<String> out = new ArrayList<>();
+                  for (String p: parts) if (p.equals("xlsx")||p.equals("xls")||p.equals("csv")) out.add(p);
+                  return out;
+              }
+
+              // ===== IO / 파싱 =====
+              static List<LedgerRow> readCsv(Path path) throws IOException {
+                  try (Reader in = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
                       CSVParser p = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).build().parse(in);
                       List<LedgerRow> out = new ArrayList<>();
                       for (CSVRecord r: p) {
-                          LocalDate d = parseDateOrNull(r.get("date"));
+                          LocalDate d = parseDateOrNull(getSafe(r,"date"));
+                          if (d == null) continue;
                           String time = getSafe(r, "time");
                           String type = getSafe(r, "type");
                           long amount = parseLongSafe(getSafe(r, "amount"));
                           String memo = getSafe(r, "memo");
                           Long bal = parseLongSafeNullable(getSafe(r, "balance"));
                           String account = getSafe(r, "account");
-                          if (d != null) out.add(new LedgerRow(d,time,type,amount,memo,bal,account));
+                          out.add(new LedgerRow(d,time,type,amount,memo,bal,account, path.toString()));
                       }
                       return out;
                   }
               }
 
-              static List<LedgerRow> readExcel(String path, String sheetName) throws IOException {
-                  try (InputStream is = Files.newInputStream(Paths.get(path))) {
-                      Workbook wb = path.toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
+              static List<LedgerRow> readExcel(Path path, String sheetName) throws IOException {
+                  try (InputStream is = Files.newInputStream(path)) {
+                      Workbook wb = path.toString().toLowerCase(Locale.ROOT).endsWith(".xlsx") ? new XSSFWorkbook(is) : new HSSFWorkbook(is);
                       Sheet sheet = (sheetName != null && !sheetName.isBlank()) ? wb.getSheet(sheetName) : wb.getSheetAt(0);
 
                       Map<String,Integer> idx = new HashMap<>();
@@ -352,27 +444,14 @@ jobs:
                           String memo = cellStr(rr, idx.getOrDefault("memo",-1));
                           Long bal = parseLongSafeNullable(cellStr(rr, idx.getOrDefault("balance",-1)));
                           String account = cellStr(rr, idx.getOrDefault("account",-1));
-                          out.add(new LedgerRow(d,time,type,amount,memo,bal,account));
+                          out.add(new LedgerRow(d,time,type,amount,memo,bal,account, path.toString()));
                       }
                       wb.close();
                       return out;
                   }
               }
 
-              static String cellStr(org.apache.poi.ss.usermodel.Row r, int cidx) {
-                  if (cidx < 0) return "";
-                  Cell c = r.getCell(cidx);
-                  if (c == null) return "";
-                  return switch (c.getCellType()) {
-                      case STRING -> c.getStringCellValue();
-                      case NUMERIC -> DateUtil.isCellDateFormatted(c)
-                              ? c.getLocalDateTimeCellValue().toLocalDate().toString()
-                              : String.valueOf(Math.round(c.getNumericCellValue()));
-                      case BOOLEAN -> String.valueOf(c.getBooleanCellValue());
-                      default -> "";
-                  };
-              }
-
+              // ===== 유틸 =====
               static String getSafe(CSVRecord r, String key) { try { return r.get(key); } catch (Exception e) { return ""; } }
               static long parseLongSafe(String s) {
                   if (s == null) return 0L;
@@ -384,6 +463,13 @@ jobs:
                   String t = (s==null) ? "" : s.replaceAll("[^0-9-]", "");
                   if (t.isBlank() || t.equals("-")) return null;
                   try { return Long.parseLong(t); } catch (Exception e) { return null; }
+              }
+
+              static LocalDate parseDateOrNull(String s) {
+                  if (s == null || s.isBlank()) return null;
+                  for (var fmt: DATE_FMTS) { try { return LocalDate.parse(s.trim(), fmt); } catch (Exception ignore) {} }
+                  try { return LocalDate.parse(s.trim()); } catch (Exception ignore) {}
+                  return null;
               }
 
               static List<LedgerRow> filterByDate(List<LedgerRow> in, LocalDate from, LocalDate to) {
@@ -399,21 +485,112 @@ jobs:
               }
 
               static void printTable(List<LedgerRow> rows) {
-                  System.out.println("date       | time     | type   | amount  | memo             | balance   | account");
-                  System.out.println("-----------+----------+--------+---------+------------------+-----------+--------");
+                  System.out.println("date       | time     | type   | amount  | memo             | balance   | account  | source");
+                  System.out.println("-----------+----------+--------+---------+------------------+-----------+----------+----------------");
                   for (LedgerRow r: rows) {
-                      System.out.printf("%-10s | %-8s | %-6s | %8s | %-16s | %9s | %s%n",
+                      System.out.printf("%-10s | %-8s | %-6s | %8s | %-16s | %9s | %-8s | %s%n",
                               r.date, nv(r.time), nv(r.type), fmt(r.amount), nv(r.memo),
-                              r.balance==null? "-" : fmt(r.balance), nv(r.account));
+                              r.balance==null? "-" : fmt(r.balance), nv(r.account), r.source);
                   }
               }
+
+              static Map<LocalDate, Summary> summarizeByDate(List<LedgerRow> rows) {
+                  Map<LocalDate, Summary> map = new TreeMap<>();
+                  for (LedgerRow r: rows) {
+                      Summary s = map.getOrDefault(r.date, new Summary());
+                      s.count++;
+                      s.total += r.amount;
+                      map.put(r.date, s);
+                  }
+                  return map;
+              }
+
+              static void writeCsv(Path out, List<LedgerRow> rows) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("date","time","type","amount","memo","balance","account","source"))) {
+                      for (LedgerRow r: rows) {
+                          p.printRecord(r.date, r.time, r.type, r.amount, r.memo, r.balance==null?"":r.balance, r.account, r.source);
+                      }
+                  }
+              }
+
+              static void writeCsvSummary(Path out, Map<LocalDate, Summary> byDate) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
+                       CSVPrinter p = new CSVPrinter(w, CSVFormat.DEFAULT.withHeader("date","count","amount_sum"))) {
+                      for (var e: byDate.entrySet()) {
+                          p.printRecord(e.getKey(), e.getValue().count, e.getValue().total);
+                      }
+                  }
+              }
+
+              static void writeFilesUsed(Path out, List<Path> files) throws IOException {
+                  try (BufferedWriter w = Files.newBufferedWriter(out, StandardCharsets.UTF_8)) {
+                      for (Path f: files) w.write(f.toString() + System.lineSeparator());
+                  }
+              }
+
+              static void writeHtmlSummary(Path out, List<LedgerRow> rows, Map<LocalDate, Summary> byDate, List<Path> files) throws IOException {
+                  StringBuilder sb = new StringBuilder();
+                  sb.append("<!doctype html><meta charset='utf-8'><title>Ledger Summary</title>");
+                  sb.append("<h1>Ledger Summary</h1>");
+                  sb.append("<h2>Files used (").append(files.size()).append(")</h2><ul>");
+                  for (Path f: files) sb.append("<li>").append(escape(f.toString())).append("</li>");
+                  sb.append("</ul>");
+
+                  sb.append("<h2>By Date</h2><table border=1 cellpadding=4 cellspacing=0><tr><th>Date</th><th>Count</th><th>Amount Sum</th></tr>");
+                  for (var e: byDate.entrySet()) {
+                      sb.append("<tr><td>").append(e.getKey()).append("</td><td>").append(e.getValue().count)
+                        .append("</td><td>").append(String.format("%,d", e.getValue().total)).append("</td></tr>");
+                  }
+                  sb.append("</table>");
+
+                  sb.append("<h2>First 100 rows</h2><table border=1 cellpadding=4 cellspacing=0>");
+                  sb.append("<tr><th>date</th><th>time</th><th>type</th><th>amount</th><th>memo</th><th>balance</th><th>account</th><th>source</th></tr>");
+                  int i=0;
+                  for (LedgerRow r: rows) {
+                      if (i++>=100) break;
+                      sb.append("<tr>")
+                        .append("<td>").append(r.date).append("</td>")
+                        .append("<td>").append(escape(nv(r.time))).append("</td>")
+                        .append("<td>").append(escape(nv(r.type))).append("</td>")
+                        .append("<td>").append(String.format("%,d", r.amount)).append("</td>")
+                        .append("<td>").append(escape(nv(r.memo))).append("</td>")
+                        .append("<td>").append(r.balance==null?"":String.format("%,d", r.balance)).append("</td>")
+                        .append("<td>").append(escape(nv(r.account))).append("</td>")
+                        .append("<td>").append(escape(r.source)).append("</td>")
+                        .append("</tr>");
+                  }
+                  sb.append("</table>");
+                  Files.writeString(out, sb.toString(), StandardCharsets.UTF_8);
+              }
+
+              static String escape(String s){ return s==null?"":s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"); }
               static String nv(String s){ return (s==null||s.isBlank())?"-":s; }
               static String fmt(long v){ return String.format("%,d", v); }
+              static class Summary { long count=0; long total=0; }
+
+              // Glob → Regex (루트/패턴 결합)
+              static String globToRegex(String glob) {
+                  String g = glob.replace("\\","/")
+                          .replace(".", "\\.")
+                          .replace("**/", "(.*/)?")
+                          .replace("**", ".*")
+                          .replace("*", "[^/]*")
+                          .replace("?", ".");
+                  if (!g.startsWith("^")) g = "^" + g;
+                  if (!g.endsWith("$")) g = g + "$";
+                  return g;
+              }
+
+              static String argOrEnv(String[] args, int idx, String env, String def) {
+                  if (args.length > idx && args[idx] != null && !args[idx].isBlank()) return args[idx];
+                  return System.getenv().getOrDefault(env, def);
+              }
           }
           JAVA
 
-      # 4) JDK/캐시
-      - name: Setup Java (Temurin 21 + Maven cache if pom exists)
+      # 4) Java 설정
+      - name: Setup Java (Temurin 21 + maven cache if pom exists)
         if: hashFiles('**/pom.xml') != ''
         uses: actions/setup-java@v4
         with:
@@ -421,103 +598,70 @@ jobs:
           java-version: '21'
           cache: maven
 
-      # 5) Build (Maven/Gradle 자동감지) + 견고한 JAR 선택 로직
-      - name: Build and pick JAR (robust)
+      # 5) 빌드 & JAR 고르기(견고한 패턴 + 일반 JAR fallback)
+      - name: Build & pick JAR
         id: pickjar
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-
           POM_PATH="${POM_PATH:-}"
           [[ -z "${POM_PATH}" ]] && POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
-
           JAR=""
-
           if [[ -n "${POM_PATH}" ]]; then
-            echo "Detected pom: ${POM_PATH}"
             WORKDIR="$(dirname "${POM_PATH}")"
+            echo "Detected pom: ${POM_PATH}"
             run mvn -B -q -DskipTests -f "${POM_PATH}" package
-
-            # ✅ 견고한 JAR 선택 순서
             for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar"; do
               CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | head -n1 || true)"
               [[ -n "${CAND}" ]] && JAR="${CAND}" && break
             done
-
-            if [[ -z "${JAR}" ]]; then
-              # 마지막 fallback: 일반 *.jar (단, original-*.jar 제외)
-              CAND="$(ls -1 "${WORKDIR}"/target/*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)"
-              [[ -n "${CAND}" ]] && JAR="${CAND}"
-            fi
-
+            [[ -z "${JAR}" ]] && CAND="$(ls -1 "${WORKDIR}"/target/*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)" && JAR="${CAND}"
             if [[ -z "${JAR}" ]]; then
               faile "실행 JAR을 찾지 못했습니다."
               ls -al "${WORKDIR}/target" || true
               exit 1
             fi
-
           else
-            # Gradle
-            if [[ -f gradlew || -f build.gradle || -f build.gradle.kts ]]; then
-              if [[ -f gradlew ]]; then
-                run chmod +x gradlew
-                if ./gradlew tasks | grep -q '^shadowJar'; then
-                  run ./gradlew -q shadowJar
-                  for pat in "*-all.jar" "*-shadow.jar"; do
-                    CAND="$(ls -1 build/libs/${pat} 2>/dev/null | head -n1 || true)"
-                    [[ -n "${CAND}" ]] && JAR="${CAND}" && break
-                  done
-                else
-                  run ./gradlew -q build
-                  for pat in "*-all.jar" "*-shadow.jar" "*.jar"; do
-                    CAND="$(ls -1 build/libs/${pat} 2>/dev/null | head -n1 || true)"
-                    [[ -n "${CAND}" ]] && JAR="${CAND}" && break
-                  done
-                fi
-              else
-                sudo apt-get update -y
-                sudo apt-get install -y gradle || true
-                run gradle -q build
-                JAR="$(ls -1 build/libs/*.jar 2>/dev/null | head -n1 || true)"
-              fi
-
-              if [[ -z "${JAR}" ]]; then
-                faile "Gradle JAR을 찾지 못했습니다."
-                ls -al build/libs || true
-                exit 1
-              fi
-            else
-              faile "pom.xml/Gradle 빌드 파일을 찾지 못했습니다."
-              find . -maxdepth 4 -type f \( -name pom.xml -o -name build.gradle -o -name build.gradle.kts \) -print || true
-              exit 1
-            fi
+            faile "pom.xml을 찾지 못했습니다."
+            exit 1
           fi
-
-          echoe "Picked JAR: ${JAR}"
           echo "JAR=${JAR}" >> "$GITHUB_ENV"
           echo "jar_path=${JAR}" >> "$GITHUB_OUTPUT"
+          echoe "Picked JAR: ${JAR}"
 
-      # 6) Run Viewer
+      # 6) 실행 (모든 옵션 전달)
       - name: Run viewer (java -jar)
         shell: bash
         env:
-          LEDGER_PATH: ${{ inputs.ledger_path }}
-          FROM_DATE: ${{ inputs.from_date }}
-          TO_DATE: ${{ inputs.to_date }}
-          SHEET_NAME: ${{ inputs.sheet_name }}
+          LEDGER_PATH:  ${{ inputs.ledger_path }}
+          FROM_DATE:    ${{ inputs.from_date }}
+          TO_DATE:      ${{ inputs.to_date }}
+          SHEET_NAME:   ${{ inputs.sheet_name }}
+          LEDGER_EXTS:  ${{ inputs.excel_exts }}
+          LEDGER_SEARCH_ROOTS: ${{ inputs.search_root }}
+          LEDGER_NAME_FILTERS: ${{ inputs.name_filters }}
+          AGGREGATE_ALL_FILES: ${{ inputs.aggregate_all_files }}
+          ALL_DATES:    ${{ inputs.all_dates }}
+          OUTPUT_FORMATS: ${{ inputs.output_formats }}
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          echo "LEDGER_PATH=${LEDGER_PATH:-'(빈값: .github/ 자동탐색)'}"
+          echo "LEDGER_PATH=${LEDGER_PATH:-'(빈값: 자동탐색)'}"
           echo "FROM_DATE=${FROM_DATE}"
           echo "TO_DATE=${TO_DATE}"
           echo "SHEET_NAME=${SHEET_NAME}"
+          echo "LEDGER_EXTS=${LEDGER_EXTS:-'(제한 없음)'}"
+          echo "LEDGER_SEARCH_ROOTS=${LEDGER_SEARCH_ROOTS}"
+          echo "LEDGER_NAME_FILTERS=${LEDGER_NAME_FILTERS}"
+          echo "AGGREGATE_ALL_FILES=${AGGREGATE_ALL_FILES}"
+          echo "ALL_DATES=${ALL_DATES}"
+          echo "OUTPUT_FORMATS=${OUTPUT_FORMATS}"
           test -n "${JAR:-}" || { faile "JAR 환경변수가 비어 있습니다."; exit 1; }
           run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
-      # 7) GitHub Release 생성(항상 실행) + 다운로드 “정식 주소” 획득
-      - name: Create GitHub Release (attach JAR)
+      # 7) 릴리즈 생성 + 정식 다운로드 주소 추출 (JAR + 리포트)
+      - name: Create GitHub Release (attach JAR & reports)
         id: release
         uses: softprops/action-gh-release@v2
         with:
@@ -527,55 +671,56 @@ jobs:
           prerelease: false
           files: |
             ${{ steps.pickjar.outputs.jar_path }}
+            target/reports/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Summarize Release URLs (정식 다운로드 주소)
+      - name: Summarize Release URLs (정식 다운로드 링크)
         id: relurls
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -Eeuo pipefail
-          # gh CLI는 기본 설치되어 있습니다.
           JSON="$(gh release view "ledger-${GITHUB_RUN_ID}" --json url,assets)"
           PAGE_URL="$(echo "$JSON" | jq -r '.url')"
+          # 첫 번째 자산 URL
           ASSET_URL="$(echo "$JSON" | jq -r '.assets[0].url')"
           echo "release_page_url=${PAGE_URL}" >> "$GITHUB_OUTPUT"
           echo "asset_download_url=${ASSET_URL}" >> "$GITHUB_OUTPUT"
-
           {
-            echo "## ✅ Download Links"
+            echo "## ✅ Download Links (Release)"
             echo "- Release page: ${PAGE_URL}"
-            echo "- Direct asset: ${ASSET_URL}"
+            echo "- First asset:  ${ASSET_URL}"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # 8) 아티팩트 업로드(런 결과 + 원본 데이터)
-      - name: Upload artifacts (logs + jars + discovered files)
+      # 8) 아티팩트 업로드(워크플로우 결과물 보존)
+      - name: Upload artifacts (logs + jars + reports + sources used)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ledger-artifacts-${{ github.run_id }}
           path: |
             ${LOG_DIR}
-            ${DL_DIR}
             **/target/*.jar
-            build/libs/*.jar
+            target/reports/**/*
             data/*.csv
             .github/**/*.xlsx
             .github/**/*.xls
             .github/**/*.csv
           if-no-files-found: ignore
 
-      # 9) 출력 요약
+      # 9) 요약
       - name: Job summary
         shell: bash
         run: |
           set -Eeuo pipefail
           {
-            echo "### 🧪 Build Output"
-            echo "- Picked JAR: \`${JAR}\`"
-            echo "### 🔗 Download"
-            echo "- Release page: ${{ steps.relurls.outputs.release_page_url }}"
-            echo "- Direct asset: ${{ steps.relurls.outputs.asset_download_url }}"
+            echo "### 🧾 Reports"
+            echo "- Consolidated CSV: \`target/reports/ledger_consolidated.csv\`"
+            echo "- Summary by date:  \`target/reports/summary_by_date.csv\`"
+            echo "- HTML summary:     \`target/reports/summary.html\`"
+            echo "### 🔗 Release"
+            echo "- Page:  ${{ steps.relurls.outputs.release_page_url }}"
+            echo "- Asset: ${{ steps.relurls.outputs.asset_download_url }}"
           } >> "$GITHUB_STEP_SUMMARY"
