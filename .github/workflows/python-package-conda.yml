@@ -46,7 +46,7 @@ on:
         required: false
         default: "console,csv,html"
 
-  # ⏱️ 5분 주기(UTC 기준)
+  # ⏱️ 5분 주기(UTC 기준) 스케줄
   schedule:
     - cron: "*/5 * * * *"
 
@@ -59,20 +59,13 @@ env:
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
 
-  # ===== 전 범위 고정 대량 수정(안전 설정) =====
-  BULK_ENABLE: "true"
-  BULK_EXCLUDES: ".git,.github/artifacts,target,node_modules,.venv,.m2"
-  REPLACE_FROM: "echo-file"
-  REPLACE_TO:   "vibe-file"
-  APPEND_LINE:  "<!-- appended-by-workflow -->"
-  RENAME_PREFIX: "bulk_"
-  RENAME_SUFFIX: ""
-  DUPLICATE_COPIES: "0"
-  CHMOD_MODE: "644"
-
-  # ===== Ledger 고급 옵션(입력 10개 제한 회피: ENV 사용) =====
+  # 🔢 inputs 제한으로 env 전환
   TOP_N: "10"
   CATEGORY_MAP_JSON: ""
+
+  # 🔊 에코 호출(Repo Variables에서 주입 가능)
+  ECHO_CALLS: ${{ vars.ECHO_CALLS }}
+  ECHO_SUMMARY: ${{ vars.ECHO_SUMMARY }}
 
 permissions:
   contents: write
@@ -92,106 +85,73 @@ jobs:
         with:
           lfs: true
 
-      - name: Echo helpers (global-safe)
+      - name: Ensure base dirs + Git LFS
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR:-.github/echo_logs}"
+          mkdir -p "${LOG_DIR}" "${DL_DIR}" "${REPORT_DIR}" app/src/main/java/com/example app/src/main/resources data
+          git lfs install
+          git lfs pull || true
+
+      # ✅ eval/괄호 에러 방지용 안전 런처
+      - name: Echo helpers (safe run: bash -lc)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           log(){ printf '%s %s\n' "$1" "$2" | tee -a "${LOG_DIR}/echo.log"; }
           echoe(){ log "${ECHO_OK}" "$*"; }
           warne(){ log "${ECHO_WARN}" "$*"; }
           faile(){ log "${ECHO_FAIL}" "$*"; }
-          # 복잡한 쉘 구문도 안전 실행 (eval → bash -lc)
-          run(){
-            printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/echo.log"
-            bash -lc "$*" 2>&1 | tee -a "${LOG_DIR}/echo.log"
-          }
+          run(){ printf '▶ %s\n' "$*" | tee -a "${LOG_DIR}/echo.log"; bash -lc "$*" 2>&1 | tee -a "${LOG_DIR}/echo.log"; }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
           echoe "Echo helpers ready"
 
-      - name: Ensure base dirs + Git LFS
+      # 🔊 에코 호출 (Repo Variables 또는 .github/echo_calls.txt)
+      - name: Echo calls (user-provided: vars or file)
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          run "mkdir -p '${LOG_DIR}' '${DL_DIR}' '${REPORT_DIR}' app/src/main/java/com/example app/src/main/resources data"
-          run "git lfs install"
-          run "git lfs pull || true"
-
-      # ===== 전 범위 고정: 대량 수정 스텝 =====
-      - name: BULK MODIFY — global-safe (replace/append/rename/duplicate/chmod)
-        if: env.BULK_ENABLE == 'true'
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source /tmp/echo_helpers.sh
-
-          IFS=',' read -r -a EXCLUDES <<< "${BULK_EXCLUDES}"
-          EXPR=""
-          for p in "${EXCLUDES[@]}"; do
-            [[ -z "$p" ]] && continue
-            [[ -n "$EXPR" ]] && EXPR="${EXPR} -o "
-            EXPR="${EXPR}-path './${p}/*'"
-          done
-
-          # 1) 텍스트 파일 전수 수집 (전 범위 고정, 제외 경로 -prune)
-          mapfile -t FILES < <(bash -lc "find . \\( ${EXPR} \\) -prune -o -type f -print0 | xargs -0 -I{} bash -lc 'file --mime \"{}\" 2>/dev/null | grep -q \"text/\" && echo {}'")
-
-          echo "대상 파일(원본) 수: ${#FILES[@]}"
-
-          # 2) 내용 치환 + 라인 추가(중복 방지)
-          for f in "${FILES[@]}"; do
-            if [[ -n "${REPLACE_FROM}" && -n "${REPLACE_TO}" ]]; then
-              run "perl -0777 -pe 's/\\Q${REPLACE_FROM}\\E/${REPLACE_TO}/g' -i \"$f\""
-            fi
-            if [[ -n "${APPEND_LINE}" ]]; then
-              grep -Fxq "${APPEND_LINE}" "$f" || echo "${APPEND_LINE}" >> "$f"
-            fi
-          done
-
-          # 3) 파일명 변경(재실행 안전: bulk_시작 또는 _copyN 는 skip)
-          RENAMED=()
-          for f in "${FILES[@]}"; do
-            dir="$(dirname "$f")"
-            base="$(basename "$f")"
-            ext="${base##*.}"; name="${base%.*}"
-            dot="."; [[ "$base" = "$ext" ]] && dot=""
-            if [[ "$name" == ${RENAME_PREFIX}* ]] || [[ "$name" =~ _copy[0-9]+$ ]]; then
-              continue
-            fi
-            new="${dir}/${RENAME_PREFIX}${name}${RENAME_SUFFIX}${dot}${ext}"
-            if [[ "${RENAME_PREFIX}${RENAME_SUFFIX}" != "" && "$f" != "$new" ]]; then
-              run "mv -f \"$f\" \"$new\""
-              RENAMED+=("$new")
-            fi
-          done
-
-          # 4) 복제(옵션)
-          if [[ "${DUPLICATE_COPIES:-0}" =~ ^[0-9]+$ && "${DUPLICATE_COPIES}" -gt 0 ]]; then
-            for f in "${RENAMED[@]}"; do
-              dir="$(dirname "$f")"
-              base="$(basename "$f")"
-              ext="${base##*.}"; name="${base%.*}"
-              dot="."; [[ "$base" = "$ext" ]] && dot=""
-              for ((i=1; i<=DUPLICATE_COPIES; i++)); do
-                clone="${dir}/${name}_copy${i}${dot}${ext}"
-                run "cp -f \"$f\" \"$clone\""
-              done
+          CALLS_RAW="${ECHO_CALLS:-}"
+          if [[ -z "${CALLS_RAW}" && -f ".github/echo_calls.txt" ]]; then
+            CALLS_RAW="$(cat .github/echo_calls.txt)"
+          fi
+          if [[ -z "${CALLS_RAW}" ]]; then
+            warne "에코 호출 입력이 비어 있어 스킵합니다 (ECHO_CALLS 변수 또는 .github/echo_calls.txt 사용 가능)."
+          else
+            echoe "에코 호출 시작"
+            IFS=$'\n'
+            for line in ${CALLS_RAW}; do
+              [[ -z "${line// }" ]] && continue
+              [[ "${line}" =~ ^# ]] && continue
+              if [[ "${line}" =~ ^OK:[[:space:]]*(.*)$ ]]; then
+                echoe "${BASH_REMATCH[1]}"
+              elif [[ "${line}" =~ ^WARN:[[:space:]]*(.*)$ ]]; then
+                warne "${BASH_REMATCH[1]}"
+              elif [[ "${line}" =~ ^FAIL:[[:space:]]*(.*)$ ]]; then
+                faile "${BASH_REMATCH[1]}"
+              elif [[ "${line}" =~ ^RUN:[[:space:]]*(.*)$ ]]; then
+                run "${BASH_REMATCH[1]}"
+              else
+                echoe "${line}"
+              fi
             done
+            echoe "에코 호출 종료"
+          fi
+          if [[ -n "${ECHO_SUMMARY:-}" ]]; then
+            {
+              echo "### 🗒️ 추가 요약(에코)"
+              printf "%s\n" "${ECHO_SUMMARY}"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # 5) 권한 통일(파일/디렉토리) — 괄호/경로 패턴 안전
-          run "find . \\( ${EXPR} \\) -prune -o -type f -exec chmod '${CHMOD_MODE:-644}' {} +"
-          run "find . \\( ${EXPR} \\) -prune -o -type d -exec chmod 755 {} +"
-
-      # ===== Maven POM 부트스트랩 =====
+      # 1) pom.xml 없으면 생성(정상 POM)
       - name: Bootstrap Maven project if missing
         if: hashFiles('**/pom.xml') == ''
         shell: bash
@@ -199,7 +159,7 @@ jobs:
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           echoe "pom.xml 미존재 → app/에 생성"
-          run "mkdir -p app/src/main/java/com/example app/src/main/resources"
+          run mkdir -p app/src/main/java/com/example app/src/main/resources
           cat > app/pom.xml <<'POM'
           <?xml version="1.0" encoding="UTF-8"?>
           <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -275,6 +235,7 @@ jobs:
           echo 'package com.example; public class BankLedger{public static void main(String[]a){System.out.println("placeholder");}}' > app/src/main/java/com/example/BankLedger.java
           echo "POM_PATH=app/pom.xml" >> "$GITHUB_ENV"
 
+      # 2) POM self-heal (닫힘태그 보정)
       - name: Self-heal POM shade <transformer> tag if broken
         shell: bash
         run: |
@@ -302,12 +263,11 @@ jobs:
             echo "✅ POM transformer 태그 정상"
           fi
 
-      # ===== 자바 본문(다국어 헤더/입·출금/월별·타입별·메모별/카테고리/랭킹/HTML+CSV) =====
-      - name: Patch BankLedger.java (multi-file + KR headers + debit/credit/net + rankings)
+      # 3) 자바 본문 패치 (멀티파일 + 다국어 헤더 + 입/출금/순증감 + 월별/타입별/메모별 + 카테고리 + HTML/CSV 리포트)
+      - name: Patch BankLedger.java (viewer core)
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p app/src/main/java/com/example
           cat > app/src/main/java/com/example/BankLedger.java <<'JAVA'
           package com.example;
           import org.apache.commons.csv.*;
@@ -350,7 +310,6 @@ jobs:
                   Files.createDirectories(reportDir);
                   LocalDate fromDate = allDates ? null : parseDateOrNull(from);
                   LocalDate toDate   = allDates ? null : parseDateOrNull(to);
-                  // 파일 탐색
                   List<Path> files = new ArrayList<>();
                   if (!pathSingle.isBlank()) files.add(Paths.get(pathSingle));
                   else files = discoverFiles(extsPref, rootsPref, nameFilters, aggregateAll);
@@ -369,7 +328,6 @@ jobs:
                       Files.writeString(csv, sample, StandardCharsets.UTF_8);
                       files = List.of(csv);
                   }
-                  // 읽기/정규화
                   List<LedgerRow> allRows = new ArrayList<>();
                   for (Path f: files) {
                       String lower = f.toString().toLowerCase(Locale.ROOT);
@@ -379,16 +337,13 @@ jobs:
                       else { System.out.println("⏭️ 지원하지 않는 확장자: " + f); continue; }
                       allRows.addAll(rows);
                   }
-                  // 기간 필터
                   List<LedgerRow> rows = filterByDate(allRows, fromDate, toDate);
-                  // 요약
                   Map<LocalDate, Sum> byDate = summarizeByDate(rows);
                   Map<String, Sum> byType = summarizeByType(rows);
                   Map<String, Sum> byMemo = summarizeByMemo(rows);
                   Map<YearMonth, Sum> byMonth = summarizeByMonth(rows);
                   Map<String, List<String>> catMap = parseCategoryMap(categoryJson);
                   Map<String, Sum> byCategory = summarizeByCategory(rows, catMap);
-                  // 출력
                   if (outFormats.contains("console")) printTable(rows, topN, byMemo);
                   if (outFormats.contains("csv")) {
                       writeCsv(reportDir.resolve("ledger_consolidated.csv"), rows);
@@ -396,14 +351,12 @@ jobs:
                       writeCsvSumType(reportDir.resolve("summary_by_type.csv"), byType);
                       writeCsvSumMemo(reportDir.resolve("summary_by_memo.csv"), byMemo, topN);
                       writeCsvSumMonth(reportDir.resolve("summary_monthly.csv"), byMonth);
-                      if (!byCategory.isEmpty())
-                        writeCsvSumCat(reportDir.resolve("summary_by_category.csv"), byCategory);
+                      if (!byCategory.isEmpty()) writeCsvSumCat(reportDir.resolve("summary_by_category.csv"), byCategory);
                       writeFilesUsed(reportDir.resolve("files_used.txt"), files);
                   }
                   if (outFormats.contains("html")) {
                       writeHtmlSummary(reportDir.resolve("summary.html"), rows, byDate, byType, byMemo, byMonth, byCategory, files, topN);
                   }
-                  // 합계
                   long outSum = rows.stream().mapToLong(r -> r.debit).sum();
                   long inSum  = rows.stream().mapToLong(r -> r.credit).sum();
                   long netSum = rows.stream().mapToLong(r -> r.net).sum();
@@ -418,7 +371,7 @@ jobs:
                   if (lastBalance != null) System.out.printf("마지막 잔액 : %,d원%n", lastBalance);
                   System.out.println("리포트 위치 : " + reportDir.toAbsolutePath());
               }
-              // ===== Discover & Filters =====
+              // ======== Discover & Filters ========
               static List<Path> discoverFiles(String extsPref, String rootsPref, String nameFilters, boolean all) throws IOException {
                   List<String> exts = parseExts(extsPref);
                   List<String> pats = toPatterns(exts);
@@ -473,7 +426,7 @@ jobs:
                   for (String p: parts) if (p.equals("xlsx")||p.equals("xls")||p.equals("csv")) out.add(p);
                   return out;
               }
-              // ===== Parsing =====
+              // ======== Parsing ========
               static List<LedgerRow> readCsv(Path path) throws IOException {
                   try (Reader in = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
                       CSVParser p = CSVFormat.DEFAULT.builder().setHeader().setSkipHeaderRecord(true).setTrim(true).build().parse(in);
@@ -530,7 +483,7 @@ jobs:
                   long net = credit - debit; // 입금(+), 출금(-)
                   return new LedgerRow(d, nv(time), nv(type), Math.max(debit,0), Math.max(credit,0), net, nv(memo), bal, nv(acct), src);
               }
-              // ===== Header utils =====
+              // ======== Headers & cell utils ========
               static Map<String,Integer> headerIndex(Set<String> keys){
                   Map<String,Integer> m = new HashMap<>();
                   int i=0; for (String k: keys){ m.put(safeLower(k), i++); }
@@ -565,7 +518,7 @@ jobs:
                       default -> "";
                   };
               }
-              // ===== Summary helpers =====
+              // ======== Summary helpers ========
               static class Sum { long debit=0, credit=0; long net(){ return credit - debit; } long cnt=0; }
               static Map<LocalDate, Sum> summarizeByDate(List<LedgerRow> rows){
                   Map<LocalDate, Sum> m = new TreeMap<>();
@@ -626,22 +579,22 @@ jobs:
                   }
                   return sortByDebitDesc(m);
               }
-              // ===== Writers =====
+              // ======== Writers ========
               static void printTable(List<LedgerRow> rows, int topN, Map<String, Sum> byMemo){
                   System.out.println("date       | time     | type   | debit   | credit  | net     | memo             | balance   | account  | source");
                   System.out.println("-----------+----------+--------+---------+---------+---------+------------------+-----------+----------+----------------");
                   for (var r: rows) {
                       System.out.printf("%-10s | %-8s | %-6s | %8s | %8s | %8s | %-16s | %9s | %-8s | %s%n",
                               r.date, nv(r.time), nv(r.type),
-                              fmt(r.debit), fmt(r.credit), fmt(r.net),
+                              fm(r.debit), fm(r.credit), fm(r.net),
                               cut(nv(r.memo),16),
-                              r.balance==null? "-" : fmt(r.balance), nv(r.account), r.source);
+                              r.balance==null? "-" : fm(r.balance), nv(r.account), r.source);
                   }
                   System.out.println("\n== Top " + topN + " 지출(memo) ==");
                   int i=0; for (var e: byMemo.entrySet().stream().sorted((a,b)->Long.compare(b.getValue().debit, a.getValue().debit)).toList()){
                       if (i++>=topN) break;
                       System.out.printf("%2d) %-24s  debit:%10s  credit:%10s  net:%10s  (cnt:%d)%n",
-                              i, cut(e.getKey(),24), fmt(e.getValue().debit), fmt(e.getValue().credit), fmt(e.getValue().net()), e.getValue().cnt);
+                              i, cut(e.getKey(),24), fm(e.getValue().debit), fm(e.getValue().credit), fm(e.getValue().net()), e.getValue().cnt);
                   }
               }
               static void writeCsv(Path out, List<LedgerRow> rows) throws IOException {
@@ -750,7 +703,7 @@ jobs:
                           .append(td(fm(e.getValue().credit))).append(td(fm(e.getValue().net()))).append("</tr>");
                   return sb.append("</table>").toString();
               }
-              // ===== Utils =====
+              // ======== Utils ========
               static String env(String k, String d){ return System.getenv().getOrDefault(k, d); }
               static String get(CSVRecord r, Map<String,Integer> idx, String k){ return get(r, idx, k, ""); }
               static String get(CSVRecord r, Map<String,Integer> idx, String k, String def){
@@ -806,9 +759,28 @@ jobs:
               }
           }
           JAVA
-          head -n 3 app/src/main/java/com/example/BankLedger.java
 
-      # ===== Java 설정 & 캐시 =====
+      # 3.5) 🔧 MASS HOTFIX: 심볼 대량 추가(aliases) — parseInt, fmt 오버로드 등
+      - name: Inject symbol aliases into BankLedger.java
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          FILE="app/src/main/java/com/example/BankLedger.java"
+          test -f "$FILE" || { echo "❌ $FILE not found"; exit 1; }
+          perl -0777 -pe '
+            s/\n}\s*$/\n  // ==== hotfix utils (inserted by workflow) ====\n
+  static int parseInt(String s,int def){ try{ return Integer.parseInt(s.trim()); } catch(Exception e){ return def; } }\n
+  static long parseLongOr(String s,long def){ try{ return Long.parseLong(s.trim()); } catch(Exception e){ return def; } }\n
+  static long nz(Long v,long d){ return v==null?d:v.longValue(); }\n
+  // fmt overloads unify to fm(long)\n
+  static String fmt(long v){ return fm(v); }\n
+  static String fmt(Long v){ return v==null?\"\":fm(v.longValue()); }\n
+  static String fmt(int v){ return fm((long)v); }\n
+  static String fmt(Integer v){ return v==null?\"\":fm((long)v.intValue()); }\n
+}\n/s' -i "$FILE"
+          grep -n "hotfix utils (inserted by workflow)" "$FILE" || { echo "❌ alias inject failed"; exit 1; }
+
+      # 4) Java 설정
       - name: Setup Java (Temurin 21 + maven cache)
         uses: actions/setup-java@v4
         with:
@@ -816,8 +788,8 @@ jobs:
           java-version: '21'
           cache: maven
 
-      # ===== 빌드 & Shaded JAR 선택(보장) =====
-      - name: Build & pick JAR (shaded-first)
+      # 5) 빌드 & JAR 고르기(견고한 패턴 + 일반 JAR fallback)
+      - name: Build & pick JAR
         id: pickjar
         shell: bash
         run: |
@@ -825,22 +797,28 @@ jobs:
           source /tmp/echo_helpers.sh
           POM_PATH="${POM_PATH:-}"
           [[ -z "${POM_PATH}" ]] && POM_PATH="$(find . -type f -name pom.xml -not -path '*/.git/*' | head -n1 || true)"
-          [[ -z "$POM_PATH" ]] && { faile "pom.xml을 찾지 못했습니다."; exit 1; }
-          WORKDIR="$(dirname "${POM_PATH}")"
-          run "mvn -B -q -DskipTests -f '${POM_PATH}' package"
           JAR=""
-          for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar"; do
-            CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | head -n1 || true)"
-            [[ -n "${CAND}" ]] && JAR="${CAND}" && break
-          done
-          [[ -z "${JAR}" ]] && JAR="$(ls -1 "${WORKDIR}"/target/*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)"
-          [[ -z "${JAR}" ]] && { faile "실행 JAR을 찾지 못했습니다."; ls -al "${WORKDIR}/target" || true; exit 1; }
+          if [[ -n "${POM_PATH}" ]]; then
+            WORKDIR="$(dirname "${POM_PATH}")"
+            echo "Detected pom: ${POM_PATH}"
+            run mvn -B -q -DskipTests -f "${POM_PATH}" package
+            for pat in "*-shaded.jar" "*jar-with-dependencies.jar" "*-all.jar" "*-shadow.jar"; do
+              CAND="$(ls -1 "${WORKDIR}"/target/${pat} 2>/dev/null | head -n1 || true)"
+              [[ -n "${CAND}" ]] && JAR="${CAND}" && break
+            done
+            [[ -z "${JAR}" ]] && CAND="$(ls -1 "${WORKDIR}"/target/*.jar 2>/dev/null | grep -v 'original-' | head -n1 || true)" && JAR="${CAND}"
+            if [[ -z "${JAR}" ]] then
+              faile "실행 JAR을 찾지 못했습니다."; ls -al "${WORKDIR}/target" || true; exit 1
+            fi
+          else
+            faile "pom.xml을 찾지 못했습니다."; exit 1
+          fi
           echo "JAR=${JAR}" >> "$GITHUB_ENV"
           echo "jar_path=${JAR}" >> "$GITHUB_OUTPUT"
-          echoe "Picked JAR: ${JAR}"
+          echo "✅ Picked JAR: ${JAR}"
 
-      # ===== 실행 (항상 shaded/manifest JAR) =====
-      - name: Run viewer (java -jar shaded)
+      # 6) 실행 (모든 옵션 전달) — TOP_N/CATEGORY_MAP_JSON은 env 사용
+      - name: Run viewer (java -jar)
         shell: bash
         env:
           LEDGER_PATH:  ${{ inputs.ledger_path }}
@@ -858,16 +836,16 @@ jobs:
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          [[ -z "${JAR:-}" ]] && { faile "JAR 환경변수 비어 있음"; exit 1; }
           echo "LEDGER_PATH=${LEDGER_PATH:-'(빈값: 자동탐색)'}"
           echo "FROM_DATE=${FROM_DATE}   TO_DATE=${TO_DATE}   ALL_DATES=${ALL_DATES}"
           echo "SHEET_NAME=${SHEET_NAME}  LEDGER_EXTS=${LEDGER_EXTS:-'(제한 없음)'}"
           echo "SEARCH_ROOTS=${LEDGER_SEARCH_ROOTS}  NAME_FILTERS=${LEDGER_NAME_FILTERS}"
           echo "AGGREGATE_ALL_FILES=${AGGREGATE_ALL_FILES}  OUTPUT_FORMATS=${OUTPUT_FORMATS}"
-          echo "TOP_N=${TOP_N:-10}"
-          run "java -jar '${JAR}' '${LEDGER_PATH:-}' '${FROM_DATE:-}' '${TO_DATE:-}'"
+          echo "TOP_N=${TOP_N}"
+          test -n "${JAR:-}" || { echo "❌ JAR 환경변수가 비어 있습니다."; exit 1; }
+          run java -jar "${JAR}" "${LEDGER_PATH:-}" "${FROM_DATE:-}" "${TO_DATE:-}"
 
-      # ===== 릴리즈 & 정식 다운로드 URL =====
+      # 7) 릴리즈 생성 + 정식 다운로드 주소 추출 (JAR + 리포트)
       - name: Create GitHub Release (attach JAR & reports)
         id: release
         uses: softprops/action-gh-release@v2
@@ -914,7 +892,7 @@ jobs:
             if [ -n "${ASSET_URL}" ]; then echo "- First asset:  ${ASSET_URL}"; fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ===== 아티팩트 업로드 =====
+      # 8) 아티팩트 업로드(로그/리포트/JAR 보존)
       - name: Upload artifacts (logs + jars + reports + sources used)
         if: always()
         uses: actions/upload-artifact@v4
@@ -931,7 +909,17 @@ jobs:
           if-no-files-found: ignore
           include-hidden-files: true
 
-      # ===== Job summary =====
+      # 9) 권한 정규화 (안전 버전)
+      - name: Normalize permissions (safe find)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+          run "chmod -R u+rwX,go+rX . || true"
+          run "find . \( -path './.git/*' -o -path './.github/artifacts/*' -o -path '*/target/*' -o -path '*/node_modules/*' -o -path './.venv/*' -o -path './.m2/*' \) -prune -o -type f -print0 | xargs -0 -r chmod 644"
+          run "find . \( -path './.git/*' -o -path './.github/artifacts/*' -o -path '*/target/*' -o -path '*/node_modules/*' -o -path './.venv/*' -o -path './.m2/*' \) -prune -o -type d -print0 | xargs -0 -r chmod 755"
+
+      # 10) 요약
       - name: Job summary
         shell: bash
         run: |
