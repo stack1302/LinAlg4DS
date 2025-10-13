@@ -1,0 +1,3 @@
+✅ ▶ curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || true
+✅ ▶ trivy fs --scanners vuln,secret,misconfig --timeout 10m --no-progress -f json -o .github/artifacts/trivy.json . || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

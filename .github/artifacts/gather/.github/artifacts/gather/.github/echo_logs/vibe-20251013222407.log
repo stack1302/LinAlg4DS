@@ -1,0 +1,4 @@
+✅ ▶ sudo snap refresh || true
+✅ ▶ nginx -t || true
+✅ ▶ sudo apachectl configtest || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

@@ -1,0 +1,6 @@
+✅ ▶ mkdir -p docs/adr docs/api
+✅ ▶ zip -qr .github/artifacts/docs.zip docs || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).
+✅ ▶ curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true
+✅ ▶ syft scan dir:. -o cyclonedx-json > .github/artifacts/sbom.json || syft packages dir:. -o cyclonedx-json > .github/artifacts/sbom.json || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

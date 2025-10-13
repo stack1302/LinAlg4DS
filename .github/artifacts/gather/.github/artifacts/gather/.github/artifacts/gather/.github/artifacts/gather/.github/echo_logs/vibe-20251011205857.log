@@ -1,0 +1,7 @@
+✅ ▶ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server || true
+✅ ▶ sudo systemctl enable --now mariadb || sudo service mariadb start || true
+✅ ▶ sudo mysql -e "CREATE DATABASE IF NOT EXISTS vibe_mysql;" || true
+✅ ▶ sudo mysql -e "CREATE TABLE IF NOT EXISTS vibe_mysql.items(id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(50));" || true
+✅ ▶ sudo mysql -e "INSERT INTO vibe_mysql.items(name) VALUES ('hello'),('world');" || true
+✅ ▶ sudo mysql -e "SELECT COUNT(*) AS cnt FROM vibe_mysql.items;" | tee .github/echo_logs/mysql_check.txt || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

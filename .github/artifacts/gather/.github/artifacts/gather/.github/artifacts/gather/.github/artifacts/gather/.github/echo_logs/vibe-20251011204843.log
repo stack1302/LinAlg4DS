@@ -1,1 +1,15 @@
 ✅ ▶ rsync -a --relative ".github/echo_logs" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative ".github/artifacts" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative ".github/echo_dirs" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative ".github/echo_files" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative "app" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative "tests" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative "docs" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative ".env.sample" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative ".editorconfig" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative ".gitattributes" ".github/artifacts/gather/" || true
+✅ ▶ rsync -a --relative ".gitignore" ".github/artifacts/gather/" || true
+✅ ▶ find ".github/echo_files" -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -I{} sha256sum '{}' | tee .github/artifacts/gather/files.sha256 || true
+✅ ▶ find ".github/echo_dirs" -maxdepth 2 2>/dev/null | head -n 200 | tee .github/artifacts/gather/created-list.txt || true
+✅ ▶ zip -qr .github/artifacts/gather/prototype-fastapi.zip app nodeapp demo 2>/dev/null || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

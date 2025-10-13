@@ -1,0 +1,6 @@
+✅ ▶ sudo apt-get update -y
+✅ ▶ sudo apt-get install -y jq moreutils zip coreutils curl rsync python3-venv
+✅ ▶ corepack enable || true
+✅ ▶ sudo chown -R runner:runner "/home/runner/work/LinAlg4DS/LinAlg4DS" || true
+✅ ▶ chmod -R u+rwX,go+rX "/home/runner/work/LinAlg4DS/LinAlg4DS" || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

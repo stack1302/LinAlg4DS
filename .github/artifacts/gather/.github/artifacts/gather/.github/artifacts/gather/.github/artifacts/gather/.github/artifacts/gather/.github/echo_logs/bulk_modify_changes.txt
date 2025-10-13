@@ -1,0 +1,368 @@
+ D .github/echo_files/file0001.txt
+ D .github/echo_files/file0002.txt
+ D .github/echo_files/file0003.txt
+ D .github/echo_files/file0004.txt
+ D .github/echo_files/file0005.txt
+ D .github/echo_files/file0006.txt
+ D .github/echo_files/file0007.txt
+ D .github/echo_files/file0008.txt
+ D .github/echo_files/file0009.txt
+ D .github/echo_files/file0010.txt
+ D .github/echo_files/file0011.txt
+ D .github/echo_files/file0012.txt
+ D .github/echo_files/file0013.txt
+ D .github/echo_files/file0014.txt
+ D .github/echo_files/file0015.txt
+ D .github/echo_files/file0016.txt
+ D .github/echo_files/file0017.txt
+ D .github/echo_files/file0018.txt
+ D .github/echo_files/file0019.txt
+ D .github/echo_files/file0020.txt
+ D .github/echo_files/file0021.txt
+ D .github/echo_files/file0022.txt
+ D .github/echo_files/file0023.txt
+ D .github/echo_files/file0024.txt
+ D .github/echo_files/file0025.txt
+ D .github/echo_files/file0026.txt
+ D .github/echo_files/file0027.txt
+ D .github/echo_files/file0028.txt
+ D .github/echo_files/file0029.txt
+ D .github/echo_files/file0030.txt
+ D .github/echo_files/file0031.txt
+ D .github/echo_files/file0032.txt
+ D .github/echo_files/file0033.txt
+ D .github/echo_files/file0034.txt
+ D .github/echo_files/file0035.txt
+ D .github/echo_files/file0036.txt
+ D .github/echo_files/file0037.txt
+ D .github/echo_files/file0038.txt
+ D .github/echo_files/file0039.txt
+ D .github/echo_files/file0040.txt
+ D .github/echo_files/file0041.txt
+ D .github/echo_files/file0042.txt
+ D .github/echo_files/file0043.txt
+ D .github/echo_files/file0044.txt
+ D .github/echo_files/file0045.txt
+ D .github/echo_files/file0046.txt
+ D .github/echo_files/file0047.txt
+ D .github/echo_files/file0048.txt
+ D .github/echo_files/file0049.txt
+ D .github/echo_files/file0050.txt
+ D .github/echo_files/file0051.txt
+ D .github/echo_files/file0052.txt
+ D .github/echo_files/file0053.txt
+ D .github/echo_files/file0054.txt
+ D .github/echo_files/file0055.txt
+ D .github/echo_files/file0056.txt
+ D .github/echo_files/file0057.txt
+ D .github/echo_files/file0058.txt
+ D .github/echo_files/file0059.txt
+ D .github/echo_files/file0060.txt
+ D .github/echo_files/file0061.txt
+ D .github/echo_files/file0062.txt
+ D .github/echo_files/file0063.txt
+ D .github/echo_files/file0064.txt
+ D .github/echo_files/file0065.txt
+ D .github/echo_files/file0066.txt
+ D .github/echo_files/file0067.txt
+ D .github/echo_files/file0068.txt
+ D .github/echo_files/file0069.txt
+ D .github/echo_files/file0070.txt
+ D .github/echo_files/file0071.txt
+ D .github/echo_files/file0072.txt
+ D .github/echo_files/file0073.txt
+ D .github/echo_files/file0074.txt
+ D .github/echo_files/file0075.txt
+ D .github/echo_files/file0076.txt
+ D .github/echo_files/file0077.txt
+ D .github/echo_files/file0078.txt
+ D .github/echo_files/file0079.txt
+ D .github/echo_files/file0080.txt
+ M .github/echo_logs/nginx_check.txt
+ M .venv/bin/dotenv
+ M .venv/bin/fastapi
+ M .venv/bin/httpx
+ M .venv/bin/pip
+ M .venv/bin/pip3
+ M .venv/bin/pip3.12
+ M .venv/bin/py.test
+ M .venv/bin/pygmentize
+ M .venv/bin/pytest
+ M .venv/bin/uvicorn
+ M .venv/bin/watchfiles
+ M .venv/bin/websockets
+ M .venv/lib/python3.12/site-packages/httptools/parser/parser.cpython-312-x86_64-linux-gnu.so
+ M .venv/lib/python3.12/site-packages/httptools/parser/url_parser.cpython-312-x86_64-linux-gnu.so
+ M .venv/lib/python3.12/site-packages/pydantic_core/_pydantic_core.cpython-312-x86_64-linux-gnu.so
+ M .venv/lib/python3.12/site-packages/uvloop/loop.cpython-312-x86_64-linux-gnu.so
+ M .venv/lib/python3.12/site-packages/watchfiles/_rust_notify.cpython-312-x86_64-linux-gnu.so
+ M .venv/lib/python3.12/site-packages/websockets/speedups.cpython-312-x86_64-linux-gnu.so
+ M .venv/lib/python3.12/site-packages/yaml/_yaml.cpython-312-x86_64-linux-gnu.so
+ D README.md
+ M app/__pycache__/main.cpython-312.pyc
+ D docs/adr/0001-adopt-vibe-coding.md
+ D docs/api/openapi-notes.md
+?? .editorconfig
+?? .env.sample
+?? .gitattributes
+?? .github/artifacts/PERMISSIONS_APPLIED.txt
+?? .github/echo_files/bulk_file0001.txt
+?? .github/echo_files/bulk_file0001_copy1.txt
+?? .github/echo_files/bulk_file0001_copy2.txt
+?? .github/echo_files/bulk_file0002.txt
+?? .github/echo_files/bulk_file0002_copy1.txt
+?? .github/echo_files/bulk_file0002_copy2.txt
+?? .github/echo_files/bulk_file0003.txt
+?? .github/echo_files/bulk_file0003_copy1.txt
+?? .github/echo_files/bulk_file0003_copy2.txt
+?? .github/echo_files/bulk_file0004.txt
+?? .github/echo_files/bulk_file0004_copy1.txt
+?? .github/echo_files/bulk_file0004_copy2.txt
+?? .github/echo_files/bulk_file0005.txt
+?? .github/echo_files/bulk_file0005_copy1.txt
+?? .github/echo_files/bulk_file0005_copy2.txt
+?? .github/echo_files/bulk_file0006.txt
+?? .github/echo_files/bulk_file0006_copy1.txt
+?? .github/echo_files/bulk_file0006_copy2.txt
+?? .github/echo_files/bulk_file0007.txt
+?? .github/echo_files/bulk_file0007_copy1.txt
+?? .github/echo_files/bulk_file0007_copy2.txt
+?? .github/echo_files/bulk_file0008.txt
+?? .github/echo_files/bulk_file0008_copy1.txt
+?? .github/echo_files/bulk_file0008_copy2.txt
+?? .github/echo_files/bulk_file0009.txt
+?? .github/echo_files/bulk_file0009_copy1.txt
+?? .github/echo_files/bulk_file0009_copy2.txt
+?? .github/echo_files/bulk_file0010.txt
+?? .github/echo_files/bulk_file0010_copy1.txt
+?? .github/echo_files/bulk_file0010_copy2.txt
+?? .github/echo_files/bulk_file0011.txt
+?? .github/echo_files/bulk_file0011_copy1.txt
+?? .github/echo_files/bulk_file0011_copy2.txt
+?? .github/echo_files/bulk_file0012.txt
+?? .github/echo_files/bulk_file0012_copy1.txt
+?? .github/echo_files/bulk_file0012_copy2.txt
+?? .github/echo_files/bulk_file0013.txt
+?? .github/echo_files/bulk_file0013_copy1.txt
+?? .github/echo_files/bulk_file0013_copy2.txt
+?? .github/echo_files/bulk_file0014.txt
+?? .github/echo_files/bulk_file0014_copy1.txt
+?? .github/echo_files/bulk_file0014_copy2.txt
+?? .github/echo_files/bulk_file0015.txt
+?? .github/echo_files/bulk_file0015_copy1.txt
+?? .github/echo_files/bulk_file0015_copy2.txt
+?? .github/echo_files/bulk_file0016.txt
+?? .github/echo_files/bulk_file0016_copy1.txt
+?? .github/echo_files/bulk_file0016_copy2.txt
+?? .github/echo_files/bulk_file0017.txt
+?? .github/echo_files/bulk_file0017_copy1.txt
+?? .github/echo_files/bulk_file0017_copy2.txt
+?? .github/echo_files/bulk_file0018.txt
+?? .github/echo_files/bulk_file0018_copy1.txt
+?? .github/echo_files/bulk_file0018_copy2.txt
+?? .github/echo_files/bulk_file0019.txt
+?? .github/echo_files/bulk_file0019_copy1.txt
+?? .github/echo_files/bulk_file0019_copy2.txt
+?? .github/echo_files/bulk_file0020.txt
+?? .github/echo_files/bulk_file0020_copy1.txt
+?? .github/echo_files/bulk_file0020_copy2.txt
+?? .github/echo_files/bulk_file0021.txt
+?? .github/echo_files/bulk_file0021_copy1.txt
+?? .github/echo_files/bulk_file0021_copy2.txt
+?? .github/echo_files/bulk_file0022.txt
+?? .github/echo_files/bulk_file0022_copy1.txt
+?? .github/echo_files/bulk_file0022_copy2.txt
+?? .github/echo_files/bulk_file0023.txt
+?? .github/echo_files/bulk_file0023_copy1.txt
+?? .github/echo_files/bulk_file0023_copy2.txt
+?? .github/echo_files/bulk_file0024.txt
+?? .github/echo_files/bulk_file0024_copy1.txt
+?? .github/echo_files/bulk_file0024_copy2.txt
+?? .github/echo_files/bulk_file0025.txt
+?? .github/echo_files/bulk_file0025_copy1.txt
+?? .github/echo_files/bulk_file0025_copy2.txt
+?? .github/echo_files/bulk_file0026.txt
+?? .github/echo_files/bulk_file0026_copy1.txt
+?? .github/echo_files/bulk_file0026_copy2.txt
+?? .github/echo_files/bulk_file0027.txt
+?? .github/echo_files/bulk_file0027_copy1.txt
+?? .github/echo_files/bulk_file0027_copy2.txt
+?? .github/echo_files/bulk_file0028.txt
+?? .github/echo_files/bulk_file0028_copy1.txt
+?? .github/echo_files/bulk_file0028_copy2.txt
+?? .github/echo_files/bulk_file0029.txt
+?? .github/echo_files/bulk_file0029_copy1.txt
+?? .github/echo_files/bulk_file0029_copy2.txt
+?? .github/echo_files/bulk_file0030.txt
+?? .github/echo_files/bulk_file0030_copy1.txt
+?? .github/echo_files/bulk_file0030_copy2.txt
+?? .github/echo_files/bulk_file0031.txt
+?? .github/echo_files/bulk_file0031_copy1.txt
+?? .github/echo_files/bulk_file0031_copy2.txt
+?? .github/echo_files/bulk_file0032.txt
+?? .github/echo_files/bulk_file0032_copy1.txt
+?? .github/echo_files/bulk_file0032_copy2.txt
+?? .github/echo_files/bulk_file0033.txt
+?? .github/echo_files/bulk_file0033_copy1.txt
+?? .github/echo_files/bulk_file0033_copy2.txt
+?? .github/echo_files/bulk_file0034.txt
+?? .github/echo_files/bulk_file0034_copy1.txt
+?? .github/echo_files/bulk_file0034_copy2.txt
+?? .github/echo_files/bulk_file0035.txt
+?? .github/echo_files/bulk_file0035_copy1.txt
+?? .github/echo_files/bulk_file0035_copy2.txt
+?? .github/echo_files/bulk_file0036.txt
+?? .github/echo_files/bulk_file0036_copy1.txt
+?? .github/echo_files/bulk_file0036_copy2.txt
+?? .github/echo_files/bulk_file0037.txt
+?? .github/echo_files/bulk_file0037_copy1.txt
+?? .github/echo_files/bulk_file0037_copy2.txt
+?? .github/echo_files/bulk_file0038.txt
+?? .github/echo_files/bulk_file0038_copy1.txt
+?? .github/echo_files/bulk_file0038_copy2.txt
+?? .github/echo_files/bulk_file0039.txt
+?? .github/echo_files/bulk_file0039_copy1.txt
+?? .github/echo_files/bulk_file0039_copy2.txt
+?? .github/echo_files/bulk_file0040.txt
+?? .github/echo_files/bulk_file0040_copy1.txt
+?? .github/echo_files/bulk_file0040_copy2.txt
+?? .github/echo_files/bulk_file0041.txt
+?? .github/echo_files/bulk_file0041_copy1.txt
+?? .github/echo_files/bulk_file0041_copy2.txt
+?? .github/echo_files/bulk_file0042.txt
+?? .github/echo_files/bulk_file0042_copy1.txt
+?? .github/echo_files/bulk_file0042_copy2.txt
+?? .github/echo_files/bulk_file0043.txt
+?? .github/echo_files/bulk_file0043_copy1.txt
+?? .github/echo_files/bulk_file0043_copy2.txt
+?? .github/echo_files/bulk_file0044.txt
+?? .github/echo_files/bulk_file0044_copy1.txt
+?? .github/echo_files/bulk_file0044_copy2.txt
+?? .github/echo_files/bulk_file0045.txt
+?? .github/echo_files/bulk_file0045_copy1.txt
+?? .github/echo_files/bulk_file0045_copy2.txt
+?? .github/echo_files/bulk_file0046.txt
+?? .github/echo_files/bulk_file0046_copy1.txt
+?? .github/echo_files/bulk_file0046_copy2.txt
+?? .github/echo_files/bulk_file0047.txt
+?? .github/echo_files/bulk_file0047_copy1.txt
+?? .github/echo_files/bulk_file0047_copy2.txt
+?? .github/echo_files/bulk_file0048.txt
+?? .github/echo_files/bulk_file0048_copy1.txt
+?? .github/echo_files/bulk_file0048_copy2.txt
+?? .github/echo_files/bulk_file0049.txt
+?? .github/echo_files/bulk_file0049_copy1.txt
+?? .github/echo_files/bulk_file0049_copy2.txt
+?? .github/echo_files/bulk_file0050.txt
+?? .github/echo_files/bulk_file0050_copy1.txt
+?? .github/echo_files/bulk_file0050_copy2.txt
+?? .github/echo_files/bulk_file0051.txt
+?? .github/echo_files/bulk_file0051_copy1.txt
+?? .github/echo_files/bulk_file0051_copy2.txt
+?? .github/echo_files/bulk_file0052.txt
+?? .github/echo_files/bulk_file0052_copy1.txt
+?? .github/echo_files/bulk_file0052_copy2.txt
+?? .github/echo_files/bulk_file0053.txt
+?? .github/echo_files/bulk_file0053_copy1.txt
+?? .github/echo_files/bulk_file0053_copy2.txt
+?? .github/echo_files/bulk_file0054.txt
+?? .github/echo_files/bulk_file0054_copy1.txt
+?? .github/echo_files/bulk_file0054_copy2.txt
+?? .github/echo_files/bulk_file0055.txt
+?? .github/echo_files/bulk_file0055_copy1.txt
+?? .github/echo_files/bulk_file0055_copy2.txt
+?? .github/echo_files/bulk_file0056.txt
+?? .github/echo_files/bulk_file0056_copy1.txt
+?? .github/echo_files/bulk_file0056_copy2.txt
+?? .github/echo_files/bulk_file0057.txt
+?? .github/echo_files/bulk_file0057_copy1.txt
+?? .github/echo_files/bulk_file0057_copy2.txt
+?? .github/echo_files/bulk_file0058.txt
+?? .github/echo_files/bulk_file0058_copy1.txt
+?? .github/echo_files/bulk_file0058_copy2.txt
+?? .github/echo_files/bulk_file0059.txt
+?? .github/echo_files/bulk_file0059_copy1.txt
+?? .github/echo_files/bulk_file0059_copy2.txt
+?? .github/echo_files/bulk_file0060.txt
+?? .github/echo_files/bulk_file0060_copy1.txt
+?? .github/echo_files/bulk_file0060_copy2.txt
+?? .github/echo_files/bulk_file0061.txt
+?? .github/echo_files/bulk_file0061_copy1.txt
+?? .github/echo_files/bulk_file0061_copy2.txt
+?? .github/echo_files/bulk_file0062.txt
+?? .github/echo_files/bulk_file0062_copy1.txt
+?? .github/echo_files/bulk_file0062_copy2.txt
+?? .github/echo_files/bulk_file0063.txt
+?? .github/echo_files/bulk_file0063_copy1.txt
+?? .github/echo_files/bulk_file0063_copy2.txt
+?? .github/echo_files/bulk_file0064.txt
+?? .github/echo_files/bulk_file0064_copy1.txt
+?? .github/echo_files/bulk_file0064_copy2.txt
+?? .github/echo_files/bulk_file0065.txt
+?? .github/echo_files/bulk_file0065_copy1.txt
+?? .github/echo_files/bulk_file0065_copy2.txt
+?? .github/echo_files/bulk_file0066.txt
+?? .github/echo_files/bulk_file0066_copy1.txt
+?? .github/echo_files/bulk_file0066_copy2.txt
+?? .github/echo_files/bulk_file0067.txt
+?? .github/echo_files/bulk_file0067_copy1.txt
+?? .github/echo_files/bulk_file0067_copy2.txt
+?? .github/echo_files/bulk_file0068.txt
+?? .github/echo_files/bulk_file0068_copy1.txt
+?? .github/echo_files/bulk_file0068_copy2.txt
+?? .github/echo_files/bulk_file0069.txt
+?? .github/echo_files/bulk_file0069_copy1.txt
+?? .github/echo_files/bulk_file0069_copy2.txt
+?? .github/echo_files/bulk_file0070.txt
+?? .github/echo_files/bulk_file0070_copy1.txt
+?? .github/echo_files/bulk_file0070_copy2.txt
+?? .github/echo_files/bulk_file0071.txt
+?? .github/echo_files/bulk_file0071_copy1.txt
+?? .github/echo_files/bulk_file0071_copy2.txt
+?? .github/echo_files/bulk_file0072.txt
+?? .github/echo_files/bulk_file0072_copy1.txt
+?? .github/echo_files/bulk_file0072_copy2.txt
+?? .github/echo_files/bulk_file0073.txt
+?? .github/echo_files/bulk_file0073_copy1.txt
+?? .github/echo_files/bulk_file0073_copy2.txt
+?? .github/echo_files/bulk_file0074.txt
+?? .github/echo_files/bulk_file0074_copy1.txt
+?? .github/echo_files/bulk_file0074_copy2.txt
+?? .github/echo_files/bulk_file0075.txt
+?? .github/echo_files/bulk_file0075_copy1.txt
+?? .github/echo_files/bulk_file0075_copy2.txt
+?? .github/echo_files/bulk_file0076.txt
+?? .github/echo_files/bulk_file0076_copy1.txt
+?? .github/echo_files/bulk_file0076_copy2.txt
+?? .github/echo_files/bulk_file0077.txt
+?? .github/echo_files/bulk_file0077_copy1.txt
+?? .github/echo_files/bulk_file0077_copy2.txt
+?? .github/echo_files/bulk_file0078.txt
+?? .github/echo_files/bulk_file0078_copy1.txt
+?? .github/echo_files/bulk_file0078_copy2.txt
+?? .github/echo_files/bulk_file0079.txt
+?? .github/echo_files/bulk_file0079_copy1.txt
+?? .github/echo_files/bulk_file0079_copy2.txt
+?? .github/echo_files/bulk_file0080.txt
+?? .github/echo_files/bulk_file0080_copy1.txt
+?? .github/echo_files/bulk_file0080_copy2.txt
+?? .github/echo_logs/bulk_modify_changes.txt
+?? .github/echo_logs/pg_test.txt
+?? .github/echo_logs/vibe-20251011204327.log
+?? .github/echo_logs/vibe-20251011204706.log
+?? .github/echo_logs/vibe-20251011204707.log
+?? .github/echo_logs/vibe-20251011204717.log
+?? .github/echo_logs/vibe-20251011204720.log
+?? .github/echo_logs/vibe-20251011204739.log
+?? .github/echo_logs/vibe-20251011204742.log
+?? .github/scripts/
+?? .gitignore
+?? bulk_README.md
+?? bulk_README_copy1.md
+?? bulk_README_copy2.md
+?? docs/adr/bulk_0001-adopt-vibe-coding.md
+?? docs/adr/bulk_0001-adopt-vibe-coding_copy1.md
+?? docs/adr/bulk_0001-adopt-vibe-coding_copy2.md
+?? docs/api/bulk_openapi-notes.md
+?? docs/api/bulk_openapi-notes_copy1.md
+?? docs/api/bulk_openapi-notes_copy2.md
