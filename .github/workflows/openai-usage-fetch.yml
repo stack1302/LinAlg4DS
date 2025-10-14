@@ -1,9 +1,10 @@
-# .github/workflows/openai-usage-fetch.yml
-name: "📊 OpenAI Usage Fetcher + CSV (Echo/Robust + Continue)"
+# .github/workflows/openai-usage-mega.yml
+name: "📊 OpenAI Usage MEGA (Echo/Continue + Bulk Gen/Download + Demo Fallback)"
 
 on:
   workflow_dispatch:
     inputs:
+      # ==== 기간/필터 ====
       start_kst:
         description: "조회 시작 (KST) 예: 2025-10-13 00:00:00"
         required: false
@@ -17,9 +18,9 @@ on:
         required: false
         default: "1d"
       categories_csv:
-        description: "카테고리 CSV (예: completions,images,audio,embeddings,moderations)"
+        description: "카테고리 CSV"
         required: false
-        default: "completions,images,audio,embeddings,moderations"
+        default: "completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions"
       models_csv:
         description: "특정 모델만(콤마구분, 비우면 전체)"
         required: false
@@ -37,32 +38,67 @@ on:
         required: false
         default: ""
 
+      # ==== 대량 생성 ====
+      dirs:
+        description: "대량 디렉토리: root=경로,count=숫자 (예: root=.github/echo_dirs,count=500)"
+        required: false
+        default: "root=.github/echo_dirs,count=200"
+      files:
+        description: "대량 파일: root=경로,count=숫자,ext=.txt (예: root=.github/echo_files,count=500,ext=.log)"
+        required: false
+        default: "root=.github/echo_files,count=500,ext=.txt"
+
+      # ==== 대량 다운로드 ====
+      download_manifest:
+        description: "다운로드 URL 목록(줄바꿈 구분). 비면 스킵"
+        required: false
+        default: ""
+      parallel:
+        description: "동시 다운로드 연결수 (aria2)"
+        required: false
+        default: "8"
+
+      # ==== 데모 모드 ====
+      demo_mode:
+        type: boolean
+        description: "API 키 없어도 샘플 Usage JSON 자동 생성"
+        required: false
+        default: true
+
+  # 필요 시 5분 주기 실행
+  # schedule:
+  #   - cron: "*/5 * * * *"
+
 env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
   OUT_DIR: .github/usage_out
+  DL_DIR: .github/echo_downloads
+  GEN_DIR: .github/echo_gen
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
   USAGE_BASE: "https://api.openai.com/v1/organization/usage"
 
 jobs:
-  fetch-usage:
+  run:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prep echo helpers (with continue-safe)
+      - name: Prep echo helpers (continue-safe)
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${OUT_DIR}"
+          mkdir -p "${LOG_DIR}" "${OUT_DIR}" "${DL_DIR}" "${GEN_DIR}"
           ERR_LOG="${LOG_DIR}/errors-$(date +%Y%m%d%H%M%S).log"
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Eeuo pipefail
           : "${LOG_DIR:=.github/echo_logs}"
           : "${OUT_DIR:=.github/usage_out}"
+          : "${DL_DIR:=.github/echo_downloads}"
+          : "${GEN_DIR:=.github/echo_gen}"
           : "${ECHO_OK:=OK}" ; : "${ECHO_WARN:=WARN}" ; : "${ECHO_FAIL:=FAIL}"
           ERR_LOG="${LOG_DIR}/errors-current.log"
 
@@ -71,13 +107,9 @@ jobs:
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           run(){   printf '▶ %s\n' "$*"; eval "$@"; }
 
-          # try_run: 실패해도 종료하지 않고 에러 로그에 누적
           try_run(){
             printf '▶ %s\n' "$*"
-            set +e
-            eval "$@"
-            rc=$?
-            set -e
+            set +e; eval "$@"; rc=$?; set -e
             if [ $rc -ne 0 ]; then
               fail "rc=${rc} :: $*"
               { printf '[%s] rc=%s %s\n' "$(date +%F' '%T)" "$rc" "$*"; } >> "${ERR_LOG}"
@@ -87,18 +119,21 @@ jobs:
             return 0
           }
 
-          # try_curl: HTTP 코드와 rc 동시 체크(실패해도 계속)
+          # try_curl: url, outputPath, extra curl args...
           try_curl(){
             url="$1"; shift
-            printf '▶ curl %s\n' "$url"
+            out="$1"; shift
+            printf '▶ curl %s -> %s\n' "$url" "$out"
             set +e
-            HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$@" "$url")
+            HTTP_CODE=$(curl -fsS -w "%{http_code}" -o "$out.tmp" "$url" "$@")
             rc=$?
             set -e
-            if [ $rc -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
-              fail "curl rc=${rc} http=${HTTP_CODE} url=${url}"
-              { printf '[%s] curl rc=%s http=%s %s\n' "$(date +%F' '%T)" "$rc" "$HTTP_CODE" "$url"; } >> "${ERR_LOG}"
+            if [ $rc -ne 0 ] || [ "${HTTP_CODE:-000}" -ge 400 ]; then
+              fail "curl rc=${rc} http=${HTTP_CODE:-000} url=${url}"
+              mv "$out.tmp" "$out.err" 2>/dev/null || true
+              { printf '[%s] curl rc=%s http=%s %s\n' "$(date +%F' '%T)" "$rc" "${HTTP_CODE:-000}" "$url"; } >> "${ERR_LOG}"
             else
+              mv "$out.tmp" "$out"
               echoe "curl ok (http=${HTTP_CODE})"
             fi
             return 0
@@ -108,58 +143,101 @@ jobs:
           printf '' > "${ERR_LOG}"
           SH
           chmod +x /tmp/echo_helpers.sh
-          # 현재 실행에서 사용할 에러 파일명을 고정 링크로 유지
           ln -sf "$(basename "$ERR_LOG")" "${LOG_DIR}/errors-current.log" || true
           source /tmp/echo_helpers.sh
-          echoe "Helpers ready: errors → ${LOG_DIR}/errors-current.log"
+          echoe "Helpers ready: ${LOG_DIR}/errors-current.log"
 
-      - name: Sanity check secrets (continue-safe)
+      - name: Sanity + Tools (continue-safe)
         shell: bash
         env:
           HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
         run: |
           source /tmp/echo_helpers.sh
           if [ "${HAS_KEY}" != "true" ]; then
-            fail "OPENAI_API_KEY secret이 필요합니다. (계속 진행은 하지만 API 호출은 실패할 수 있음)"
-            # 계속 진행
+            fail "OPENAI_API_KEY secret 미설정 (데모 모드가 켜져 있으면 샘플 생성)"
           else
             echoe "OPENAI_API_KEY 확인"
           fi
-          if [ -n "${{ secrets.OPENAI_ORG_ID }}" ]; then
-            echoe "OPENAI_ORG_ID 감지됨(선택값)"
-          else
-            warn "OPENAI_ORG_ID 미설정"
-          fi
+          [ -n "${{ secrets.OPENAI_ORG_ID }}" ] && echoe "OPENAI_ORG_ID 감지" || warn "OPENAI_ORG_ID 미설정"
 
-      - name: Install jq (continue-safe)
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
           try_run sudo apt-get update -y
-          try_run sudo apt-get install -y jq
+          try_run sudo apt-get install -y jq aria2
 
-      - name: Resolve time window (KST -> UTC ISO8601)
+      - name: Resolve time window (KST → UTC)
         id: when
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          set -Eeuo pipefail
           START_KST="${{ github.event.inputs.start_kst }}"
           END_KST="${{ github.event.inputs.end_kst }}"
           if [ -z "$START_KST" ] || [ -z "$END_KST" ]; then
-            warn "입력 시간 미지정 → 기본: 어제 00:00:00 ~ 오늘 23:59:59 (KST)"
+            warn "기간 미지정 → 어제 00:00:00 ~ 오늘 23:59:59 (KST)"
             START_KST="$(date -d 'yesterday 00:00:00' +'%Y-%m-%d %H:%M:%S')"
             END_KST="$(date -d 'today 23:59:59' +'%Y-%m-%d %H:%M:%S')"
           fi
-          echo "start_kst=$START_KST" >> $GITHUB_OUTPUT
-          echo "end_kst=$END_KST" >> $GITHUB_OUTPUT
           START_UTC="$(TZ=UTC date -d "$START_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
           END_UTC="$(TZ=UTC date -d "$END_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "start_kst=$START_KST" >> $GITHUB_OUTPUT
+          echo "end_kst=$END_KST" >> $GITHUB_OUTPUT
           echo "start_utc=$START_UTC" >> $GITHUB_OUTPUT
           echo "end_utc=$END_UTC" >> $GITHUB_OUTPUT
           echoe "KST ${START_KST} ~ ${END_KST} → UTC ${START_UTC} ~ ${END_UTC}"
 
-      - name: Fetch usage (multi-category, continue-safe)
+      - name: Bulk directory generation (continue-safe)
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          CFG="${{ github.event.inputs.dirs }}"
+          ROOT="$(awk -F, '{for(i=1;i<=NF;i++){if($i~ /^root=/){split($i,a,"=");print a[2]}}}' <<< "$CFG")"
+          COUNT="$(awk -F, '{for(i=1;i<=NF;i++){if($i~ /^count=/){split($i,a,"=");print a[2]}}}' <<< "$CFG")"
+          : "${ROOT:=.github/echo_dirs}"
+          : "${COUNT:=200}"
+          echoe "디렉토리 생성: root=${ROOT}, count=${COUNT}"
+          try_run mkdir -p "$ROOT"
+          for i in $(seq -w 1 "$COUNT"); do
+            try_run mkdir -p "${ROOT}/dir_${i}"
+            echo "created: ${ROOT}/dir_${i}" >> "${GEN_DIR}/dirs.list"
+          done
+          echoe "총 $(wc -l < "${GEN_DIR}/dirs.list" 2>/dev/null || echo 0)개 디렉토리 생성"
+
+      - name: Bulk file generation (continue-safe)
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          CFG="${{ github.event.inputs.files }}"
+          ROOT="$(awk -F, '{for(i=1;i<=NF;i++){if($i~ /^root=/){split($i,a,"=");print a[2]}}}' <<< "$CFG")"
+          COUNT="$(awk -F, '{for(i=1;i<=NF;i++){if($i~ /^count=/){split($i,a,"=");print a[2]}}}' <<< "$CFG")"
+          EXT="$(awk -F, '{for(i=1;i<=NF;i++){if($i~ /^ext=/){split($i,a,"=");print a[2]}}}' <<< "$CFG")"
+          : "${ROOT:=.github/echo_files}"
+          : "${COUNT:=500}"
+          : "${EXT:=.txt}"
+          echoe "파일 생성: root=${ROOT}, count=${COUNT}, ext=${EXT}"
+          try_run mkdir -p "$ROOT"
+          for i in $(seq -w 1 "$COUNT"); do
+            f="${ROOT}/file_${i}${EXT}"
+            printf 'idx=%s time=%s\n' "$i" "$(date -Iseconds)" > "$f" || true
+            echo "$f" >> "${GEN_DIR}/files.list"
+          done
+          echoe "총 $(wc -l < "${GEN_DIR}/files.list" 2>/dev/null || echo 0)개 파일 생성"
+
+      - name: Bulk download (aria2, continue-safe)
+        shell: bash
+        env:
+          PAR: ${{ github.event.inputs.parallel }}
+        run: |
+          source /tmp/echo_helpers.sh
+          MAN="${{ github.event.inputs.download_manifest }}"
+          if [ -z "$MAN" ]; then
+            warn "download_manifest 비어있음 → 스킵"
+            exit 0
+          fi
+          LIST="${DL_DIR}/urls.txt"
+          printf '%s\n' "$MAN" | sed '/^\s*$/d' > "$LIST"
+          echoe "다운로드 URL 수: $(wc -l < "$LIST") (병렬:${PAR:-8})"
+          # aria2: 각 파일당 4연결, 전체 PAR 동시 다운로드
+          try_run aria2c -x4 -s4 -j "${PAR:-8}" -i "$LIST" -d "$DL_DIR"
+
+      - name: Fetch OpenAI usage (continue-safe + backoff)
         id: fetch
         shell: bash
         env:
@@ -177,61 +255,86 @@ jobs:
           mkdir -p "${OUT_DIR}"
           START_UTC="${{ steps.when.outputs.start_utc }}"
           END_UTC="${{ steps.when.outputs.end_utc }}"
-          : "${CATEGORIES_CSV:=completions,images,audio,embeddings,moderations}"
-
-          # 공통 QS(표시는 하되, 개별 --data-urlencode로 넘김)
-          QS="start_time=${START_UTC}&end_time=${END_UTC}&interval=${INTERVAL}"
-          [ -n "$MODELS_CSV" ]   && QS="${QS}&models=${MODELS_CSV}"
-          [ -n "$PROJECTS_CSV" ] && QS="${QS}&project_ids=${PROJECTS_CSV}"
-          [ -n "$USERS_CSV" ]    && QS="${QS}&user_ids=${USERS_CSV}"
-          [ -n "$EXTRA_QUERY" ]  && QS="${QS}&${EXTRA_QUERY}"
-          echoe "QueryString: $QS"
+          : "${CATEGORIES_CSV:=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions}"
 
           IFS=',' read -ra CATS <<< "$CATEGORIES_CSV"
           : > "${OUT_DIR}/_index.jsonl"
+
+          # 공통 파라미터
+          QS=( --data-urlencode "start_time=${START_UTC}"
+               --data-urlencode "end_time=${END_UTC}"
+               --data-urlencode "interval=${INTERVAL}" )
+          [ -n "$MODELS_CSV" ]   && QS+=( --data-urlencode "models=${MODELS_CSV}" )
+          [ -n "$PROJECTS_CSV" ] && QS+=( --data-urlencode "project_ids=${PROJECTS_CSV}" )
+          [ -n "$USERS_CSV" ]    && QS+=( --data-urlencode "user_ids=${USERS_CSV}" )
+
           for cat in "${CATS[@]}"; do
-            cat_trim="$(echo "$cat" | xargs)"
-            [ -z "$cat_trim" ] && continue
+            cat_trim="$(echo "$cat" | xargs)"; [ -z "$cat_trim" ] && continue
             url="${USAGE_BASE}/${cat_trim}"
             out_json="${OUT_DIR}/${cat_trim}.json"
 
-            # curl은 실패해도 다음 카테고리로 넘어감
-            set +e
-            if [ -n "${OPENAI_ORG_ID:-}" ]; then
-              HDR_ORG=(-H "OpenAI-Organization: ${OPENAI_ORG_ID}")
-            else
-              HDR_ORG=()
-            fi
-            HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$out_json.tmp" -G "$url" \
-              -H "Authorization: Bearer ${OPENAI_API_KEY:-dummy}" \
-              "${HDR_ORG[@]}" \
-              --data-urlencode "start_time=${START_UTC}" \
-              --data-urlencode "end_time=${END_UTC}" \
-              --data-urlencode "interval=${INTERVAL}" \
-              --data-urlencode "models=${MODELS_CSV}" \
-              --data-urlencode "project_ids=${PROJECTS_CSV}" \
-              --data-urlencode "user_ids=${USERS_CSV}")
-            rc=$?
-            set -e
+            # 3회 백오프 재시도
+            ok=0; for attempt in 1 2 3; do
+              set +e
+              if [ -n "${OPENAI_ORG_ID:-}" ]; then HDR_ORG=(-H "OpenAI-Organization: ${OPENAI_ORG_ID}"); else HDR_ORG=(); fi
+              HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$out_json.tmp" -G "$url" \
+                -H "Authorization: Bearer ${OPENAI_API_KEY:-dummy}" \
+                "${HDR_ORG[@]}" "${QS[@]}")
+              rc=$?
+              set -e
+              if [ $rc -eq 0 ] && [ "$HTTP_CODE" -lt 400 ]; then
+                mv "$out_json.tmp" "$out_json"
+                ok=1; break
+              fi
+              warn "cat=${cat_trim} 실패(rc=$rc http=$HTTP_CODE) 재시도(${attempt}/3)"
+              sleep $((attempt*2))
+            done
 
-            if [ $rc -ne 0 ] || [ "$HTTP_CODE" -ge 400 ]; then
-              fail "fetch 실패(cat=${cat_trim}) rc=$rc http=$HTTP_CODE"
+            if [ $ok -eq 1 ]; then
+              if jq -e . >/dev/null 2>&1 < "$out_json"; then
+                echoe "JSON OK: ${out_json}"
+                printf '%s\t%s\n' "$cat_trim" "$out_json" >> "${OUT_DIR}/_index.jsonl"
+              else
+                warn "JSON 파싱 실패: ${out_json} → .raw 보존"
+                mv "$out_json" "${out_json}.raw" || true
+                printf '%s\t%s\n' "$cat_trim" "${out_json}.raw" >> "${OUT_DIR}/_index.jsonl"
+              fi
+            else
+              fail "fetch 최종 실패(cat=${cat_trim})"
               mv "$out_json.tmp" "$out_json.err" 2>/dev/null || true
               printf '%s\t%s\n' "$cat_trim" "$out_json.err" >> "${OUT_DIR}/_index.jsonl"
-              continue
-            fi
-            mv "$out_json.tmp" "$out_json"
-
-            # JSON 검증(실패해도 계속)
-            if jq -e . >/dev/null 2>&1 < "$out_json"; then
-              echoe "JSON OK: ${out_json}"
-              printf '%s\t%s\n' "$cat_trim" "$out_json" >> "${OUT_DIR}/_index.jsonl"
-            else
-              warn "JSON 파싱 실패: ${out_json} → .raw로 보존"
-              mv "$out_json" "${out_json}.raw" || true
-              printf '%s\t%s\n' "$cat_trim" "${out_json}.raw" >> "${OUT_DIR}/_index.jsonl"
             fi
           done
+
+      - name: DEMO fallback (no key or all failed → synthesize)
+        if: ${{ inputs.demo_mode }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          # 성공 파일 개수 확인
+          ok_cnt=$(awk '{print $2}' "${OUT_DIR}/_index.jsonl" | grep -E '\.json$' | wc -l || true)
+          if [ -n "${{ secrets.OPENAI_API_KEY }}" ] && [ "$ok_cnt" -gt 0 ]; then
+            echoe "실제 데이터가 존재 → 데모 스킵"
+            exit 0
+          fi
+
+          warn "DEMO MODE: 샘플 Usage JSON 생성"
+          START_UTC="${{ steps.when.outputs.start_utc }}"
+          END_UTC="${{ steps.when.outputs.end_utc }}"
+          DAY=$(date -u +%Y-%m-%dT00:00:00Z)
+
+          gen_one(){
+            cat="$1"; out="${OUT_DIR}/${cat}.json"
+            jq -n --arg t "$DAY" '{
+              "data":[
+                {"timestamp":$t,"model":"o4-mini","n_requests":12,"input_tokens":3400,"output_tokens":2100,"cost_usd":0.85},
+                {"timestamp":$t,"model":"gpt-4o","n_requests":5,"input_tokens":900,"output_tokens":700,"cost_usd":0.42}
+              ]
+            }' > "$out"
+            printf '%s\t%s\n' "$cat" "$out" >> "${OUT_DIR}/_index.jsonl"
+          }
+          for c in completions images audio embeddings moderations; do gen_one "$c"; done
+          echoe "샘플 파일 생성 완료"
 
       - name: Build CSV summary (best-effort, continue-safe)
         shell: bash
@@ -244,7 +347,6 @@ jobs:
           while IFS=$'\t' read -r cat fpath; do
             [ -z "$cat" ] && continue
             [ ! -s "$fpath" ] && { warn "빈 파일: $fpath"; continue; }
-            # 변환 실패해도 다음 행/파일로 계속
             set +e
             jq -r --arg C "$cat" '
               (.data // [])[] |
@@ -255,46 +357,44 @@ jobs:
                 (.n_requests // .requests // ""),
                 (.input_tokens // .prompt_tokens // ""),
                 (.output_tokens // .completion_tokens // ""),
-                (
-                  if (.total_tokens) then .total_tokens
-                  else ((.input_tokens // .prompt_tokens // 0) + (.output_tokens // .completion_tokens // 0))
-                  end
-                ),
+                (if .total_tokens then .total_tokens
+                 else ((.input_tokens // .prompt_tokens // 0) + (.output_tokens // .completion_tokens // 0)) end),
                 (.cost_usd // .cost // "")
               ] | @csv
             ' "$fpath" >> "$CSV"
             rc=$?
             set -e
-            if [ $rc -ne 0 ]; then
-              fail "CSV 변환 실패: $fpath"
-            fi
+            [ $rc -ne 0 ] && fail "CSV 변환 실패: $fpath" || true
           done < "${OUT_DIR}/_index.jsonl"
 
+          echoe "CSV summary ready → ${CSV}"
           ls -al "${OUT_DIR}" || true
-          echoe "CSV summary (best-effort) → ${CSV}"
 
       - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openai-usage-${{ github.run_id }}
+          name: openai-usage-mega-${{ github.run_id }}
           path: |
             .github/usage_out/**
             .github/echo_logs/**
+            .github/echo_downloads/**
+            .github/echo_gen/**
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Job summary (always, with error dump)
+      - name: Job summary (always)
         if: always()
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          echo "## OpenAI Usage Fetch Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## OpenAI Usage MEGA Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 기간 (KST): ${{ steps.when.outputs.start_kst }} ~ ${{ steps.when.outputs.end_kst }}" >> $GITHUB_STEP_SUMMARY
           echo "- 기간 (UTC): ${{ steps.when.outputs.start_utc }} ~ ${{ steps.when.outputs.end_utc }}" >> $GITHUB_STEP_SUMMARY
           echo "- 간격: ${{ github.event.inputs.interval }}" >> $GITHUB_STEP_SUMMARY
           echo "- 카테고리: ${{ github.event.inputs.categories_csv }}" >> $GITHUB_STEP_SUMMARY
+          echo "- DEMO_MODE: ${{ github.event.inputs.demo_mode }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -s "${OUT_DIR}/usage_summary.csv" ]; then
             echo "### CSV 샘플(상위 20행)" >> $GITHUB_STEP_SUMMARY
@@ -305,11 +405,11 @@ jobs:
           fi
           if [ -s "${LOG_DIR}/errors-current.log" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### 오류 로그 (최근 실행)" >> $GITHUB_STEP_SUMMARY
+            echo "### 오류 로그 (최근 실행 200줄)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             sed 's/^/    /' "${LOG_DIR}/errors-current.log" | head -n 200 >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "_전체 오류 전문은 Artifacts의 logs 참조_" >> $GITHUB_STEP_SUMMARY
+            echo "_전체 로그/원본은 Artifacts 참고_" >> $GITHUB_STEP_SUMMARY
           else
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "오류 없음 🎉" >> $GITHUB_STEP_SUMMARY
