@@ -4,48 +4,40 @@ name: "📊 OpenAI Usage MEGA (≤10 inputs, Random Date + Echo/Continue)"
 on:
   workflow_dispatch:
     inputs:
-      # 1) 기간 모드: manual | random
       date_mode:
         type: choice
         description: "기간 모드"
         options: ["manual", "random"]
         required: true
         default: "manual"
-      # 2) 기간 스펙
-      # - manual 예: "2025-10-13 00:00:00..2025-10-14 23:59:59"  (KST, 양끝 포함)
-      # - random 예: "days=1..7,within=365"  → 최근 365일 안에서 길이 1~7일 임의 범위
+      # manual: "YYYY-MM-DD HH:MM:SS..YYYY-MM-DD HH:MM:SS" (KST)
+      # random: "days=1..7,within=365"
       date_span:
         description: "기간 스펙 (manual/random 형식)"
         required: false
         default: ""
-      # 3) API 집계 간격
       interval:
         description: "집계 간격 (1m|1h|1d)"
         required: false
         default: "1d"
-      # 4) 질의 구성(카테고리/필터/추가쿼리 통합)
-      #   예) "categories=completions,images,audio,embeddings,moderations;models=o4-mini,gpt-4o;projects=proj_x,proj_y;users=user_a;extra=foo=bar&x=y"
+      # 예) "categories=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions;models=o4-mini,gpt-4o;projects=proj_x;users=user_a;extra=foo=bar&x=y"
       query_cfg:
         description: "쿼리 구성 문자열"
         required: false
         default: "categories=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions"
-      # 5) 대량 생성 구성(디렉토리/파일 통합)
-      #   예) "dirs_root=.github/echo_dirs,dirs_count=200;files_root=.github/echo_files,files_count=500,files_ext=.txt"
+      # 예) "dirs_root=.github/echo_dirs,dirs_count=200;files_root=.github/echo_files,files_count=500,files_ext=.txt"
       bulk_cfg:
         description: "대량 생성 구성"
         required: false
         default: "dirs_root=.github/echo_dirs,dirs_count=200;files_root=.github/echo_files,files_count=500,files_ext=.txt"
-      # 6) 대량 다운로드 URL 목록(줄바꿈 구분)
       download_manifest:
         description: "다운로드 URL 목록 (줄바꿈 구분)"
         required: false
         default: ""
-      # 7) 병렬 다운로드 연결 수
       parallel:
         description: "동시 다운로드(aria2) 연결 수"
         required: false
         default: "8"
-      # 8) 데모 모드: 키가 없거나 조회 실패 시 샘플 JSON 생성
       demo_mode:
         type: boolean
         description: "API 키 없어도 샘플 Usage JSON 생성"
@@ -88,7 +80,17 @@ jobs:
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
           run(){   printf '▶ %s\n' "$*"; eval "$@"; }
-          try_run(){ printf '▶ %s\n' "$*"; set +e; eval "$@"; rc=$?; set -e; if [ $rc -ne 0 ]; then fail "rc=${rc} :: $*"; printf '[%s] rc=%s %s\n' "$(date +%F' '%T)" "$rc" "$*" >> "${ERR_LOG}"; else echoe "ok"; fi; }
+          try_run(){
+            printf '▶ %s\n' "$*"
+            set +e; eval "$@"; rc=$?; set -e
+            if [ $rc -ne 0 ]; then
+              fail "rc=${rc} :: $*"
+              { printf '[%s] rc=%s %s\n' "$(date +%F' '%T)" "$rc" "$*"; } >> "${ERR_LOG}"
+            else
+              echoe "ok"
+            fi
+            return 0
+          }
           export -f echoe warn fail run try_run
           printf '' > "${ERR_LOG}"
           SH
@@ -98,6 +100,7 @@ jobs:
           echoe "Helpers ready: ${LOG_DIR}/errors-current.log"
 
       - name: Sanity + Tools (continue-safe)
+        continue-on-error: true
         shell: bash
         env:
           HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
@@ -112,23 +115,35 @@ jobs:
           try_run sudo apt-get update -y
           try_run sudo apt-get install -y jq aria2 coreutils
 
-      - name: Resolve time window (manual/random → KST & UTC)
+      - name: Resolve time window (manual/random → KST & UTC)  # <-- 버그 수정됨
         id: when
+        continue-on-error: true
         shell: bash
         run: |
+          # set -e는 GitHub가 걸어두므로, 내부에서 실패하지 않게 조심
           source /tmp/echo_helpers.sh
           MODE="${{ github.event.inputs.date_mode }}"
           SPAN="${{ github.event.inputs.date_span }}"
           INTERVAL="${{ github.event.inputs.interval }}"
 
+          # 안전 함수
           to_iso_kst(){ date -d "$1" +'%Y-%m-%d %H:%M:%S'; }
 
           if [ "$MODE" = "manual" ]; then
-            # 형식: "YYYY-MM-DD HH:MM:SS..YYYY-MM-DD HH:MM:SS"
-            if [[ "$SPAN" =~ ^[^.]+[.][.][^.]+'?$ ]]; then
-              START_KST="$(to_iso_kst "$(printf '%s' "$SPAN" | awk -F'\\.\\.' '{print $1}')")"
-              END_KST="$(to_iso_kst "$(printf '%s' "$SPAN" | awk -F'\\.\\.' '{print $2}')")"
-            else
+            # 구분자 '..' 존재하면 수동 파싱
+            if printf '%s' "$SPAN" | grep -q '\.\.'; then
+              START_KST_RAW="$(printf '%s' "$SPAN" | awk -F'\\.\\.' '{print $1}')"
+              END_KST_RAW="$(printf '%s' "$SPAN" | awk -F'\\.\\.' '{print $2}')"
+              if [ -n "$START_KST_RAW" ] && [ -n "$END_KST_RAW" ]; then
+                START_KST="$(to_iso_kst "$START_KST_RAW")"
+                END_KST="$(to_iso_kst "$END_KST_RAW")"
+              else
+                warn "manual 형식 불완전 → 기본값 사용"
+              fi
+            fi
+
+            # 기본값 보정
+            if [ -z "${START_KST:-}" ] || [ -z "${END_KST:-}" ]; then
               warn "manual 형식 미지정 → 어제 00:00:00..오늘 23:59:59 (KST)"
               START_KST="$(date -d 'yesterday 00:00:00' +'%Y-%m-%d %H:%M:%S')"
               END_KST="$(date -d 'today 23:59:59' +'%Y-%m-%d %H:%M:%S')"
@@ -137,16 +152,25 @@ jobs:
             # MODE = random
             # 예) "days=1..7,within=365"
             DAYS_MIN=1; DAYS_MAX=7; WITHIN=365
-            [[ "$SPAN" =~ days=([0-9]+)[.][.]([0-9]+) ]] && DAYS_MIN="${BASH_REMATCH[1]}" && DAYS_MAX="${BASH_REMATCH[2]}"
-            [[ "$SPAN" =~ within=([0-9]+) ]] && WITHIN="${BASH_REMATCH[1]}"
+            # 안전 파서(정규식 미사용)
+            if printf '%s' "$SPAN" | grep -q 'days='; then
+              DAYS_RANGE="$(printf '%s' "$SPAN" | tr ',' '\n' | awk -F= '$1=="days"{print $2}')"
+              # 1..7 형태
+              if printf '%s' "$DAYS_RANGE" | grep -q '\.\.'; then
+                DAYS_MIN="$(printf '%s' "$DAYS_RANGE" | awk -F'\\.\\.' '{print $1}')"
+                DAYS_MAX="$(printf '%s' "$DAYS_RANGE" | awk -F'\\.\\.' '{print $2}')"
+              fi
+            fi
+            if printf '%s' "$SPAN" | grep -q 'within='; then
+              WITHIN="$(printf '%s' "$SPAN" | tr ',' '\n' | awk -F= '$1=="within"{print $2}')"
+            fi
 
-            # 랜덤 길이/오프셋
+            # 랜덤 길이/오프셋 (coreutils: shuf 사용)
             rand(){ shuf -i "$1"-"$2" -n 1; }
-            LEN=$(rand "$DAYS_MIN" "$DAYS_MAX")
-            # 종료일을 KST 기준 최근 WITHIN일 내 임의 날짜의 23:59:59로
-            OFF=$(rand 0 "$WITHIN")
+            LEN=$(rand "${DAYS_MIN:-1}" "${DAYS_MAX:-7}")
+            OFF=$(rand 0 "${WITHIN:-365}")
+
             END_KST="$(date -d "$OFF days ago 23:59:59" +'%Y-%m-%d %H:%M:%S')"
-            # 시작일은 LEN-1일 전 00:00:00
             START_KST="$(date -d "$OFF days ago -$((LEN-1)) days 00:00:00" +'%Y-%m-%d %H:%M:%S')"
             echoe "Random window: len=${LEN}d within=${WITHIN}d offset=${OFF}d"
           fi
@@ -154,15 +178,18 @@ jobs:
           START_UTC="$(TZ=UTC date -d "$START_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
           END_UTC="$(TZ=UTC date -d "$END_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
 
-          echo "start_kst=$START_KST" >> $GITHUB_OUTPUT
-          echo "end_kst=$END_KST" >> $GITHUB_OUTPUT
-          echo "start_utc=$START_UTC" >> $GITHUB_OUTPUT
-          echo "end_utc=$END_UTC" >> $GITHUB_OUTPUT
+          {
+            echo "start_kst=$START_KST"
+            echo "end_kst=$END_KST"
+            echo "start_utc=$START_UTC"
+            echo "end_utc=$END_UTC"
+          } >> "$GITHUB_OUTPUT"
 
           echoe "KST ${START_KST} ~ ${END_KST} → UTC ${START_UTC} ~ ${END_UTC} (interval=${INTERVAL})"
 
       - name: Parse query_cfg (categories/filters/extra)
         id: q
+        continue-on-error: true
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -174,11 +201,13 @@ jobs:
           USERS="$(parse_val users || true)"
           EXTRA="$(parse_val extra || true)"
           : "${CATEGORIES:=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions}"
-          echo "categories=$CATEGORIES" >> $GITHUB_OUTPUT
-          echo "models=$MODELS" >> $GITHUB_OUTPUT
-          echo "projects=$PROJECTS" >> $GITHUB_OUTPUT
-          echo "users=$USERS" >> $GITHUB_OUTPUT
-          echo "extra=$EXTRA" >> $GITHUB_OUTPUT
+          {
+            echo "categories=$CATEGORIES"
+            echo "models=$MODELS"
+            echo "projects=$PROJECTS"
+            echo "users=$USERS"
+            echo "extra=$EXTRA"
+          } >> "$GITHUB_OUTPUT"
           echoe "Categories: $CATEGORIES"
           [ -n "$MODELS" ] && echoe "Models: $MODELS" || warn "Models: (all)"
           [ -n "$PROJECTS" ] && echoe "Projects: $PROJECTS" || warn "Projects: (all)"
@@ -186,6 +215,7 @@ jobs:
           [ -n "$EXTRA" ] && echoe "Extra: $EXTRA" || true
 
       - name: Bulk generate (dirs + files, continue-safe)
+        continue-on-error: true
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -204,6 +234,7 @@ jobs:
           for i in $(seq -w 1 "$FCOUNT"); do f="${FROOT}/file_${i}${FEXT}"; printf 'idx=%s time=%s\n' "$i" "$(date -Iseconds)" > "$f" || true; echo "$f" >> "${GEN_DIR}/files.list"; done
 
       - name: Bulk download (aria2, continue-safe)
+        continue-on-error: true
         shell: bash
         env:
           PAR: ${{ github.event.inputs.parallel }}
@@ -218,13 +249,13 @@ jobs:
 
       - name: Fetch OpenAI usage (continue-safe + backoff)
         id: fetch
+        continue-on-error: true
         shell: bash
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_ORG_ID: ${{ secrets.OPENAI_ORG_ID }}
           INTERVAL: ${{ github.event.inputs.interval }}
         run: |
-          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           START_UTC="${{ steps.when.outputs.start_utc }}"
           END_UTC="${{ steps.when.outputs.end_utc }}"
@@ -243,12 +274,8 @@ jobs:
           [ -n "$MODELS" ]   && QS+=( --data-urlencode "models=${MODELS}" )
           [ -n "$PROJECTS" ] && QS+=( --data-urlencode "project_ids=${PROJECTS}" )
           [ -n "$USERS" ]    && QS+=( --data-urlencode "user_ids=${USERS}" )
-          # EXTRA는 raw 쿼리 문자열로 덧붙임
           EXTRA_QS=()
-          if [ -n "$EXTRA" ]; then
-            IFS='&' read -ra KV <<< "$EXTRA"
-            for x in "${KV[@]}"; do EXTRA_QS+=( --data-urlencode "$x" ); done
-          fi
+          if [ -n "$EXTRA" ]; then IFS='&' read -ra KV <<< "$EXTRA"; for x in "${KV[@]}"; do EXTRA_QS+=( --data-urlencode "$x" ); done; fi
 
           for cat in "${CATS[@]}"; do
             cat_trim="$(echo "$cat" | xargs)"; [ -z "$cat_trim" ] && continue
@@ -263,10 +290,10 @@ jobs:
                 "${HDR_ORG[@]}" "${QS[@]}" "${EXTRA_QS[@]}")
               rc=$?
               set -e
-              if [ $rc -eq 0 ] && [ "$HTTP_CODE" -lt 400 ]; then
+              if [ $rc -eq 0 ] && [ "${HTTP_CODE:-000}" -lt 400 ]; then
                 mv "$out_json.tmp" "$out_json"; ok=1; break
               fi
-              warn "cat=${cat_trim} 실패(rc=$rc http=$HTTP_CODE) 재시도(${attempt}/3)"; sleep $((attempt*2))
+              warn "cat=${cat_trim} 실패(rc=$rc http=${HTTP_CODE:-000}) 재시도(${attempt}/3)"; sleep $((attempt*2))
             done
 
             if [ $ok -eq 1 ]; then
@@ -287,6 +314,7 @@ jobs:
 
       - name: DEMO fallback (no key or all failed → synthesize)
         if: ${{ inputs.demo_mode }}
+        continue-on-error: true
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -304,9 +332,9 @@ jobs:
           echoe "샘플 파일 생성 완료"
 
       - name: Build CSV summary (best-effort, continue-safe)
+        continue-on-error: true
         shell: bash
         run: |
-          set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           CSV="${OUT_DIR}/usage_summary.csv"
           echo "category,timestamp,model,requests,input_tokens,output_tokens,total_tokens,cost_usd" > "$CSV" || true
