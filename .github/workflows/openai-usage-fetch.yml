@@ -1,50 +1,40 @@
 # .github/workflows/openai-usage-mega.yml
-name: "📊 OpenAI Usage MEGA (≤10 inputs, Bulk Files/Queries/Perms/DB + Echo/Continue)"
+name: "📊 OpenAI Usage MEGA (≤10 inputs, Bulk Files/Queries/Perms/DB + Canonical curl + Echo/Continue)"
 
 on:
   workflow_dispatch:
     inputs:
       date_mode:
         type: choice
-        description: "기간 모드"
         options: ["manual", "random"]
         required: true
         default: "manual"
       date_span:
-        description: "기간 스펙 (manual/random 형식)"
         required: false
         default: ""
       interval:
-        description: "집계 간격 (1m|1h|1d)"
         required: false
         default: "1d"
       query_cfg:
-        description: "쿼리 구성 문자열"
         required: false
         default: "categories=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions"
       bulk_cfg:
-        description: "대량 생성 구성 (디렉토리/파일)"
         required: false
         default: "dirs_root=.github/echo_dirs,dirs_count=200;files_root=.github/echo_files,files_count=500,files_ext=.txt"
       download_manifest:
-        description: "다운로드 URL 목록 (줄바꿈 구분)"
         required: false
         default: ""
       parallel:
-        description: "동시 다운로드(aria2) 연결 수"
         required: false
         default: "8"
       demo_mode:
         type: boolean
-        description: "API 키 없어도 샘플 Usage JSON 생성"
         required: false
         default: true
       db_cfg:
-        description: "DB 대량 생성 구성 (SQLite)"
         required: false
         default: "db_root=.github/echo_dbs,db_count=3,tables_per_db=2,rows_per_table=20"
       perm_cfg:
-        description: "권한/인증 파일 대량 생성 구성"
         required: false
         default: "perm_root=.github/echo_perms,users=10,chmod=640,acl_manifest=true,htpasswd=true"
 
@@ -86,22 +76,84 @@ jobs:
           : "${SQL_DIR:=.github/echo_sql}"
           : "${ECHO_OK:=OK}" ; : "${ECHO_WARN:=WARN}" ; : "${ECHO_FAIL:=FAIL}"
           ERR_LOG="${LOG_DIR}/errors-current.log"
+
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
           warn(){  printf '%s %s\n' "${ECHO_WARN}" "$*"; }
           fail(){  printf '%s %s\n' "${ECHO_FAIL}" "$*"; }
-          run(){   printf '▶ %s\n' "$*"; eval "$@"; }
+
+          # eval 제거: 모든 인자를 그대로 실행
+          run(){
+            printf '▶'
+            for a in "$@"; do printf ' %q' "$a"; done; printf '\n'
+            "$@"
+          }
           try_run(){
-            printf '▶ %s\n' "$*"
-            set +e; eval "$@"; rc=$?; set -e
+            printf '▶'
+            for a in "$@"; do printf ' %q' "$a"; done; printf '\n'
+            set +e; "$@"; rc=$?; set -e
             if [ $rc -ne 0 ]; then
-              fail "rc=${rc} :: $*"
-              { printf '[%s] rc=%s %s\n' "$(date +%F' '%T)" "$rc" "$*"; } >> "${ERR_LOG}"
+              fail "rc=${rc}"
+              { printf '[%s] rc=%s ' "$(date +%F' '%T)" "$rc"; printf '%q ' "$@"; printf '\n'; } >> "${ERR_LOG}"
             else
               echoe "ok"
             fi
             return 0
           }
-          export -f echoe warn fail run try_run
+
+          # trim helpers
+          _trim(){ sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' ; }
+          _strip_quotes(){ sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//" ; }
+
+          # Canonical URL helpers
+          normalize_url(){
+            in="$1"
+            norm="$(printf '%s' "$in" | _trim | _strip_quotes)"
+            case "$norm" in
+              http://*|https://*) : ;;
+              www.*) norm="https://${norm}";;
+              *) norm="https://${norm}";;
+            esac
+            printf '%s' "$norm"
+          }
+          canon_url(){
+            url="$(normalize_url "$1")"
+            set +e
+            eff="$(curl -fsSIL --location --max-redirs 10 -o /dev/null -w '%{url_effective}' "$url")"
+            rc=$?
+            set -e
+            if [ $rc -ne 0 ] || [ -z "$eff" ]; then
+              printf '%s' "$url"; return 1
+            else
+              printf '%s' "$eff"; return 0
+            fi
+          }
+          canonize_list(){
+            in="$1"; out="$2"; mapf="$3"; badf="$4"
+            : > "$out"; : > "$mapf"; : > "$badf"
+            while IFS= read -r line || [ -n "$line" ]; do
+              [ -z "$line" ] && continue
+              src="$(printf '%s' "$line" | _trim | _strip_quotes)"
+              [ -z "$src" ] && continue
+              norm="$(normalize_url "$src")"
+              if eff="$(canon_url "$norm")"; then
+                printf '%s\n' "$eff" >> "$out"
+                printf '%s\t%s\n' "$src" "$eff" >> "$mapf"
+              else
+                printf '%s\n' "$norm" >> "$out"
+                printf '%s\t%s\n' "$src" "FAILED" >> "$mapf"
+                printf '%s\n' "$src" >> "$badf"
+              fi
+            done < "$in"
+            sort -u "$out" -o "$out"
+          }
+
+          # key=value 파싱 결과를 강제 trim
+          kv_get(){
+            line="$1"; key="$2"
+            printf '%s' "$line" | tr ';,' '\n' | awk -F= -v k="$2" '$1==k{ $1=""; sub(/^=/,""); print; }' | _trim
+          }
+
+          export -f echoe warn fail run try_run _trim _strip_quotes normalize_url canon_url canonize_list kv_get
           printf '' > "${ERR_LOG}"
           SH
           chmod +x /tmp/echo_helpers.sh
@@ -112,12 +164,11 @@ jobs:
       - name: Sanity + Tools (continue-safe)
         continue-on-error: true
         shell: bash
-        env:
-          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+        env: { HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }} }
         run: |
           source /tmp/echo_helpers.sh
           if [ "${HAS_KEY}" != "true" ]; then
-            fail "OPENAI_API_KEY secret 미설정 (데모 모드로 샘플 생성 가능)"
+            fail "OPENAI_API_KEY secret 미설정 (데모 모드로 샘플 생성)"
           else
             echoe "OPENAI_API_KEY 확인"
           fi
@@ -187,7 +238,7 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           CFG="${{ github.event.inputs.query_cfg }}"
-          parse_val(){ printf '%s' "$CFG" | tr ';' '\n' | awk -F= -v k="$1" '$1==k{ $1=""; sub(/^=/,""); print; }'; }
+          parse_val(){ kv_get "$CFG" "$1"; }
           CATEGORIES="$(parse_val categories || true)"
           MODELS="$(parse_val models || true)"
           PROJECTS="$(parse_val projects || true)"
@@ -202,10 +253,6 @@ jobs:
             echo "extra=$EXTRA"
           } >> "$GITHUB_OUTPUT"
           echoe "Categories: $CATEGORIES"
-          [ -n "$MODELS" ] && echoe "Models: $MODELS" || warn "Models: (all)"
-          [ -n "$PROJECTS" ] && echoe "Projects: $PROJECTS" || warn "Projects: (all)"
-          [ -n "$USERS" ] && echoe "Users: $USERS" || warn "Users: (all)"
-          [ -n "$EXTRA" ] && echoe "Extra: $EXTRA" || true
 
       - name: Bulk generate (dirs + files, continue-safe)
         continue-on-error: true
@@ -213,7 +260,7 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           CFG="${{ github.event.inputs.bulk_cfg }}"
-          get(){ printf '%s' "$CFG" | tr ';' '\n' | awk -F= -v k="$1" '$1==k{ $1=""; sub(/^=/,""); print; }'; }
+          get(){ kv_get "$CFG" "$1"; }
           DROOT="$(get dirs_root || true)"; : "${DROOT:=.github/echo_dirs}"
           DCOUNT="$(get dirs_count || true)"; : "${DCOUNT:=200}"
           FROOT="$(get files_root || true)"; : "${FROOT:=.github/echo_files}"
@@ -226,21 +273,27 @@ jobs:
           try_run mkdir -p "$FROOT"
           for i in $(seq -w 1 "$FCOUNT"); do f="${FROOT}/file_${i}${FEXT}"; printf 'idx=%s time=%s\n' "$i" "$(date -Iseconds)" > "$f" || true; echo "$f" >> "${GEN_DIR}/files.list"; done
 
-      - name: Bulk download (aria2, continue-safe)
+      - name: Canonicalize URLs (curl -L) and Bulk download (aria2, continue-safe)
         continue-on-error: true
         shell: bash
-        env:
-          PAR: ${{ github.event.inputs.parallel }}
+        env: { PAR: ${{ github.event.inputs.parallel }} }
         run: |
           source /tmp/echo_helpers.sh
           MAN="${{ github.event.inputs.download_manifest }}"
           if [ -z "$MAN" ]; then warn "download_manifest 비어있음 → 스킵"; exit 0; fi
-          LIST="${DL_DIR}/urls.txt"
-          printf '%s\n' "$MAN" | sed '/^\s*$/d' > "$LIST"
-          echoe "다운로드 URL 수: $(wc -l < "$LIST") (병렬:${PAR:-8})"
-          try_run aria2c -x4 -s4 -j "${PAR:-8}" -i "$LIST" -d "$DL_DIR"
+          try_run mkdir -p "$DL_DIR"
+          RAW="${DL_DIR}/urls.raw.txt"
+          CANON="${DL_DIR}/urls.canon.txt"
+          MAP="${DL_DIR}/urls.mapping.tsv"
+          BAD="${DL_DIR}/urls.bad.txt"
+          printf '%s\n' "$MAN" | sed '/^\s*$/d' > "$RAW"
+          echoe "원본 URL 수: $(wc -l < "$RAW" || echo 0)"
+          try_run bash -lc "canonize_list '$RAW' '$CANON' '$MAP' '$BAD'"
+          echoe "정규화 URL 수: $(wc -l < "$CANON" || echo 0)"
+          [ -s "$BAD" ] && warn "정규화 실패 URL 존재 → $BAD"
+          try_run aria2c -x4 -s4 -j "${PAR:-8}" -i "$CANON" -d "$DL_DIR"
 
-      - name: Fetch OpenAI usage (continue-safe + backoff)
+      - name: Fetch OpenAI usage (continue-safe + backoff + curl -L)
         id: fetch
         continue-on-error: true
         shell: bash
@@ -260,28 +313,43 @@ jobs:
           mkdir -p "${OUT_DIR}"
           IFS=',' read -ra CATS <<< "$CATEGORIES"
           : > "${OUT_DIR}/_index.jsonl"
-          QS=( --data-urlencode "start_time=${START_UTC}" --data-urlencode "end_time=${END_UTC}" --data-urlencode "interval=${INTERVAL}" )
+          : > "${OUT_DIR}/_errors.jsonl"
+
+          QS=( --data-urlencode "start_time=${START_UTC}"
+               --data-urlencode "end_time=${END_UTC}"
+               --data-urlencode "interval=${INTERVAL}" )
           [ -n "$MODELS" ]   && QS+=( --data-urlencode "models=${MODELS}" )
           [ -n "$PROJECTS" ] && QS+=( --data-urlencode "project_ids=${PROJECTS}" )
           [ -n "$USERS" ]    && QS+=( --data-urlencode "user_ids=${USERS}" )
           EXTRA_QS=(); if [ -n "$EXTRA" ]; then IFS='&' read -ra KV <<< "$EXTRA"; for x in "${KV[@]}"; do EXTRA_QS+=( --data-urlencode "$x" ); done; fi
+
           for cat in "${CATS[@]}"; do
             cat_trim="$(echo "$cat" | xargs)"; [ -z "$cat_trim" ] && continue
-            url="${USAGE_BASE}/${cat_trim}"
+            base_url="${USAGE_BASE}/${cat_trim}"
             out_json="${OUT_DIR}/${cat_trim}.json"
             ok=0; for attempt in 1 2 3; do
               set +e
               if [ -n "${OPENAI_ORG_ID:-}" ]; then HDR_ORG=(-H "OpenAI-Organization: ${OPENAI_ORG_ID}"); else HDR_ORG=(); fi
-              HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$out_json.tmp" -G "$url" -H "Authorization: Bearer ${OPENAI_API_KEY:-dummy}" "${HDR_ORG[@]}" "${QS[@]}" "${EXTRA_QS[@]}")
-              rc=$?; set -e
-              if [ $rc -eq 0 ] && [ "${HTTP_CODE:-000}" -lt 400 ]; then mv "$out_json.tmp" "$out_json"; ok=1; break; fi
-              warn "cat=${cat_trim} 실패(rc=$rc http=${HTTP_CODE:-000}) 재시도(${attempt}/3)"; sleep $((attempt*2))
+              RESP=$(curl -sS -L -w "%{http_code}\n%{url_effective}" -o "$out_json.tmp" -G "$base_url" \
+                -H "Authorization: Bearer ${OPENAI_API_KEY:-dummy}" "${HDR_ORG[@]}" "${QS[@]}" "${EXTRA_QS[@]}")
+              rc=$?; code="$(printf '%s' "$RESP" | sed -n '1p')"; effu="$(printf '%s' "$RESP" | sed -n '2p')"
+              set -e
+              echoe "cat=${cat_trim} effective_url=${effu:-$base_url}"
+              if [ $rc -eq 0 ] && [ "${code:-000}" -lt 400 ]; then mv "$out_json.tmp" "$out_json"; ok=1; break; fi
+              warn "cat=${cat_trim} 실패(rc=$rc http=${code:-000}) 재시도(${attempt}/3)"; sleep $((attempt*2))
             done
             if [ $ok -eq 1 ]; then
-              if jq -e . >/dev/null 2>&1 < "$out_json"; then echoe "JSON OK: ${out_json}"; printf '%s\t%s\n' "$cat_trim" "$out_json" >> "${OUT_DIR}/_index.jsonl"; else
-                warn "JSON 파싱 실패: ${out_json} → .raw 보존"; mv "$out_json" "${out_json}.raw" || true; printf '%s\t%s\n' "$cat_trim" "${out_json}.raw" >> "${OUT_DIR}/_index.jsonl"; fi
+              if jq -e . >/dev/null 2>&1 < "$out_json"; then
+                echoe "JSON OK: ${out_json}"
+                printf '%s\t%s\n' "$cat_trim" "$out_json" >> "${OUT_DIR}/_index.jsonl"
+              else
+                warn "JSON 파싱 실패: ${out_json}"
+                printf '%s\t%s\n' "$cat_trim" "$out_json" >> "${OUT_DIR}/_errors.jsonl"
+                mv "$out_json" "${out_json}.raw" || true
+              fi
             else
-              fail "fetch 최종 실패(cat=${cat_trim})"; mv "$out_json.tmp" "$out_json.err" 2>/dev/null || true; printf '%s\t%s\n' "$cat_trim" "$out_json.err" >> "${OUT_DIR}/_index.jsonl"
+              printf '%s\t%s\n' "$cat_trim" "${out_json}.err" >> "${OUT_DIR}/_errors.jsonl"
+              mv "$out_json.tmp" "${out_json}.err" 2>/dev/null || true
             fi
           done
 
@@ -292,7 +360,7 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           ok_cnt=$(awk '{print $2}' "${OUT_DIR}/_index.jsonl" | grep -E '\.json$' | wc -l || true)
-          if [ -n "${{ secrets.OPENAI_API_KEY }}" ] && [ "$ok_cnt" -gt 0 ]; then echoe "실제 데이터가 존재 → 데모 스킵"; exit 0; fi
+          if [ -n "${{ secrets.OPENAI_API_KEY }}" ] && [ "$ok_cnt" -gt 0 ]; then echoe "실데이터 존재 → 데모 스킵"; exit 0; fi
           warn "DEMO MODE: 샘플 Usage JSON 생성"
           DAY=$(date -u +%Y-%m-%dT00:00:00Z)
           gen_one(){ catg="$1"; out="${OUT_DIR}/${catg}.json"; jq -n --arg t "$DAY" '{
@@ -313,6 +381,9 @@ jobs:
           while IFS=$'\t' read -r cat fpath; do
             [ -z "$cat" ] && continue
             [ ! -s "$fpath" ] && { warn "빈 파일: $fpath"; continue; }
+            if ! jq -e . >/dev/null 2>&1 < "$fpath"; then
+              warn "JSON 아님, 스킵: $fpath"; continue
+            fi
             set +e
             jq -r --arg C "$cat" '
               (.data // [])[] |
@@ -342,15 +413,17 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           CFG="${{ github.event.inputs.db_cfg }}"
-          get(){ printf '%s' "$CFG" | tr ',' '\n' | awk -F= -v k="$1" '$1==k{ $1=""; sub(/^=/,""); print; }'; }
+          get(){ kv_get "$CFG" "$1"; }
           DB_ROOT="$(get db_root || true)"; : "${DB_ROOT:=.github/echo_dbs}"
           DB_COUNT="$(get db_count || true)"; : "${DB_COUNT:=3}"
           TBL_PER_DB="$(get tables_per_db || true)"; : "${TBL_PER_DB:=2}"
           ROWS_PER_TBL="$(get rows_per_table || true)"; : "${ROWS_PER_TBL:=20}"
-          echo "db_root=$DB_ROOT" >> "$GITHUB_OUTPUT"
-          echo "db_count=$DB_COUNT" >> "$GITHUB_OUTPUT"
-          echo "tables_per_db=$TBL_PER_DB" >> "$GITHUB_OUTPUT"
-          echo "rows_per_table=$ROWS_PER_TBL" >> "$GITHUB_OUTPUT"
+          {
+            echo "db_root=$DB_ROOT"
+            echo "db_count=$DB_COUNT"
+            echo "tables_per_db=$TBL_PER_DB"
+            echo "rows_per_table=$ROWS_PER_TBL"
+          } >> "$GITHUB_OUTPUT"
           echoe "DB CFG → root=$DB_ROOT, dbs=$DB_COUNT, tables=$TBL_PER_DB, rows=$ROWS_PER_TBL"
 
       - name: Bulk create SQLite DBs with seed data (continue-safe)
@@ -359,8 +432,7 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           mkdir -p "${DB_DIR}"
-          DB_ROOT="${{ steps.dbq.outputs.db_root }}"
-          [ -n "$DB_ROOT" ] || DB_ROOT="${DB_DIR}"
+          DB_ROOT="${{ steps.dbq.outputs.db_root }}"; [ -n "$DB_ROOT" ] || DB_ROOT="${DB_DIR}"
           DB_COUNT="${{ steps.dbq.outputs.db_count }}"
           TBL="${{ steps.dbq.outputs.tables_per_db }}"
           ROWS="${{ steps.dbq.outputs.rows_per_table }}"
@@ -432,7 +504,7 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           CFG="${{ github.event.inputs.perm_cfg }}"
-          get(){ printf '%s' "$CFG" | tr ',' '\n' | awk -F= -v k="$1" '$1==k{ $1=""; sub(/^=/,""); print; }'; }
+          get(){ kv_get "$CFG" "$1"; }
           PROOT="$(get perm_root || true)"; : "${PROOT:=.github/echo_perms}"
           USERS="$(get users || true)"; : "${USERS:=10}"
           CHMOD_MODE="$(get chmod || true)"; : "${CHMOD_MODE:=640}"
@@ -462,10 +534,9 @@ jobs:
 
           for i in $(seq -w 1 "$USERS"); do
             u="user_${i}"
-            echo "username=${u}" > "$PROOT/users/${u}.conf"
+            try_run bash -lc "echo 'username=${u}' > '$PROOT/users/${u}.conf'"
             head -c 16 /dev/urandom | base64 > "$PROOT/users/${u}.token" || echo "token_${u}" > "$PROOT/users/${u}.token"
 
-            # ✅ heredoc 대신 jq 로 안전하게 JSON 생성
             TS="$(date -Iseconds)"
             jq -n --arg user "$u" --arg ts "$TS" \
               '{user:$user, roles:["reader"], scopes:["usage.read"], created_at:$ts}' \
@@ -499,12 +570,11 @@ jobs:
               u="user_${i}"
               p="$(head -c 8 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 10)"
               if [ $first -eq 1 ]; then
-                try_run htpasswd -b -c "$HTP" "$u" "$p"
-                first=0
+                try_run htpasswd -b -c "$HTP" "$u" "$p"; first=0
               else
                 try_run htpasswd -b "$HTP" "$u" "$p"
               fi
-              echo "${u}:${p}" >> "$PROOT/users/credentials.list"
+              printf '%s:%s\n' "$u" "$p" >> "$PROOT/users/credentials.list"
             done
             try_run chmod "${MODE}" "$HTP" "$PROOT/users/credentials.list"
           fi
@@ -532,13 +602,14 @@ jobs:
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          echo "## OpenAI Usage MEGA Summary (Bulk + Perms + DB)" >> $GITHUB_STEP_SUMMARY
+          echo "## OpenAI Usage MEGA Summary (Bulk + Perms + DB + Canonical curl)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 모드: ${{ github.event.inputs.date_mode }}" >> $GITHUB_STEP_SUMMARY
           echo "- 기간 (KST): ${{ steps.when.outputs.start_kst }} ~ ${{ steps.when.outputs.end_kst }}" >> $GITHUB_STEP_SUMMARY
           echo "- 기간 (UTC): ${{ steps.when.outputs.start_utc }} ~ ${{ steps.when.outputs.end_utc }}" >> $GITHUB_STEP_SUMMARY
           echo "- 간격: ${{ github.event.inputs.interval }}" >> $GITHUB_STEP_SUMMARY
           echo "- 카테고리: ${{ steps.q.outputs.categories }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 정규화 URL: $( [ -f "${DL_DIR}/urls.canon.txt" ] && wc -l < "${DL_DIR}/urls.canon.txt" || echo 0 ) 개" >> $GITHUB_STEP_SUMMARY
           echo "- DB root: ${{ steps.dbq.outputs.db_root }} | DBs: ${{ steps.dbq.outputs.db_count }}" >> $GITHUB_STEP_SUMMARY
           echo "- Perm root: ${{ steps.pcfg.outputs.perm_root }} | Users: ${{ steps.pcfg.outputs.users }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -548,6 +619,12 @@ jobs:
             head -n 21 "${OUT_DIR}/usage_summary.csv" | sed 's/^/    /' >> $GITHUB_STEP_SUMMARY
           else
             echo "Usage CSV 생성 실패 또는 데이터 없음" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f "${DL_DIR}/urls.mapping.tsv" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### URL Canonicalization map (head)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            head -n 20 "${DL_DIR}/urls.mapping.tsv" | sed 's/^/    /' >> $GITHUB_STEP_SUMMARY
           fi
           if [ -f "${SQL_DIR}/query_results.txt" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
