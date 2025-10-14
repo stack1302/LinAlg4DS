@@ -1,5 +1,5 @@
 # .github/workflows/openai-usage-mega.yml
-name: "📊 OpenAI Usage MEGA (≤10 inputs, Random Date + Echo/Continue)"
+name: "📊 OpenAI Usage MEGA (≤10 inputs, Bulk Files/Queries/Perms/DB + Echo/Continue)"
 
 on:
   workflow_dispatch:
@@ -27,7 +27,7 @@ on:
         default: "categories=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions"
       # 예) "dirs_root=.github/echo_dirs,dirs_count=200;files_root=.github/echo_files,files_count=500,files_ext=.txt"
       bulk_cfg:
-        description: "대량 생성 구성"
+        description: "대량 생성 구성 (디렉토리/파일)"
         required: false
         default: "dirs_root=.github/echo_dirs,dirs_count=200;files_root=.github/echo_files,files_count=500,files_ext=.txt"
       download_manifest:
@@ -43,6 +43,18 @@ on:
         description: "API 키 없어도 샘플 Usage JSON 생성"
         required: false
         default: true
+      # (9) DB 대량 생성 구성
+      # 예) "db_root=.github/echo_dbs,db_count=5,tables_per_db=3,rows_per_table=100"
+      db_cfg:
+        description: "DB 대량 생성 구성 (SQLite)"
+        required: false
+        default: "db_root=.github/echo_dbs,db_count=3,tables_per_db=2,rows_per_table=20"
+      # (10) 권한/인증 파일 대량 생성 구성
+      # 예) "perm_root=.github/echo_perms,users=20,chmod=640,acl_manifest=true,htpasswd=true"
+      perm_cfg:
+        description: "권한/인증 파일 대량 생성 구성"
+        required: false
+        default: "perm_root=.github/echo_perms,users=10,chmod=640,acl_manifest=true,htpasswd=true"
 
 env:
   TZ: Asia/Seoul
@@ -50,6 +62,9 @@ env:
   OUT_DIR: .github/usage_out
   DL_DIR: .github/echo_downloads
   GEN_DIR: .github/echo_gen
+  DB_DIR: .github/echo_dbs
+  PERM_DIR: .github/echo_perms
+  SQL_DIR: .github/echo_sql
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
@@ -65,7 +80,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${OUT_DIR}" "${DL_DIR}" "${GEN_DIR}"
+          mkdir -p "${LOG_DIR}" "${OUT_DIR}" "${DL_DIR}" "${GEN_DIR}" "${DB_DIR}" "${PERM_DIR}" "${SQL_DIR}"
           ERR_LOG="${LOG_DIR}/errors-$(date +%Y%m%d%H%M%S).log"
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
@@ -74,6 +89,9 @@ jobs:
           : "${OUT_DIR:=.github/usage_out}"
           : "${DL_DIR:=.github/echo_downloads}"
           : "${GEN_DIR:=.github/echo_gen}"
+          : "${DB_DIR:=.github/echo_dbs}"
+          : "${PERM_DIR:=.github/echo_perms}"
+          : "${SQL_DIR:=.github/echo_sql}"
           : "${ECHO_OK:=OK}" ; : "${ECHO_WARN:=WARN}" ; : "${ECHO_FAIL:=FAIL}"
           ERR_LOG="${LOG_DIR}/errors-current.log"
           echoe(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
@@ -112,25 +130,22 @@ jobs:
             echoe "OPENAI_API_KEY 확인"
           fi
           [ -n "${{ secrets.OPENAI_ORG_ID }}" ] && echoe "OPENAI_ORG_ID 감지" || warn "OPENAI_ORG_ID 미설정"
-          try_run sudo apt-get update -y
-          try_run sudo apt-get install -y jq aria2 coreutils
 
-      - name: Resolve time window (manual/random → KST & UTC)  # <-- 버그 수정됨
+          try_run sudo apt-get update -y
+          try_run sudo apt-get install -y jq aria2 coreutils sqlite3 apache2-utils
+
+      - name: Resolve time window (manual/random → KST & UTC)
         id: when
         continue-on-error: true
         shell: bash
         run: |
-          # set -e는 GitHub가 걸어두므로, 내부에서 실패하지 않게 조심
           source /tmp/echo_helpers.sh
           MODE="${{ github.event.inputs.date_mode }}"
           SPAN="${{ github.event.inputs.date_span }}"
           INTERVAL="${{ github.event.inputs.interval }}"
-
-          # 안전 함수
           to_iso_kst(){ date -d "$1" +'%Y-%m-%d %H:%M:%S'; }
 
           if [ "$MODE" = "manual" ]; then
-            # 구분자 '..' 존재하면 수동 파싱
             if printf '%s' "$SPAN" | grep -q '\.\.'; then
               START_KST_RAW="$(printf '%s' "$SPAN" | awk -F'\\.\\.' '{print $1}')"
               END_KST_RAW="$(printf '%s' "$SPAN" | awk -F'\\.\\.' '{print $2}')"
@@ -138,24 +153,18 @@ jobs:
                 START_KST="$(to_iso_kst "$START_KST_RAW")"
                 END_KST="$(to_iso_kst "$END_KST_RAW")"
               else
-                warn "manual 형식 불완전 → 기본값 사용"
+                warn "manual 형식 불완전 → 기본기간 사용"
               fi
             fi
-
-            # 기본값 보정
             if [ -z "${START_KST:-}" ] || [ -z "${END_KST:-}" ]; then
-              warn "manual 형식 미지정 → 어제 00:00:00..오늘 23:59:59 (KST)"
+              warn "manual 미지정 → 어제 00:00:00..오늘 23:59:59 (KST)"
               START_KST="$(date -d 'yesterday 00:00:00' +'%Y-%m-%d %H:%M:%S')"
               END_KST="$(date -d 'today 23:59:59' +'%Y-%m-%d %H:%M:%S')"
             fi
           else
-            # MODE = random
-            # 예) "days=1..7,within=365"
             DAYS_MIN=1; DAYS_MAX=7; WITHIN=365
-            # 안전 파서(정규식 미사용)
             if printf '%s' "$SPAN" | grep -q 'days='; then
               DAYS_RANGE="$(printf '%s' "$SPAN" | tr ',' '\n' | awk -F= '$1=="days"{print $2}')"
-              # 1..7 형태
               if printf '%s' "$DAYS_RANGE" | grep -q '\.\.'; then
                 DAYS_MIN="$(printf '%s' "$DAYS_RANGE" | awk -F'\\.\\.' '{print $1}')"
                 DAYS_MAX="$(printf '%s' "$DAYS_RANGE" | awk -F'\\.\\.' '{print $2}')"
@@ -164,12 +173,9 @@ jobs:
             if printf '%s' "$SPAN" | grep -q 'within='; then
               WITHIN="$(printf '%s' "$SPAN" | tr ',' '\n' | awk -F= '$1=="within"{print $2}')"
             fi
-
-            # 랜덤 길이/오프셋 (coreutils: shuf 사용)
             rand(){ shuf -i "$1"-"$2" -n 1; }
             LEN=$(rand "${DAYS_MIN:-1}" "${DAYS_MAX:-7}")
             OFF=$(rand 0 "${WITHIN:-365}")
-
             END_KST="$(date -d "$OFF days ago 23:59:59" +'%Y-%m-%d %H:%M:%S')"
             START_KST="$(date -d "$OFF days ago -$((LEN-1)) days 00:00:00" +'%Y-%m-%d %H:%M:%S')"
             echoe "Random window: len=${LEN}d within=${WITHIN}d offset=${OFF}d"
@@ -177,14 +183,12 @@ jobs:
 
           START_UTC="$(TZ=UTC date -d "$START_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
           END_UTC="$(TZ=UTC date -d "$END_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
-
           {
             echo "start_kst=$START_KST"
             echo "end_kst=$END_KST"
             echo "start_utc=$START_UTC"
             echo "end_utc=$END_UTC"
           } >> "$GITHUB_OUTPUT"
-
           echoe "KST ${START_KST} ~ ${END_KST} → UTC ${START_UTC} ~ ${END_UTC} (interval=${INTERVAL})"
 
       - name: Parse query_cfg (categories/filters/extra)
@@ -267,48 +271,29 @@ jobs:
           mkdir -p "${OUT_DIR}"
           IFS=',' read -ra CATS <<< "$CATEGORIES"
           : > "${OUT_DIR}/_index.jsonl"
-
-          QS=( --data-urlencode "start_time=${START_UTC}"
-               --data-urlencode "end_time=${END_UTC}"
-               --data-urlencode "interval=${INTERVAL}" )
+          QS=( --data-urlencode "start_time=${START_UTC}" --data-urlencode "end_time=${END_UTC}" --data-urlencode "interval=${INTERVAL}" )
           [ -n "$MODELS" ]   && QS+=( --data-urlencode "models=${MODELS}" )
           [ -n "$PROJECTS" ] && QS+=( --data-urlencode "project_ids=${PROJECTS}" )
           [ -n "$USERS" ]    && QS+=( --data-urlencode "user_ids=${USERS}" )
-          EXTRA_QS=()
-          if [ -n "$EXTRA" ]; then IFS='&' read -ra KV <<< "$EXTRA"; for x in "${KV[@]}"; do EXTRA_QS+=( --data-urlencode "$x" ); done; fi
+          EXTRA_QS=(); if [ -n "$EXTRA" ]; then IFS='&' read -ra KV <<< "$EXTRA"; for x in "${KV[@]}"; do EXTRA_QS+=( --data-urlencode "$x" ); done; fi
 
           for cat in "${CATS[@]}"; do
             cat_trim="$(echo "$cat" | xargs)"; [ -z "$cat_trim" ] && continue
             url="${USAGE_BASE}/${cat_trim}"
             out_json="${OUT_DIR}/${cat_trim}.json"
-
             ok=0; for attempt in 1 2 3; do
               set +e
               if [ -n "${OPENAI_ORG_ID:-}" ]; then HDR_ORG=(-H "OpenAI-Organization: ${OPENAI_ORG_ID}"); else HDR_ORG=(); fi
-              HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$out_json.tmp" -G "$url" \
-                -H "Authorization: Bearer ${OPENAI_API_KEY:-dummy}" \
-                "${HDR_ORG[@]}" "${QS[@]}" "${EXTRA_QS[@]}")
-              rc=$?
-              set -e
-              if [ $rc -eq 0 ] && [ "${HTTP_CODE:-000}" -lt 400 ]; then
-                mv "$out_json.tmp" "$out_json"; ok=1; break
-              fi
+              HTTP_CODE=$(curl -sS -w "%{http_code}" -o "$out_json.tmp" -G "$url" -H "Authorization: Bearer ${OPENAI_API_KEY:-dummy}" "${HDR_ORG[@]}" "${QS[@]}" "${EXTRA_QS[@]}")
+              rc=$?; set -e
+              if [ $rc -eq 0 ] && [ "${HTTP_CODE:-000}" -lt 400 ]; then mv "$out_json.tmp" "$out_json"; ok=1; break; fi
               warn "cat=${cat_trim} 실패(rc=$rc http=${HTTP_CODE:-000}) 재시도(${attempt}/3)"; sleep $((attempt*2))
             done
-
             if [ $ok -eq 1 ]; then
-              if jq -e . >/dev/null 2>&1 < "$out_json"; then
-                echoe "JSON OK: ${out_json}"
-                printf '%s\t%s\n' "$cat_trim" "$out_json" >> "${OUT_DIR}/_index.jsonl"
-              else
-                warn "JSON 파싱 실패: ${out_json} → .raw 보존"
-                mv "$out_json" "${out_json}.raw" || true
-                printf '%s\t%s\n' "$cat_trim" "${out_json}.raw" >> "${OUT_DIR}/_index.jsonl"
-              fi
+              if jq -e . >/dev/null 2>&1 < "$out_json"; then echoe "JSON OK: ${out_json}"; printf '%s\t%s\n' "$cat_trim" "$out_json" >> "${OUT_DIR}/_index.jsonl"; else
+                warn "JSON 파싱 실패: ${out_json} → .raw 보존"; mv "$out_json" "${out_json}.raw" || true; printf '%s\t%s\n' "$cat_trim" "${out_json}.raw" >> "${OUT_DIR}/_index.jsonl"; fi
             else
-              fail "fetch 최종 실패(cat=${cat_trim})"
-              mv "$out_json.tmp" "$out_json.err" 2>/dev/null || true
-              printf '%s\t%s\n' "$cat_trim" "$out_json.err" >> "${OUT_DIR}/_index.jsonl"
+              fail "fetch 최종 실패(cat=${cat_trim})"; mv "$out_json.tmp" "$out_json.err" 2>/dev/null || true; printf '%s\t%s\n' "$cat_trim" "$out_json.err" >> "${OUT_DIR}/_index.jsonl"
             fi
           done
 
@@ -319,8 +304,7 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           ok_cnt=$(awk '{print $2}' "${OUT_DIR}/_index.jsonl" | grep -E '\.json$' | wc -l || true)
-          if [ -n "${{ secrets.OPENAI_API_KEY }}" ] && [ "$ok_cnt" -gt 0 ]; then
-            echoe "실제 데이터가 존재 → 데모 스킵"; exit 0; fi
+          if [ -n "${{ secrets.OPENAI_API_KEY }}" ] && [ "$ok_cnt" -gt 0 ]; then echoe "실제 데이터가 존재 → 데모 스킵"; exit 0; fi
           warn "DEMO MODE: 샘플 Usage JSON 생성"
           DAY=$(date -u +%Y-%m-%dT00:00:00Z)
           gen_one(){ catg="$1"; out="${OUT_DIR}/${catg}.json"; jq -n --arg t "$DAY" '{
@@ -360,6 +344,190 @@ jobs:
           echoe "CSV summary ready → ${CSV}"
           ls -al "${OUT_DIR}" || true
 
+      # =========================
+      # 🔥 DB & SQL 대량 생성 섹션
+      # =========================
+      - name: Parse DB config
+        id: dbq
+        continue-on-error: true
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          CFG="${{ github.event.inputs.db_cfg }}"
+          get(){ printf '%s' "$CFG" | tr ',' '\n' | awk -F= -v k="$1" '$1==k{ $1=""; sub(/^=/,""); print; }'; }
+          DB_ROOT="$(get db_root || true)"; : "${DB_ROOT:=.github/echo_dbs}"
+          DB_COUNT="$(get db_count || true)"; : "${DB_COUNT:=3}"
+          TBL_PER_DB="$(get tables_per_db || true)"; : "${TBL_PER_DB:=2}"
+          ROWS_PER_TBL="$(get rows_per_table || true)"; : "${ROWS_PER_TBL:=20}"
+          echo "db_root=$DB_ROOT" >> "$GITHUB_OUTPUT"
+          echo "db_count=$DB_COUNT" >> "$GITHUB_OUTPUT"
+          echo "tables_per_db=$TBL_PER_DB" >> "$GITHUB_OUTPUT"
+          echo "rows_per_table=$ROWS_PER_TBL" >> "$GITHUB_OUTPUT"
+          echoe "DB CFG → root=$DB_ROOT, dbs=$DB_COUNT, tables=$TBL_PER_DB, rows=$ROWS_PER_TBL"
+
+      - name: Bulk create SQLite DBs with seed data (continue-safe)
+        continue-on-error: true
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          mkdir -p "${DB_DIR}"
+          DB_ROOT="${{ steps.dbq.outputs.db_root }}"
+          [ -n "$DB_ROOT" ] || DB_ROOT="${DB_DIR}"
+          DB_COUNT="${{ steps.dbq.outputs.db_count }}"
+          TBL="${{ steps.dbq.outputs.tables_per_db }}"
+          ROWS="${{ steps.dbq.outputs.rows_per_table }}"
+          try_run mkdir -p "$DB_ROOT"
+
+          for d in $(seq -w 1 "${DB_COUNT:-3}"); do
+            DBP="${DB_ROOT}/demo_${d}.sqlite"
+            echoe "Create DB: $DBP"
+            for t in $(seq -w 1 "${TBL:-2}"); do
+              TBLN="tbl_${t}"
+              try_run sqlite3 "$DBP" "CREATE TABLE IF NOT EXISTS ${TBLN}(id INTEGER PRIMARY KEY, name TEXT, created_at TEXT);"
+              for r in $(seq 1 "${ROWS:-20}"); do
+                NAME="name_${t}_${r}"; NOW="$(date -Iseconds)"
+                try_run sqlite3 "$DBP" "INSERT INTO ${TBLN}(name, created_at) VALUES('${NAME}', '${NOW}');"
+              done
+            done
+            # 인덱스 및 뷰 예시도 추가
+            try_run sqlite3 "$DBP" "CREATE VIEW IF NOT EXISTS v_counts AS SELECT name, COUNT(*) AS cnt FROM tbl_01 GROUP BY name;"
+            echo "$DBP" >> "${GEN_DIR}/dbs.list"
+          done
+          echoe "DBs created: $(wc -l < "${GEN_DIR}/dbs.list" 2>/dev/null || echo 0)"
+
+      - name: Generate massive SQL queries (continue-safe)
+        continue-on-error: true
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          mkdir -p "${SQL_DIR}"
+          DB_ROOT="${{ steps.dbq.outputs.db_root }}"; [ -n "$DB_ROOT" ] || DB_ROOT="${DB_DIR}"
+          TBL="${{ steps.dbq.outputs.tables_per_db }}"; : "${TBL:=2}"
+
+          # DB별로 다수의 SQL 파일 생성 (조회/집계/조인/인덱스 힌트 없음)
+          idx=0
+          while read -r DBP; do
+            [ -f "$DBP" ] || continue
+            base="$(basename "$DBP" .sqlite)"
+            for t in $(seq -w 1 "$TBL"); do
+              TBLN="tbl_${t}"
+              q1="${SQL_DIR}/${base}_${TBLN}_select.sql"
+              q2="${SQL_DIR}/${base}_${TBLN}_count.sql"
+              q3="${SQL_DIR}/${base}_${TBLN}_recent.sql"
+              printf 'SELECT * FROM %s LIMIT 50;\n' "$TBLN" > "$q1"
+              printf 'SELECT COUNT(*) AS cnt FROM %s;\n' "$TBLN" > "$q2"
+              printf "SELECT * FROM %s WHERE created_at >= datetime('now','-1 day');\n" "$TBLN" > "$q3"
+              echo "$q1" >> "${GEN_DIR}/sql.list"; echo "$q2" >> "${GEN_DIR}/sql.list"; echo "$q3" >> "${GEN_DIR}/sql.list"
+              idx=$((idx+3))
+            done
+          done < "${GEN_DIR}/dbs.list"
+          echoe "Generated SQL files: $idx"
+
+      - name: (Optional) Execute sample SQL against DBs (continue-safe)
+        continue-on-error: true
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          OUT="${SQL_DIR}/query_results.txt"
+          : > "$OUT"
+          while read -r DBP; do
+            [ -f "$DBP" ] || continue
+            printf '\n-- %s --\n' "$DBP" >> "$OUT"
+            # 샘플: 각 DB 첫 번째 SQL 1개 실행
+            Q="$(ls "${SQL_DIR}/$(basename "$DBP" .sqlite)"*_select.sql 2>/dev/null | head -n1)"
+            [ -n "$Q" ] && try_run bash -lc "sqlite3 -header -csv '$DBP' < '$Q' >> '$OUT'"
+          done < "${GEN_DIR}/dbs.list"
+          echoe "Sample SQL execution done → $OUT"
+
+      # =========================
+      # 🔐 권한/인증 파일 대량 생성 섹션
+      # =========================
+      - name: Parse permission config
+        id: pcfg
+        continue-on-error: true
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          CFG="${{ github.event.inputs.perm_cfg }}"
+          get(){ printf '%s' "$CFG" | tr ',' '\n' | awk -F= -v k="$1" '$1==k{ $1=""; sub(/^=/,""); print; }'; }
+          PROOT="$(get perm_root || true)"; : "${PROOT:=.github/echo_perms}"
+          USERS="$(get users || true)"; : "${USERS:=10}"
+          CHMOD_MODE="$(get chmod || true)"; : "${CHMOD_MODE:=640}"
+          ACL_MANIFEST="$(get acl_manifest || true)"; : "${ACL_MANIFEST:=true}"
+          HTPASSWD_ON="$(get htpasswd || true)"; : "${HTPASSWD_ON:=true}"
+          {
+            echo "perm_root=$PROOT"
+            echo "users=$USERS"
+            echo "chmod_mode=$CHMOD_MODE"
+            echo "acl_manifest=$ACL_MANIFEST"
+            echo "htpasswd=$HTPASSWD_ON"
+          } >> "$GITHUB_OUTPUT"
+          echoe "PERM CFG → root=$PROOT, users=$USERS, chmod=$CHMOD_MODE, acl_manifest=$ACL_MANIFEST, htpasswd=$HTPASSWD_ON"
+
+      - name: Bulk permission & auth files (continue-safe)
+        continue-on-error: true
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          PROOT="${{ steps.pcfg.outputs.perm_root }}"; : "${PROOT:=.github/echo_perms}"
+          USERS="${{ steps.pcfg.outputs.users }}"; : "${USERS:=10}"
+          MODE="${{ steps.pcfg.outputs.chmod_mode }}"; : "${MODE:=640}"
+          ACL_ON="${{ steps.pcfg.outputs.acl_manifest }}"; : "${ACL_ON:=true}"
+          HTP_ON="${{ steps.pcfg.outputs.htpasswd }}"; : "${HTP_ON:=true}"
+
+          try_run mkdir -p "$PROOT/users" "$PROOT/policies" "$PROOT/acls"
+
+          # 사용자 N명 생성: 계정 파일, 임의 토큰, 정책 JSON
+          for i in $(seq -w 1 "$USERS"); do
+            u="user_${i}"
+            echo "username=${u}" > "$PROOT/users/${u}.conf"
+            head -c 16 /dev/urandom | base64 > "$PROOT/users/${u}.token" || echo "token_${u}" > "$PROOT/users/${u}.token"
+            cat > "$PROOT/policies/${u}.json" <<POL
+            { "user": "${u}", "roles": ["reader"], "scopes": ["usage.read"], "created_at": "$(date -Iseconds)" }
+POL
+            try_run chmod "${MODE}" "$PROOT/users/${u}.conf" "$PROOT/users/${u}.token" "$PROOT/policies/${u}.json"
+          done
+
+          # ACL 매니페스트(JSON) 생성
+          if [ "$ACL_ON" = "true" ]; then
+            MAN="$PROOT/acls/acl_manifest.json"
+            echoe "Create ACL manifest: $MAN"
+            {
+              echo '{ "version": 1, "items": ['
+              first=1
+              for i in $(seq -w 1 "$USERS"); do
+                u="user_${i}"
+                [ $first -eq 1 ] || echo ','
+                printf '  { "user":"%s", "resources":["usage","downloads","db"], "permissions":["read"] }' "$u"
+                first=0
+              done
+              echo ']}'
+            } > "$MAN"
+            try_run chmod "${MODE}" "$MAN"
+          fi
+
+          # htpasswd 파일 (apache2-utils 필요)
+          if [ "$HTP_ON" = "true" ]; then
+            HTP="$PROOT/.htpasswd"
+            echoe "Create htpasswd: $HTP"
+            # 첫 사용자 생성 시 -c (파일 생성), 이후는 추가
+            first=1
+            for i in $(seq -w 1 "$USERS"); do
+              u="user_${i}"
+              p="$(head -c 8 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 10)"
+              if [ $first -eq 1 ]; then
+                try_run htpasswd -b -c "$HTP" "$u" "$p"
+                first=0
+              else
+                try_run htpasswd -b "$HTP" "$u" "$p"
+              fi
+              echo "${u}:${p}" >> "$PROOT/users/credentials.list"
+            done
+            try_run chmod "${MODE}" "$HTP" "$PROOT/users/credentials.list"
+          fi
+
+          echoe "Permission/auth files ready under $PROOT"
+
       - name: Upload artifacts (always)
         if: always()
         uses: actions/upload-artifact@v4
@@ -370,6 +538,9 @@ jobs:
             .github/echo_logs/**
             .github/echo_downloads/**
             .github/echo_gen/**
+            .github/echo_dbs/**
+            .github/echo_perms/**
+            .github/echo_sql/**
           if-no-files-found: warn
           retention-days: 7
 
@@ -378,20 +549,28 @@ jobs:
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          echo "## OpenAI Usage MEGA Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## OpenAI Usage MEGA Summary (Bulk + Perms + DB)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- 모드: ${{ github.event.inputs.date_mode }}" >> $GITHUB_STEP_SUMMARY
           echo "- 기간 (KST): ${{ steps.when.outputs.start_kst }} ~ ${{ steps.when.outputs.end_kst }}" >> $GITHUB_STEP_SUMMARY
           echo "- 기간 (UTC): ${{ steps.when.outputs.start_utc }} ~ ${{ steps.when.outputs.end_utc }}" >> $GITHUB_STEP_SUMMARY
           echo "- 간격: ${{ github.event.inputs.interval }}" >> $GITHUB_STEP_SUMMARY
           echo "- 카테고리: ${{ steps.q.outputs.categories }}" >> $GITHUB_STEP_SUMMARY
+          echo "- DB root: ${{ steps.dbq.outputs.db_root }} | DBs: ${{ steps.dbq.outputs.db_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Perm root: ${{ steps.pcfg.outputs.perm_root }} | Users: ${{ steps.pcfg.outputs.users }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -s "${OUT_DIR}/usage_summary.csv" ]; then
-            echo "### CSV 샘플(상위 20행)" >> $GITHUB_STEP_SUMMARY
+            echo "### Usage CSV (Top 20 rows)" >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
             head -n 21 "${OUT_DIR}/usage_summary.csv" | sed 's/^/    /' >> $GITHUB_STEP_SUMMARY
           else
-            echo "CSV 생성 실패 또는 데이터 없음" >> $GITHUB_STEP_SUMMARY
+            echo "Usage CSV 생성 실패 또는 데이터 없음" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f "${SQL_DIR}/query_results.txt" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Sample SQL Execution (head)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            head -n 30 "${SQL_DIR}/query_results.txt" | sed 's/^/    /' >> $GITHUB_STEP_SUMMARY
           fi
           if [ -s "${LOG_DIR}/errors-current.log" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
