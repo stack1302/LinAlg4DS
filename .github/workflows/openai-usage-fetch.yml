@@ -10,8 +10,6 @@ on:
         options: ["manual", "random"]
         required: true
         default: "manual"
-      # manual: "YYYY-MM-DD HH:MM:SS..YYYY-MM-DD HH:MM:SS" (KST)
-      # random: "days=1..7,within=365"
       date_span:
         description: "기간 스펙 (manual/random 형식)"
         required: false
@@ -20,12 +18,10 @@ on:
         description: "집계 간격 (1m|1h|1d)"
         required: false
         default: "1d"
-      # 예) "categories=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions;models=o4-mini,gpt-4o;projects=proj_x;users=user_a;extra=foo=bar&x=y"
       query_cfg:
         description: "쿼리 구성 문자열"
         required: false
         default: "categories=completions,images,audio,embeddings,moderations,vector_stores,code_interpreter_sessions"
-      # 예) "dirs_root=.github/echo_dirs,dirs_count=200;files_root=.github/echo_files,files_count=500,files_ext=.txt"
       bulk_cfg:
         description: "대량 생성 구성 (디렉토리/파일)"
         required: false
@@ -43,14 +39,10 @@ on:
         description: "API 키 없어도 샘플 Usage JSON 생성"
         required: false
         default: true
-      # (9) DB 대량 생성 구성
-      # 예) "db_root=.github/echo_dbs,db_count=5,tables_per_db=3,rows_per_table=100"
       db_cfg:
         description: "DB 대량 생성 구성 (SQLite)"
         required: false
         default: "db_root=.github/echo_dbs,db_count=3,tables_per_db=2,rows_per_table=20"
-      # (10) 권한/인증 파일 대량 생성 구성
-      # 예) "perm_root=.github/echo_perms,users=20,chmod=640,acl_manifest=true,htpasswd=true"
       perm_cfg:
         description: "권한/인증 파일 대량 생성 구성"
         required: false
@@ -130,7 +122,6 @@ jobs:
             echoe "OPENAI_API_KEY 확인"
           fi
           [ -n "${{ secrets.OPENAI_ORG_ID }}" ] && echoe "OPENAI_ORG_ID 감지" || warn "OPENAI_ORG_ID 미설정"
-
           try_run sudo apt-get update -y
           try_run sudo apt-get install -y jq aria2 coreutils sqlite3 apache2-utils
 
@@ -144,7 +135,6 @@ jobs:
           SPAN="${{ github.event.inputs.date_span }}"
           INTERVAL="${{ github.event.inputs.interval }}"
           to_iso_kst(){ date -d "$1" +'%Y-%m-%d %H:%M:%S'; }
-
           if [ "$MODE" = "manual" ]; then
             if printf '%s' "$SPAN" | grep -q '\.\.'; then
               START_KST_RAW="$(printf '%s' "$SPAN" | awk -F'\\.\\.' '{print $1}')"
@@ -180,7 +170,6 @@ jobs:
             START_KST="$(date -d "$OFF days ago -$((LEN-1)) days 00:00:00" +'%Y-%m-%d %H:%M:%S')"
             echoe "Random window: len=${LEN}d within=${WITHIN}d offset=${OFF}d"
           fi
-
           START_UTC="$(TZ=UTC date -d "$START_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
           END_UTC="$(TZ=UTC date -d "$END_KST +0900" +'%Y-%m-%dT%H:%M:%SZ')"
           {
@@ -276,7 +265,6 @@ jobs:
           [ -n "$PROJECTS" ] && QS+=( --data-urlencode "project_ids=${PROJECTS}" )
           [ -n "$USERS" ]    && QS+=( --data-urlencode "user_ids=${USERS}" )
           EXTRA_QS=(); if [ -n "$EXTRA" ]; then IFS='&' read -ra KV <<< "$EXTRA"; for x in "${KV[@]}"; do EXTRA_QS+=( --data-urlencode "$x" ); done; fi
-
           for cat in "${CATS[@]}"; do
             cat_trim="$(echo "$cat" | xargs)"; [ -z "$cat_trim" ] && continue
             url="${USAGE_BASE}/${cat_trim}"
@@ -377,7 +365,6 @@ jobs:
           TBL="${{ steps.dbq.outputs.tables_per_db }}"
           ROWS="${{ steps.dbq.outputs.rows_per_table }}"
           try_run mkdir -p "$DB_ROOT"
-
           for d in $(seq -w 1 "${DB_COUNT:-3}"); do
             DBP="${DB_ROOT}/demo_${d}.sqlite"
             echoe "Create DB: $DBP"
@@ -389,7 +376,6 @@ jobs:
                 try_run sqlite3 "$DBP" "INSERT INTO ${TBLN}(name, created_at) VALUES('${NAME}', '${NOW}');"
               done
             done
-            # 인덱스 및 뷰 예시도 추가
             try_run sqlite3 "$DBP" "CREATE VIEW IF NOT EXISTS v_counts AS SELECT name, COUNT(*) AS cnt FROM tbl_01 GROUP BY name;"
             echo "$DBP" >> "${GEN_DIR}/dbs.list"
           done
@@ -403,8 +389,6 @@ jobs:
           mkdir -p "${SQL_DIR}"
           DB_ROOT="${{ steps.dbq.outputs.db_root }}"; [ -n "$DB_ROOT" ] || DB_ROOT="${DB_DIR}"
           TBL="${{ steps.dbq.outputs.tables_per_db }}"; : "${TBL:=2}"
-
-          # DB별로 다수의 SQL 파일 생성 (조회/집계/조인/인덱스 힌트 없음)
           idx=0
           while read -r DBP; do
             [ -f "$DBP" ] || continue
@@ -433,7 +417,6 @@ jobs:
           while read -r DBP; do
             [ -f "$DBP" ] || continue
             printf '\n-- %s --\n' "$DBP" >> "$OUT"
-            # 샘플: 각 DB 첫 번째 SQL 1개 실행
             Q="$(ls "${SQL_DIR}/$(basename "$DBP" .sqlite)"*_select.sql 2>/dev/null | head -n1)"
             [ -n "$Q" ] && try_run bash -lc "sqlite3 -header -csv '$DBP' < '$Q' >> '$OUT'"
           done < "${GEN_DIR}/dbs.list"
@@ -477,18 +460,20 @@ jobs:
 
           try_run mkdir -p "$PROOT/users" "$PROOT/policies" "$PROOT/acls"
 
-          # 사용자 N명 생성: 계정 파일, 임의 토큰, 정책 JSON
           for i in $(seq -w 1 "$USERS"); do
             u="user_${i}"
             echo "username=${u}" > "$PROOT/users/${u}.conf"
             head -c 16 /dev/urandom | base64 > "$PROOT/users/${u}.token" || echo "token_${u}" > "$PROOT/users/${u}.token"
-            cat > "$PROOT/policies/${u}.json" <<POL
-            { "user": "${u}", "roles": ["reader"], "scopes": ["usage.read"], "created_at": "$(date -Iseconds)" }
-POL
+
+            # ✅ heredoc 대신 jq 로 안전하게 JSON 생성
+            TS="$(date -Iseconds)"
+            jq -n --arg user "$u" --arg ts "$TS" \
+              '{user:$user, roles:["reader"], scopes:["usage.read"], created_at:$ts}' \
+              > "$PROOT/policies/${u}.json"
+
             try_run chmod "${MODE}" "$PROOT/users/${u}.conf" "$PROOT/users/${u}.token" "$PROOT/policies/${u}.json"
           done
 
-          # ACL 매니페스트(JSON) 생성
           if [ "$ACL_ON" = "true" ]; then
             MAN="$PROOT/acls/acl_manifest.json"
             echoe "Create ACL manifest: $MAN"
@@ -506,11 +491,9 @@ POL
             try_run chmod "${MODE}" "$MAN"
           fi
 
-          # htpasswd 파일 (apache2-utils 필요)
           if [ "$HTP_ON" = "true" ]; then
             HTP="$PROOT/.htpasswd"
             echoe "Create htpasswd: $HTP"
-            # 첫 사용자 생성 시 -c (파일 생성), 이후는 추가
             first=1
             for i in $(seq -w 1 "$USERS"); do
               u="user_${i}"
