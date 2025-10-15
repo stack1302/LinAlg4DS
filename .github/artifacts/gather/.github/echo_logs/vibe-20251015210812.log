@@ -1,0 +1,3 @@
+✅ ▶ sudo -u postgres psql -v ON_ERROR_STOP=0 -c "CREATE DATABASE vibe_db;" || true
+✅ ▶ sudo -u postgres psql -v ON_ERROR_STOP=0 -f /tmp/seed.sql
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

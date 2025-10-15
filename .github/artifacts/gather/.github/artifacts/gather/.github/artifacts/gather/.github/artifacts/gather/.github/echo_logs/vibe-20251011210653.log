@@ -1,0 +1,8 @@
+✅ ▶ bash .github/scripts/permissions.sh
+✅ ▶ chmod -R u+rwX,go+rX .
+✅ ▶ find . -type f -not -path './.git/*' -exec chmod 644 {} + || true
+✅ ▶ find . -type d -not -path './.git/*' -exec chmod 755 {} + || true
+✅ ▶ find . -maxdepth 3 -printf '%M %u:%g %p\n' | head -n 300 >> .github/artifacts/PERMISSIONS_APPLIED.txt
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).
+✅ ▶ python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx build
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

@@ -1,0 +1,2 @@
+✅ ▶ python3 -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

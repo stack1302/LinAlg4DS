@@ -1,0 +1,2 @@
+✅ ▶ python3 -m pip -q install -U uv || true
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).

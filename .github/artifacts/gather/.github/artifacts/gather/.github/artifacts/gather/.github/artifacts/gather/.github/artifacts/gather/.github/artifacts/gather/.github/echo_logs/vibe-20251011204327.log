@@ -1,0 +1,7 @@
+✅ ▶ mkdir -p .github/echo_dirs .github/echo_files app tests docs/adr docs/api .github/scripts .github/echo_artifacts
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).
+✅ ▶ sudo apt-get update -y
+✅ ▶ sudo DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::=--force-confnew full-upgrade
+✅ ▶ sudo apt-get -y autoremove
+✅ ▶ sudo apt-get -y autoclean
+✅ 단계 완료 (실패 건 기록, 파이프라인 계속 진행).
