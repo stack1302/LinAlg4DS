@@ -41,7 +41,7 @@ on:
         required: false
         default: "false"
       features:             # 10
-        description: "추가 기능: ssm,eip,cwlogs,alb_https,userdata_url=https://... (콤마로 구분)"
+        description: "추가 기능: ssm,eip,cwlogs,alb_https,oidc_guide,userdata_url=https://... (콤마로 구분)"
         required: false
         default: "ssm"
 
@@ -242,6 +242,139 @@ jobs:
           echo "account_id=$ACC" >> "$GITHUB_OUTPUT"
           echo "region=${AWS_DEFAULT_REGION}" >> "$GITHUB_OUTPUT"
           ok "AWS Account: $ACC"
+
+      # ---------- OIDC 구성 가이드 팩 생성 ----------
+      - name: OIDC — Generate Config Pack (guide + trust policy + commands)
+        if: always()
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          in_features oidc_guide || { ok "oidc_guide 비활성화"; exit 0; }
+          PACK="${OUT_DIR}/oidc"; mkdir -p "$PACK"
+          ORG_REPO="${TAG_REPO}"               # owner/repo
+          OWNER="${ORG_REPO%%/*}"
+          REPO="${ORG_REPO##*/}"
+          BRANCH="${GITHUB_REF_NAME:-*}"       # 예: main
+          ROLE_NAME="gha-${OWNER}-${REPO}-oidc"
+          echo "$ROLE_NAME" > "${PACK}/suggested-role-name.txt"
+
+          # 1) Thumbprint 계산(루트 인증서)
+          TMPD="$(mktemp -d)"
+          set +e
+          CNT=$(openssl s_client -servername token.actions.githubusercontent.com -showcerts -connect token.actions.githubusercontent.com:443 </dev/null 2>/dev/null | awk '/BEGIN CERTIFICATE/{n++}{print > "'$TMPD'/cert" n ".pem"} END{print n}')
+          set -e
+          ROOT="$TMPD/cert${CNT}.pem"
+          THUMB=""
+          if [[ -f "$ROOT" ]]; then
+            THUMB=$(openssl x509 -in "$ROOT" -fingerprint -sha1 -noout | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f' || true)
+          fi
+          echo "${THUMB:-unknown}" > "${PACK}/thumbprint.txt"
+          ok "OIDC thumbprint: ${THUMB:-unknown}"
+
+          # 2) Trust policy (repo + branch 스코프 / 필요시 수정)
+          cat > "${PACK}/trust-policy.json" <<JSON
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Federated": "arn:aws:iam::${{ steps.acct.outputs.account_id }}:oidc-provider/token.actions.githubusercontent.com"
+                },
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+                  },
+                  "StringLike": {
+                    "token.actions.githubusercontent.com:sub": "repo:${OWNER}/${REPO}:ref:refs/heads/${BRANCH}"
+                  }
+                }
+              }
+            ]
+          }
+          JSON
+
+          # 3) 최소 권한 정책(샘플) — 필요시 편집
+          cat > "${PACK}/role-policy-min.json" <<'JSON'
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              { "Effect": "Allow", "Action": [
+                  "ec2:*","elasticloadbalancing:*","autoscaling:*","iam:PassRole",
+                  "logs:*","ssm:*","cloudwatch:*"
+                ], "Resource": "*" }
+            ]
+          }
+          JSON
+
+          # 4) 생성 스크립트
+          cat > "${PACK}/create-commands.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          : "${AWS_REGION:=us-east-1}"
+          ACC="$(aws sts get-caller-identity --query Account --output text)"
+          echo "Account=$ACC Region=$AWS_REGION"
+          # 1) OIDC Provider 생성(없으면). URL과 aud는 GitHub 고정
+          THUMB="$(cat thumbprint.txt)"
+          if ! aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, 'token.actions.githubusercontent.com')]" --output text | grep -q token.actions.githubusercontent.com; then
+            echo "Creating OIDC Provider..."
+            aws iam create-open-id-connect-provider \
+              --url https://token.actions.githubusercontent.com \
+              --client-id-list sts.amazonaws.com \
+              --thumbprint-list "$THUMB"
+          else
+            echo "OIDC Provider already exists (token.actions.githubusercontent.com)"
+          fi
+          # 2) 역할 생성 (trust-policy.json 사용)
+          ROLE_NAME="$(cat suggested-role-name.txt)"
+          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev/null 2>&1; then
+            echo "Creating role: $ROLE_NAME"
+            aws iam create-role --role-name "$ROLE_NAME" \
+              --assume-role-policy-document file://trust-policy.json
+            # 최소 권한 부여(샘플). 운영에 맞게 바꾸세요.
+            aws iam put-role-policy --role-name "$ROLE_NAME" \
+              --policy-name "${ROLE_NAME}-inline" \
+              --policy-document file://role-policy-min.json
+          else
+            echo "Role exists: $ROLE_NAME"
+          fi
+          echo "ROLE ARN: arn:aws:iam::$ACC:role/$ROLE_NAME"
+          SH
+          chmod +x "${PACK}/create-commands.sh"
+
+          # 5) README
+          cat > "${PACK}/README.md" <<MD
+          # GitHub Actions → AWS OIDC 구성 가이드
+
+          ## 요약
+          - 리포지토리: \`${OWNER}/${REPO}\`
+          - 권장 역할명: \`${ROLE_NAME}\`
+          - 리전: \`${AWS_DEFAULT_REGION}\`
+          - OIDC Thumbprint: \`${THUMB:-unknown}\`
+
+          ## 생성 순서
+          1) AWS 콘솔/CLI로 **OIDC Provider**(token.actions.githubusercontent.com) 유무 확인  
+          2) \`trust-policy.json\`(브랜치/레포 스코프) 확인 후 필요시 수정  
+          3) \`role-policy-min.json\` 최소 권한 조정(운영에 맞게 축소 권장)  
+          4) 아래 스크립트 실행
+          \`\`\`bash
+          cd oidc
+          ./create-commands.sh
+          \`\`\`
+
+          ## 워크플로우에서 사용
+          - 리포지토리 **Variables**에 \`AWS_ROLE_TO_ASSUME\` = \`arn:aws:iam::<ACCOUNT_ID>:role/${ROLE_NAME}\`
+          - (필요시) \`ACM_CERT_ARN\` 등 추가 변수 설정
+          - 해당 워크플로우는 OIDC/키/없음(Dry-Run) 순으로 자동 판별합니다.
+          MD
+
+          ok "OIDC config pack generated at ${PACK}"
+          {
+            echo "### 📦 OIDC Config Pack"
+            echo "- Files: trust-policy.json, role-policy-min.json, create-commands.sh, thumbprint.txt, README.md"
+            echo "- Suggested Role: \`${ROLE_NAME}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ============ LITE FLOW ============
       - name: LITE — Resolve default VPC/Subnet
