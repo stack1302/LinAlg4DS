@@ -1,4 +1,4 @@
-name: "🟢 AWS Test Server — EC2 Create + Safe-Continue + Logs/Artifacts"
+name: "🟢 AWS Test Server — EC2 Create + Safe-Continue + Logs"
 
 on:
   workflow_dispatch:
@@ -28,7 +28,7 @@ on:
         required: false
         default: "true"
       keypair_name:
-        description: "생성할 키페어 이름(빈값이면 자동 생성)"
+        description: "생성/재사용 키페어 이름(빈값이면 자동 생성)"
         required: false
         default: ""
       teardown:
@@ -37,7 +37,7 @@ on:
         default: "false"
 
 permissions:
-  id-token: write     # OIDC용
+  id-token: write
   contents: read
 
 concurrency:
@@ -48,6 +48,7 @@ env:
   TZ: Asia/Seoul
   LOG_DIR: .github/echo_logs
   OUT_DIR: .github/echo_out
+  AWS_ROLE_TO_ASSUME: ${{ vars.AWS_ROLE_TO_ASSUME || '' }}
   AWS_REGION_INPUT: ${{ github.event.inputs.aws_region }}
   AWS_DEFAULT_REGION: ${{ github.event.inputs.aws_region || 'us-east-1' }}
   INSTANCE_TYPE: ${{ github.event.inputs.instance_type || 't3.micro' }}
@@ -62,7 +63,6 @@ env:
   TAG_RUN_ATTEMPT: ${{ github.run_attempt }}
   TAG_REPO: ${{ github.repository }}
   TAG_ACTOR: ${{ github.actor }}
-  # 사용되는 리소스 이름 접두사
   NAME_PREFIX: gha-test-${{ github.run_id }}-${{ github.run_attempt }}
 
 jobs:
@@ -71,6 +71,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        continue-on-error: true
 
       - name: Prepare echo helpers + folders
         shell: bash
@@ -84,17 +85,10 @@ jobs:
           ok(){ echo "✅ $(TS) $*"; }
           warn(){ echo "⚠️  $(TS) $*" >&2; }
           fail(){ echo "❌ $(TS) $*" >&2; }
-          # 실패해도 다음으로 넘어가는 안전 실행 래퍼
-          safe_run(){
-            local name="$1"; shift || true
+          safe_run(){ local name="$1"; shift || true
             ok "RUN [$name] → $*"
-            if "$@"; then
-              ok "OK [$name]"
-            else
-              warn "CONTINUE [$name] 실패했지만 계속 진행합니다"
-              return 0
-            fi
-          }
+            if "$@"; then ok "OK [$name]"
+            else warn "CONTINUE [$name] 실패했지만 계속 진행"; return 0; fi; }
           SH
           chmod +x /tmp/echo_helpers.sh
           echo "Helpers ready" | tee "${LOG_DIR}/00_helpers.log"
@@ -105,11 +99,8 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           MODE="dry"
-          if [[ -n "${AWS_ROLE_TO_ASSUME:-}" ]]; then
-            MODE="oidc"
-          elif [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
-            MODE="keys"
-          fi
+          if [[ -n "${AWS_ROLE_TO_ASSUME:-}" ]]; then MODE="oidc"
+          elif [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then MODE="keys"; fi
           echo "mode=$MODE" | tee "${OUT_DIR}/mode.txt"
           echo "mode=$MODE" >> "$GITHUB_OUTPUT"
           ok "Auth mode: $MODE"
@@ -117,18 +108,18 @@ jobs:
       - name: Configure AWS creds via OIDC
         if: steps.mode.outputs.mode == 'oidc'
         uses: aws-actions/configure-aws-credentials@v4
+        continue-on-error: true
         with:
           role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_DEFAULT_REGION }}
 
       - name: Configure AWS creds via Keys (not recommended)
         if: steps.mode.outputs.mode == 'keys'
+        continue-on-error: true
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          safe_run "export-keys" bash -c '
-            echo "Using static keys in env (discouraged). Region=${AWS_DEFAULT_REGION}"
-          '
+          safe_run "export-keys" bash -c 'echo "Using static keys. Region=${AWS_DEFAULT_REGION}"'
 
       - name: Install AWS CLI + jq
         shell: bash
@@ -145,9 +136,9 @@ jobs:
           MODE="${{ steps.mode.outputs.mode }}"
           REGION="${AWS_DEFAULT_REGION}"
           if [[ "$MODE" == "dry" ]]; then
-            ok "Dry-Run 모드: 실제 AWS 호출 없이 진행 (명령만 기록)"
             echo "account_id=000000000000" >> "$GITHUB_OUTPUT"
             echo "region=$REGION" >> "$GITHUB_OUTPUT"
+            ok "Dry-Run: Account/Region 가정"
             exit 0
           fi
           ACC=$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo "UNKNOWN")
@@ -161,33 +152,22 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           MODE="${{ steps.mode.outputs.mode }}"
-          VPC="${VPC_ID_INPUT}"
-          SUBNET="${SUBNET_ID_INPUT}"
-
+          VPC="${VPC_ID_INPUT}"; SUBNET="${SUBNET_ID_INPUT}"
           if [[ "$MODE" == "dry" ]]; then
             echo "vpc_id=vpc-DRYRUN" >> "$GITHUB_OUTPUT"
             echo "subnet_id=subnet-DRYRUN" >> "$GITHUB_OUTPUT"
-            ok "Dry-Run: 기본 VPC/SUBNET 가정"
-            exit 0
-          fi
-
+            ok "Dry-Run: 기본 VPC/SUBNET 가정"; exit 0; fi
           if [[ -z "$VPC" ]]; then
-            VPC=$(aws ec2 describe-vpcs \
-              --filters Name=isDefault,Values=true \
-              --query "Vpcs[0].VpcId" --output text || true)
+            VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true \
+                  --query "Vpcs[0].VpcId" --output text || true)
             [[ "$VPC" == "None" ]] && VPC=""
           fi
-
           if [[ -z "$SUBNET" ]]; then
-            SUBNET=$(aws ec2 describe-subnets \
-              --filters Name=default-for-az,Values=true \
-              --query "Subnets[0].SubnetId" --output text || true)
+            SUBNET=$(aws ec2 describe-subnets --filters Name=default-for-az,Values=true \
+                    --query "Subnets[0].SubnetId" --output text || true)
             [[ "$SUBNET" == "None" ]] && SUBNET=""
           fi
-
-          if [[ -z "$VPC" || -z "$SUBNET" ]]; then
-            warn "기본 VPC/Subnet 탐색 실패 — 수동 지정 필요할 수 있음"
-          fi
+          [[ -z "$VPC" || -z "$SUBNET" ]] && warn "기본 VPC/Subnet 탐색 실패 — 수동 지정 필요할 수 있음"
           echo "vpc_id=$VPC" >> "$GITHUB_OUTPUT"
           echo "subnet_id=$SUBNET" >> "$GITHUB_OUTPUT"
           ok "VPC: ${VPC:-N/A} / Subnet: ${SUBNET:-N/A}"
@@ -198,35 +178,24 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           MODE="${{ steps.mode.outputs.mode }}"
-          if [[ "$MODE" == "dry" ]]; then
-            echo "sg_id=sg-DRYRUN" >> "$GITHUB_OUTPUT"
-            ok "Dry-Run: SG 가정"
-            exit 0
-          fi
-
+          if [[ "$MODE" == "dry" ]]; then echo "sg_id=sg-DRYRUN" >> "$GITHUB_OUTPUT"; ok "Dry-Run: SG 가정"; exit 0; fi
           if [[ "${CREATE_NEW_SG,,}" == "true" ]]; then
             VPC_ID="${{ steps.net.outputs.vpc_id }}"
             SG_NAME="${NAME_PREFIX}-sg"
-            SG_ID=$(aws ec2 create-security-group \
-              --group-name "$SG_NAME" \
-              --description "GH Actions Test SG" \
-              --vpc-id "$VPC_ID" \
+            SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" \
+              --description "GH Actions Test SG" --vpc-id "$VPC_ID" \
               --tag-specifications "ResourceType=security-group,Tags=[{Key=Project,Value=${TAG_PROJECT}},{Key=Repo,Value=${TAG_REPO}},{Key=RunID,Value=${TAG_RUN_ID}}]" \
               --query GroupId --output text 2>/dev/null || true)
-
             if [[ -n "$SG_ID" ]]; then
               ok "SG created: $SG_ID"
               if [[ "${OPEN_HTTP,,}" == "true" ]]; then
                 safe_run "open-80" aws ec2 authorize-security-group-ingress \
                   --group-id "$SG_ID" --protocol tcp --port 80 --cidr 0.0.0.0/0
               fi
-            else
-              warn "SG 생성 실패 — 기본/기존 SG 사용을 시도"
-            fi
+            else warn "SG 생성 실패 — 기존 SG 사용 시도"; fi
             echo "sg_id=${SG_ID:-}" >> "$GITHUB_OUTPUT"
           else
-            ok "새 SG 생성 스킵"
-            echo "sg_id=" >> "$GITHUB_OUTPUT"
+            ok "새 SG 생성 스킵"; echo "sg_id=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Key Pair (or reuse)
@@ -236,33 +205,14 @@ jobs:
           source /tmp/echo_helpers.sh
           MODE="${{ steps.mode.outputs.mode }}"
           NAME="${KEYP_NAME_INPUT:-${NAME_PREFIX}-kp}"
-
-          if [[ "$MODE" == "dry" ]]; then
-            echo "key_name=$NAME" >> "$GITHUB_OUTPUT"
-            ok "Dry-Run: 키페어 ${NAME} 가정"
-            exit 0
-          fi
-
-          # 이미 존재하면 통과
+          if [[ "$MODE" == "dry" ]]; then echo "key_name=$NAME" >> "$GITHUB_OUTPUT"; ok "Dry-Run: 키페어 ${NAME} 가정"; exit 0; fi
           EXISTS=$(aws ec2 describe-key-pairs --key-names "$NAME" --query "KeyPairs[0].KeyName" --output text 2>/dev/null || true)
-          if [[ "$EXISTS" == "$NAME" ]]; then
-            ok "키페어 재사용: $NAME"
-            echo "key_name=$NAME" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # 생성
-          PEM="${OUT_DIR}/${NAME}.pem"
-          KP_JSON="${OUT_DIR}/${NAME}.json"
-          if aws ec2 create-key-pair --key-name "$NAME" \
-             --key-type rsa --key-format pem \
-             --query "{KeyName:KeyName,Material:KeyMaterial}" --output json > "$KP_JSON" 2>/dev/null; then
-            jq -r '.Material' "$KP_JSON" > "$PEM"
-            chmod 600 "$PEM" || true
-            ok "키페어 생성: $NAME (pem 저장)"
-          else
-            warn "키페어 생성 실패 — 인스턴스 접속은 SSM/UserData에 의존"
-          fi
+          if [[ "$EXISTS" == "$NAME" ]]; then ok "키페어 재사용: $NAME"; echo "key_name=$NAME" >> "$GITHUB_OUTPUT"; exit 0; fi
+          PEM="${OUT_DIR}/${NAME}.pem"; KP_JSON="${OUT_DIR}/${NAME}.json"
+          if aws ec2 create-key-pair --key-name "$NAME" --key-type rsa --key-format pem \
+               --query "{KeyName:KeyName,Material:KeyMaterial}" --output json > "$KP_JSON" 2>/dev/null; then
+            jq -r '.Material' "$KP_JSON" > "$PEM"; chmod 600 "$PEM" || true; ok "키페어 생성: $NAME"
+          else warn "키페어 생성 실패 — 접속은 SSM/UserData에 의존"; fi
           echo "key_name=$NAME" >> "$GITHUB_OUTPUT"
 
       - name: Resolve AMI (Amazon Linux 2023 via SSM param)
@@ -271,19 +221,11 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           MODE="${{ steps.mode.outputs.mode }}"
-          if [[ "$MODE" == "dry" ]]; then
-            echo "ami_id=ami-DRYRUN" >> "$GITHUB_OUTPUT"
-            ok "Dry-Run: AMI 가정"
-            exit 0
-          fi
-          # AL2023 최신 AMI: SSM 파라미터를 통해 조회
+          if [[ "$MODE" == "dry" ]]; then echo "ami_id=ami-DRYRUN" >> "$GITHUB_OUTPUT"; ok "Dry-Run: AMI 가정"; exit 0; fi
           AMI=$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
                 --query "Parameters[0].Value" --output text 2>/dev/null || true)
-          if [[ -z "$AMI" || "$AMI" == "None" ]]; then
-            warn "AL2023 AMI 조회 실패 — Ubuntu 22.04 LTS Public AMI 등으로 교체 필요"
-          fi
-          echo "ami_id=${AMI:-}" >> "$GITHUB_OUTPUT"
-          ok "AMI: ${AMI:-N/A}"
+          [[ -z "$AMI" || "$AMI" == "None" ]] && warn "AL2023 AMI 조회 실패 — 대체 AMI 필요할 수 있음"
+          echo "ami_id=${AMI:-}" >> "$GITHUB_OUTPUT"; ok "AMI: ${AMI:-N/A}"
 
       - name: Launch EC2 (UserData:Nginx + Docker)
         id: ec2
@@ -294,20 +236,15 @@ jobs:
           if [[ "$MODE" == "dry" ]]; then
             echo "instance_id=i-DRYRUN" >> "$GITHUB_OUTPUT"
             echo "public_ip=203.0.113.10" >> "$GITHUB_OUTPUT"
-            ok "Dry-Run: EC2 가정 기동"
-            exit 0
-          fi
+            ok "Dry-Run: EC2 가정 기동"; exit 0; fi
 
           AMI="${{ steps.ami.outputs.ami_id }}"
-          if [[ -z "$AMI" ]]; then
-            warn "AMI 없음 — 실행 시도는 실패할 수 있음(안전통과)"
-          fi
+          [[ -z "$AMI" ]] && warn "AMI 없음 — 실행 실패할 수 있으나 계속 진행"
 
           SG_ID="${{ steps.sg.outputs.sg_id }}"
           NET_ARGS=( --subnet-id "${{ steps.net.outputs.subnet_id }}" )
           [[ -n "$SG_ID" ]] && NET_ARGS+=( --security-group-ids "$SG_ID" )
 
-          # UserData: Nginx & Docker 설치 + index 파일
           cat > "${OUT_DIR}/userdata.sh" <<'UD'
           #!/bin/bash
           set -Eeuo pipefail
@@ -316,7 +253,6 @@ jobs:
           systemctl enable --now docker || true
           systemctl enable --now nginx || true
           echo "<h1>GH Actions AWS Test Server</h1><p>$(date)</p>" > /usr/share/nginx/html/index.html
-          # 간단한 헬스로그
           echo "ok $(date)" >> /var/log/gha_test_health.log
           UD
 
@@ -332,15 +268,9 @@ jobs:
             --output json > "$OUT_JSON" || true
 
           IID=$(jq -r '.Instances[0].InstanceId // empty' "$OUT_JSON" 2>/dev/null || echo "")
-          if [[ -z "$IID" ]]; then
-            warn "인스턴스 ID 파싱 실패 — 이후 단계는 안전통과"
-          else
-            ok "인스턴스 생성: $IID"
-          fi
-
+          [[ -z "$IID" ]] && warn "인스턴스 ID 파싱 실패 — 이후 단계는 안전통과"
           echo "instance_id=$IID" >> "$GITHUB_OUTPUT"
 
-          # 대기 & 공인 IP 조회
           if [[ -n "$IID" ]]; then
             safe_run "wait-running" aws ec2 wait instance-running --instance-ids "$IID"
             DESC="${OUT_DIR}/describe_instance.json"
@@ -364,7 +294,6 @@ jobs:
           PIP="${{ steps.ec2.outputs.public_ip }}"
           SG="${{ steps.sg.outputs.sg_id }}"
           KP="${{ steps.key.outputs.key_name }}"
-
           {
             echo "## ✅ AWS Test Server Summary"
             echo ""
@@ -380,10 +309,9 @@ jobs:
             if [[ -n "$PIP" ]]; then
               echo "> 테스트: http://$PIP/"
             else
-              echo "> 퍼블릭 IP가 없으면 Subnet/SG 또는 퍼블릭 IP 할당 설정을 점검하세요."
+              echo "> 퍼블릭 IP가 없으면 Subnet/SG 혹은 퍼블릭 IP 할당 설정을 점검하세요."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-
           ok "Summary written"
 
       - name: Optional Teardown (delete resources)
@@ -392,35 +320,22 @@ jobs:
         run: |
           source /tmp/echo_helpers.sh
           MODE="${{ steps.mode.outputs.mode }}"
-          if [[ "$MODE" == "dry" ]]; then
-            ok "Dry-Run: 삭제 스킵(가정상 성공)"
-            exit 0
-          fi
-
+          if [[ "$MODE" == "dry" ]]; then ok "Dry-Run: 삭제 스킵(가정상 성공)"; exit 0; fi
           IID="${{ steps.ec2.outputs.instance_id }}"
           SG="${{ steps.sg.outputs.sg_id }}"
           KP="${{ steps.key.outputs.key_name }}"
-
           if [[ -n "$IID" ]]; then
             safe_run "terminate" aws ec2 terminate-instances --instance-ids "$IID"
             safe_run "wait-terminated" aws ec2 wait instance-terminated --instance-ids "$IID"
           fi
-
-          # SG는 인스턴스 분리 후 제거
-          if [[ -n "$SG" ]]; then
-            safe_run "delete-sg" aws ec2 delete-security-group --group-id "$SG"
-          fi
-
-          # 키페어는 액세스 위험 최소화를 위해 삭제 권장 (원하면 주석 처리)
-          if [[ -n "$KP" ]]; then
-            safe_run "delete-kp" aws ec2 delete-key-pair --key-name "$KP"
-          fi
-
+          [[ -n "$SG" ]] && safe_run "delete-sg" aws ec2 delete-security-group --group-id "$SG"
+          [[ -n "$KP" ]] && safe_run "delete-kp" aws ec2 delete-key-pair --key-name "$KP"
           ok "Teardown attempted (safe-continue)"
 
       - name: Collect & Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: aws-test-server-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
