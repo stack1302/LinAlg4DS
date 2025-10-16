@@ -285,7 +285,7 @@ jobs:
           echo "ami_id=${AMI:-}" >> "$GITHUB_OUTPUT"
           ok "AMI: ${AMI:-N/A}"
 
-      - name: Launch EC2 (UserData: Nginx + Docker)
+      - name: Launch EC2 (UserData:Nginx + Docker)
         id: ec2
         shell: bash
         run: |
