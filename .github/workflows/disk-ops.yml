@@ -1,4 +1,4 @@
-name: "💽 Disk Ops — Linux / Windows / macOS — No-Skip + Reports (≤10 inputs)"
+name: "💽 Disk Ops — Linux / Windows / macOS — No-Skip + ISO Injection (≤10 inputs)"
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ on:
         type: boolean
         default: true
       iso_cfg:       # 10
-        description: 'ISO/옵션: name=MYISO,src=/mnt/data,checksum=1,cleanup=1'
+        description: 'ISO/옵션: name=MYISO,src=/mnt/data,inject_kv=A=1;B=2,inject_note=...,inject_repo=dir1;dir2,inject_env=1,checksum=1,cleanup=1'
         default: ""
 
 permissions:
@@ -87,11 +87,13 @@ jobs:
           }
           kv(){ local k="$1" s="${2:-}"; IFS=',' read -ra P <<< "${s}"; for p in "${P[@]:-}"; do p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"; [[ "$p" == "$k="* ]] && echo "${p#*=}" && return 0; done; return 1; }
           kv_bool(){ local v; v="$(kv "$1" "${2:-}" || true)"; [[ "$v" =~ ^(1|true|yes|on)$ ]] && echo 1 || echo 0; }
+          # split semicolon list -> echo each element
+          split_sc(){ local s="${1:-}"; IFS=';' read -ra arr <<< "${s}"; for x in "${arr[@]:-}"; do [ -n "${x}" ] && echo "${x}"; done; }
           SH
           chmod +x /tmp/echo_helpers.sh
           echo "helpers ready"
 
-      - name: Disk Ops (Linux)
+      - name: Disk Ops (Linux) + ISO Injection
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
@@ -104,12 +106,17 @@ jobs:
           SRC="$(kv src  '${{ inputs.iso_cfg }}' || echo "${MP}")"
           DO_SUM="$(kv_bool checksum '${{ inputs.iso_cfg }}')"
           DO_CLN="$(kv_bool cleanup  '${{ inputs.iso_cfg }}')"
+          INJ_KV="$(kv inject_kv   '${{ inputs.iso_cfg }}' || true)"
+          INJ_NOTE="$(kv inject_note '${{ inputs.iso_cfg }}' || true)"
+          INJ_REPO="$(kv inject_repo '${{ inputs.iso_cfg }}' || true)"
+          INJ_ENV="$(kv_bool inject_env '${{ inputs.iso_cfg }}')"
 
-          # 공통 패키지 + ISO 도구(있으면 설치)
+          # 공통 패키지 + ISO 도구
           run_sh_req "apt.update" 2 "sudo apt-get update -y"
           run_sh_req "apt.install.core" 2 "sudo apt-get install -y parted util-linux xfsprogs udev"
           run_chain  "apt.install.iso"  "sudo apt-get install -y xorriso || sudo apt-get install -y genisoimage || sudo apt-get install -y cdrtools || true"
 
+          # 디스크 준비
           if [ "$MODE" = "linux_loop" ]; then
             run_chain "img.create" "sudo fallocate -l '${SIZE}' '${IMG}' || sudo dd if=/dev/zero of='${IMG}' bs=1M count=$(( ${{ inputs.size_gb }} * 1024 )) || true"
             run_sh_req "loop.attach" 2 "sudo losetup -fP '${IMG}'"
@@ -118,7 +125,7 @@ jobs:
             TGT="${LOOP}"
             PART="${LOOP}p1"
           else
-            if [ -z "${DEV}" ]; then warn "linux_device: device가 지정되지 않아 파괴적 작업을 생략합니다"; fi
+            if [ -z "${DEV}" ]; then warn "linux_device: device 미지정 → 파괴적 조작 생략"; fi
             TGT="${DEV}"
             PART="${DEV}1"
           fi
@@ -137,33 +144,76 @@ jobs:
             run_sh_req "mount" 2 "sudo mount '${PART}' '${MP}'"
           fi
 
-          # fstab (UUID 우선, 실패시 LABEL)
+          # fstab
           if [ -n "${PART:-}" ] && [ "${FSTAB}" = "true" ]; then
             UUID=""; for i in {1..5}; do UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true); [ -n "$UUID" ] && break || sleep 1; done
             LINE=$([ -n "$UUID" ] && echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" || echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2")
             echo "${LINE}" | sudo tee -a /etc/fstab >/dev/null || true
           fi
 
-          # 권한 이양(소유자/ACL/퍼미션)
+          # 권한 이양
           USERN="$(id -un)"; GROUPN="$(id -gn)"
           [ -d "${MP}" ] && run_chain "fix.perms" "sudo chown -R '${USERN}:${GROUPN}' '${MP}' || (command -v setfacl >/dev/null && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || sudo chmod -R a+rwx '${MP}' || true" || true
 
           # 대량 생성
           [ -d "${MP}" ] && run_sh_req  "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done" || true
           [ -d "${MP}" ] && run_sh_req  "mass.files" 1 "cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env" || true
-          [ -d "${MP}" ] && run_sh_req  "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true" || true
 
-          # ISO (요청 시) + 체크섬
+          # ===== ISO STAGING & INJECTION =====
           ISO=""
           if [ -n "${{ inputs.iso_cfg }}" ]; then
-            ISO="${{ github.workspace }}/${NAME}.iso"
-            run_chain "iso.create" "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || true"
-            if [ -f "${ISO}" ] && [ "${DO_SUM}" = "1" ]; then
-              sha256sum "${ISO}" > "${ISO}.sha256" || true
+            STAGE="${GITHUB_WORKSPACE}/_iso_stage_${NAME}"
+            rm -rf "${STAGE}" && mkdir -p "${STAGE}"
+            # 원본 복사
+            if [ -d "${SRC}" ]; then
+              cp -a "${SRC}/." "${STAGE}/" || true
+            else
+              warn "src not found: ${SRC}"
+            fi
+            # repo 경로 주입
+            if [ -n "${INJ_REPO:-}" ]; then
+              while IFS= read -r relpath; do
+                [ -z "$relpath" ] && continue
+                [ -e "${GITHUB_WORKSPACE}/${relpath}" ] && mkdir -p "${STAGE}/_repo" && cp -a "${GITHUB_WORKSPACE}/${relpath}" "${STAGE}/_repo/" || warn "inject_repo not found: ${relpath}"
+              done < <(split_sc "${INJ_REPO}")
+            fi
+            # kv 주입 -> configs/INJECT.env
+            if [ -n "${INJ_KV:-}" ]; then
+              mkdir -p "${STAGE}/configs"
+              : > "${STAGE}/configs/INJECT.env"
+              while IFS= read -r kvline; do
+                [ -z "$kvline" ] && continue
+                echo "${kvline}" >> "${STAGE}/configs/INJECT.env"
+              done < <(echo "${INJ_KV}" | tr ';' '\n')
+            fi
+            # note 주입 -> README_INJECT.txt
+            if [ -n "${INJ_NOTE:-}" ]; then
+              echo "${INJ_NOTE}" > "${STAGE}/README_INJECT.txt" || true
+            fi
+            # CI env 요약
+            if [ "${INJ_ENV}" = "1" ]; then
+              mkdir -p "${STAGE}/configs"
+              {
+                echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}"
+                echo "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}"
+                echo "GITHUB_REF=${GITHUB_REF:-}"
+                echo "RUNNER_OS=${RUNNER_OS:-}"
+                echo "RUNNER_ARCH=${RUNNER_ARCH:-}"
+                date -Iseconds
+              } > "${STAGE}/configs/CI_ENV.txt"
+            fi
+
+            # ISO 생성 + 선택 체크섬
+            ISO="${GITHUB_WORKSPACE}/${NAME}.iso"
+            run_chain "iso.create" "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${STAGE}' || genisoimage -R -J -V '${NAME}' -o '${ISO}' '${STAGE}' || mkisofs -R -J -V '${NAME}' -o '${ISO}' '${STAGE}' || true"
+            if [ -f "${ISO}" ]; then
+              [ "${DO_SUM}" = "1" ] && sha256sum "${ISO}" > "${ISO}.sha256" || true
+              mv "${ISO}" "${ART_DIR}/" || true
+              [ -f "${ISO}.sha256" ] && mv "${ISO}.sha256" "${ART_DIR}/" || true
             fi
           fi
 
-          # 리포트(시스템/마운트/구조) + 요약
+          # 리포트
           {
             echo "=== lsblk -f ==="; lsblk -f || true
             echo; echo "=== df -h ==="; df -h || true
@@ -172,7 +222,7 @@ jobs:
             echo; echo "=== tree (2 levels) ==="
             command -v tree >/dev/null 2>&1 && (tree -L 2 "${MP}" || true) || (find "${MP}" -maxdepth 2 -type d -print 2>/dev/null | head -n 200 || true)
           } > "${ART_DIR}/linux_report.txt"
-          echo -e "## Linux Summary\n- Mode: ${MODE}\n- Mount: ${MP}\n- FS: ${FS}\n- Label: ${LABEL}\n- ISO: ${ISO:-none}\n- Checksum: $([ -n "${ISO}" ] && [ "${DO_SUM}" = "1" ] && echo "generated" || echo "n/a")" >> "$GITHUB_STEP_SUMMARY"
+          echo -e "## Linux Summary\n- Mode: ${MODE}\n- Mount: ${MP}\n- FS: ${FS}\n- Label: ${LABEL}\n- ISO: ${ISO:-none}" >> "$GITHUB_STEP_SUMMARY"
 
           # 선택적 정리
           if [ "${DO_CLN}" = "1" ]; then
@@ -183,6 +233,7 @@ jobs:
               [ -n "${LOOP_DEV}" ] && sudo losetup -d "${LOOP_DEV}" || true
               sudo rm -f "${IMG}" || true
             fi
+            rm -rf "${STAGE:-}" || true
           fi
 
       - name: Upload artifacts (Linux)
@@ -199,39 +250,31 @@ jobs:
   # ===================== Windows =====================
   windows:
     if: ${{ inputs.runner == 'windows-latest' || inputs.runner == 'all' }}
-    name: "Windows — VHDX"
+    name: "Windows — VHDX + ISO Injection"
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Disk Ops (Windows)
+      - name: Disk Ops (Windows) + ISO Injection
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           $VRoot = Join-Path $env:GITHUB_WORKSPACE "vdisks"
           New-Item -ItemType Directory -Force -Path $VRoot | Out-Null
-          $Size = [int]${{ inputs.size_gb }} * 1GB
-          $Vhdx = Join-Path $VRoot "data.vhdx"
-          $DL = "${{ inputs.drive_letter }}"
+          $Size  = [int]${{ inputs.size_gb }} * 1GB
+          $Vhdx  = Join-Path $VRoot "data.vhdx"
+          $DL    = "${{ inputs.drive_letter }}"
           $Label = "${{ inputs.label }}"
-          $Summary = @()
 
-          $Summary += "## Windows Summary"
-          $Summary += "- DriveLetter: $DL"
-          $Summary += "- VHDX: $Vhdx"
-
-          Write-Host "▶ Create VHDX $Vhdx"
+          # --- VHDX: 생성/마운트/포맷 ---
           try { New-VHD -Path $Vhdx -SizeBytes $Size -Dynamic -ErrorAction Continue } catch { $_ | Out-String | Write-Warning }
-
-          Write-Host "▶ Mount VHDX"
           $disk = $null
           try { $disk = Mount-VHD -Path $Vhdx -PassThru | Get-Disk } catch { $_ | Out-String | Write-Warning }
           if ($disk) {
             try { Initialize-Disk -Number $disk.Number -PartitionStyle GPT -ErrorAction Continue } catch { $_ | Out-String | Write-Warning }
             try { New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter $DL -ErrorAction Continue | Out-Null } catch { $_ | Out-String | Write-Warning }
             try { Format-Volume -DriveLetter $DL -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false -ErrorAction Continue | Out-Null } catch { $_ | Out-String | Write-Warning }
-
             foreach ($d in @("logs","data","backups","scripts","configs","reports")) { New-Item -ItemType Directory -Force -Path "$($DL):\$d" | Out-Null }
             "KEY=VALUE" | Out-File -Encoding utf8 -FilePath "$($DL):\configs\app.env"
             "file,ts"   | Out-File -Encoding utf8 -FilePath "$($DL):\reports\index.csv"
@@ -239,27 +282,134 @@ jobs:
             Write-Warning "VHDX mount failed — continue"
           }
 
-          # 보고서
-          $rep = Join-Path $env:GITHUB_WORKSPACE ".github\echo_artifacts\windows_report.txt"
-          New-Item -ItemType Directory -Force -Path (Split-Path $rep) | Out-Null
-          "=== Get-Disk ===" | Out-File -Encoding utf8 $rep
-          Get-Disk | Format-List * | Out-String | Out-File -Append -Encoding utf8 $rep
-          "`n=== Get-Partition ===" | Out-File -Append -Encoding utf8 $rep
-          Get-Partition | Format-List * | Out-String | Out-File -Append -Encoding utf8 $rep
-          "`n=== Get-Volume ===" | Out-File -Append -Encoding utf8 $rep
-          Get-Volume | Format-List * | Out-String | Out-File -Append -Encoding utf8 $rep
-          "`n=== Directory (depth 2) ===" | Out-File -Append -Encoding utf8 $rep
-          if (Test-Path "$DL`:") { Get-ChildItem "$DL`:\" -Recurse -Depth 2 | Select-Object FullName, Length | Out-String | Out-File -Append -Encoding utf8 $rep }
+          # ===== ISO STAGING & INJECTION (Windows) =====
+          $isoCfg = "${{ inputs.iso_cfg }}"
+          if ($isoCfg.Length -gt 0) {
+            function Get-Kv { param([string]$Key,[string]$Str) $m = [regex]::Match($Str, "(?i)(^|,)\s*$Key=([^,]+)"); if($m.Success){ return $m.Groups[2].Value.Trim() } return "" }
+            function Get-Bool { param([string]$Key,[string]$Str) $v = (Get-Kv $Key $Str).ToLower(); if("1,true,yes,on" -split ',' -contains $v){ return $true } return $false }
 
-          # 선택적 정리: iso_cfg에 cleanup=1 이 있으면 분리
-          $doCleanup = 0
-          if ("${{ inputs.iso_cfg }}".ToLower().Contains("cleanup=1")) { $doCleanup = 1 }
-          if ($doCleanup -eq 1) {
-            try { Dismount-VHD -Path $Vhdx -ErrorAction Continue } catch { $_ | Out-String | Write-Warning }
+            $Name     = (Get-Kv "name" $isoCfg); if(-not $Name){ $Name = "DISK_IMG" }
+            $Src      = (Get-Kv "src"  $isoCfg); if(-not $Src){ $Src = "$($DL):\" }
+            $DoSum    = (Get-Bool "checksum" $isoCfg)
+            $DoCleanup= (Get-Bool "cleanup"  $isoCfg)
+            $injKv    = (Get-Kv "inject_kv"   $isoCfg)
+            $injNote  = (Get-Kv "inject_note" $isoCfg)
+            $injRepo  = (Get-Kv "inject_repo" $isoCfg)
+            $injEnv   = (Get-Bool "inject_env" $isoCfg)
+
+            $Stage = Join-Path $env:GITHUB_WORKSPACE ("_iso_stage_" + $Name)
+            if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+            New-Item -ItemType Directory -Path $Stage | Out-Null
+
+            # 원본 복사 (드라이브 문자/경로 둘 다 허용)
+            if (Test-Path $Src) {
+              robocopy $Src $Stage /MIR /NFL /NDL /NJH /NJS /NP | Out-Null
+            } else {
+              Write-Warning "src not found: $Src"
+            }
+
+            # repo 경로 주입
+            if ($injRepo) {
+              $dst = Join-Path $Stage "_repo"
+              New-Item -ItemType Directory -Force -Path $dst | Out-Null
+              $paths = $injRepo -split ';'
+              foreach ($rel in $paths) {
+                if (-not [string]::IsNullOrWhiteSpace($rel)) {
+                  $p = Join-Path $env:GITHUB_WORKSPACE $rel
+                  if (Test-Path $p) {
+                    robocopy $p $dst /E /NFL /NDL /NJH /NJS /NP | Out-Null
+                  } else {
+                    Write-Warning "inject_repo not found: $rel"
+                  }
+                }
+              }
+            }
+
+            # kv 주입
+            if ($injKv) {
+              $cfgDir = Join-Path $Stage "configs"
+              New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+              $envFile = Join-Path $cfgDir "INJECT.env"
+              $injKv -split ';' | ForEach-Object { if($_.Trim()){ $_ | Out-File -Append -Encoding utf8 $envFile } }
+            }
+
+            # note 주입
+            if ($injNote) {
+              $notePath = Join-Path $Stage "README_INJECT.txt"
+              $injNote | Out-File -Encoding utf8 $notePath
+            }
+
+            # CI env 요약
+            if ($injEnv) {
+              $cfgDir = Join-Path $Stage "configs"
+              New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
+              $envTxt = Join-Path $cfgDir "CI_ENV.txt"
+              @(
+                "GITHUB_REPOSITORY=$env:GITHUB_REPOSITORY"
+                "GITHUB_RUN_ID=$env:GITHUB_RUN_ID"
+                "GITHUB_REF=$env:GITHUB_REF"
+                "RUNNER_OS=$env:RUNNER_OS"
+                "RUNNER_ARCH=$env:RUNNER_ARCH"
+                (Get-Date).ToString("o")
+              ) | Out-File -Encoding utf8 $envTxt
+            }
+
+            # ISO 생성 (IMAPI2 COM; New-IsoFile)
+            function New-IsoFile {
+              param([Parameter(Mandatory=$true)][string]$Path,[Parameter(Mandatory=$true)][string]$Source)
+              $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
+              $fsi.ChooseImageDefaultsForMediaType(0) | Out-Null
+              $fsi.FileSystemsToCreate = 3  # ISO9660(1)+Joliet(2)
+              $dir = $fsi.Root
+              function Add-Dir([__ComObject]$root, [string]$src) {
+                Get-ChildItem -Force -LiteralPath $src | ForEach-Object {
+                  if ($_.PSIsContainer) {
+                    $sub = $fsi.CreateDirectoryItem($_.Name)
+                    $root.AddDirectory($sub)
+                    Add-Dir $sub $_.FullName
+                  } else {
+                    $item = $fsi.CreateFileItem($_.Name)
+                    $stream = New-Object -ComObject ADODB.Stream
+                    $stream.Type = 1; $stream.Open()
+                    $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+                    $stream.Write($bytes)
+                    $item.Data = $stream
+                    $root.AddFile($item)
+                  }
+                }
+              }
+              Add-Dir $dir $Source
+              $result = $fsi.CreateResultImage()
+              $stream = $result.ImageStream
+              $target = New-Object -ComObject ADODB.Stream
+              $target.Type = 1; $target.Open()
+              $target.Position = 0
+              $target.Write($stream.Read())
+              $target.SaveToFile($Path,2)
+              $target.Close()
+            }
+
+            $IsoPath = Join-Path $env:GITHUB_WORKSPACE ($Name + ".iso")
+            try { New-IsoFile -Path $IsoPath -Source $Stage } catch { $_ | Out-String | Write-Warning }
+
+            # 체크섬
+            if (Test-Path $IsoPath -and $DoSum) {
+              $hash = Get-FileHash -Algorithm SHA256 $IsoPath
+              $hash.Hash | Out-File -Encoding utf8 ($IsoPath + ".sha256")
+            }
+
+            # 아티팩트 이동
+            New-Item -ItemType Directory -Force -Path "${env:GITHUB_WORKSPACE}\.github\echo_artifacts" | Out-Null
+            if (Test-Path $IsoPath) { Move-Item $IsoPath "${env:GITHUB_WORKSPACE}\.github\echo_artifacts\" -Force }
+            if (Test-Path ($IsoPath + ".sha256")) { Move-Item ($IsoPath + ".sha256") "${env:GITHUB_WORKSPACE}\.github\echo_artifacts\" -Force }
+
+            # 선택적 정리
+            if ($DoCleanup) {
+              if (Test-Path "$DL`:") { try { Dismount-VHD -Path $Vhdx -ErrorAction Continue } catch { } }
+              if (Test-Path $Vhdx) { Remove-Item -Force $Vhdx }
+              if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+            }
           }
-
-          # 요약 출력
-          $Summary | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Upload artifacts (Windows)
         uses: actions/upload-artifact@v4
@@ -267,19 +417,20 @@ jobs:
           name: windows-artifacts
           path: |
             vdisks
-            .github/echo_artifacts/windows_report.txt
+            .github/echo_artifacts/*.iso
+            .github/echo_artifacts/*.iso.sha256
           if-no-files-found: warn
 
   # ===================== macOS =====================
   macos:
     if: ${{ inputs.runner == 'macos-latest' || inputs.runner == 'all' }}
-    name: "macOS — DMG"
+    name: "macOS — DMG + ISO Injection"
     runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Disk Ops (macOS)
+      - name: Disk Ops (macOS) + ISO Injection
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -290,10 +441,20 @@ jobs:
           FS="${{ inputs.fs }}"; [ "${FS}" = "APFS" ] || [ "${FS}" = "JHFS+" ] || FS="APFS"
           LABEL="${{ inputs.label }}"
           MP="${{ inputs.mount_path }}"
-          NAME="$(echo "${{ inputs.iso_cfg }}" | awk -F'name=' '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${NAME}" ] || NAME="DISK_IMG"
-          SRC="$(echo  "${{ inputs.iso_cfg }}" | awk -F'src='  '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${SRC}" ] || SRC="/Volumes/${LABEL}"
-          DO_SUM=0; echo "${{ inputs.iso_cfg }}" | grep -qi "checksum=1" && DO_SUM=1 || true
-          DO_CLN=0; echo "${{ inputs.iso_cfg }}" | grep -qi "cleanup=1" && DO_CLN=1 || true
+          # iso_cfg 파싱
+          kv(){ local k="$1" s="$2"; IFS=',' read -ra P <<< "$s"; for p in "${P[@]}"; do p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"; [[ "$p" == "$k="* ]] && echo "${p#*=}" && return 0; done; return 1; }
+          kv_bool(){ local v; v="$(kv "$1" "$2" || true)"; [[ "$v" =~ ^(1|true|yes|on)$ ]] && echo 1 || echo 0; }
+          split_sc(){ local s="$1"; IFS=';' read -ra arr <<< "$s"; for x in "${arr[@]}"; do [ -n "$x" ] && echo "$x"; done; }
+
+          NAME="$(kv name '${{ inputs.iso_cfg }}' || echo 'DISK_IMG')"
+          SRC="$(kv src  '${{ inputs.iso_cfg }}' || true)"
+          [ -n "$SRC" ] || SRC="/Volumes/${LABEL}"
+          DO_SUM="$(kv_bool checksum '${{ inputs.iso_cfg }}')"
+          DO_CLN="$(kv_bool cleanup  '${{ inputs.iso_cfg }}')"
+          INJ_KV="$(kv inject_kv   '${{ inputs.iso_cfg }}' || true)"
+          INJ_NOTE="$(kv inject_note '${{ inputs.iso_cfg }}' || true)"
+          INJ_REPO="$(kv inject_repo '${{ inputs.iso_cfg }}' || true)"
+          INJ_ENV="$(kv_bool inject_env '${{ inputs.iso_cfg }}')"
 
           echo "▶ create DMG"
           hdiutil create -size "${SIZE}g" -fs "${FS}" -volname "${LABEL}" "${DMG}" >>"${LOG_DIR}/mac.log" 2>&1 || true
@@ -306,14 +467,58 @@ jobs:
             echo "file,ts" > "${MOUNT}/reports/index.csv"
           fi
 
-          # ISO + 체크섬
+          # ===== ISO STAGING & INJECTION (macOS) =====
           ISO=""
           if [ -n "${{ inputs.iso_cfg }}" ]; then
+            STAGE="${GITHUB_WORKSPACE}/_iso_stage_${NAME}"
+            rm -rf "${STAGE}" && mkdir -p "${STAGE}"
+            if [ -d "${SRC}" ]; then
+              cp -a "${SRC}/." "${STAGE}/" || true
+            else
+              echo "WARN: src not found: ${SRC}" >> "${LOG_DIR}/mac.log"
+            fi
+            # repo 주입
+            if [ -n "${INJ_REPO:-}" ]; then
+              mkdir -p "${STAGE}/_repo"
+              while IFS= read -r rel; do
+                [ -z "$rel" ] && continue
+                if [ -e "${GITHUB_WORKSPACE}/${rel}" ]; then
+                  cp -a "${GITHUB_WORKSPACE}/${rel}" "${STAGE}/_repo/" || true
+                else
+                  echo "WARN: inject_repo not found: ${rel}" >> "${LOG_DIR}/mac.log"
+                fi
+              done < <(split_sc "${INJ_REPO}")
+            fi
+            # kv 주입
+            if [ -n "${INJ_KV:-}" ]; then
+              mkdir -p "${STAGE}/configs"
+              : > "${STAGE}/configs/INJECT.env"
+              echo "${INJ_KV}" | tr ';' '\n' >> "${STAGE}/configs/INJECT.env"
+            fi
+            # note 주입
+            if [ -n "${INJ_NOTE:-}" ]; then
+              echo "${INJ_NOTE}" > "${STAGE}/README_INJECT.txt" || true
+            fi
+            # env 주입
+            if [ "${INJ_ENV}" = "1" ]; then
+              mkdir -p "${STAGE}/configs"
+              {
+                echo "GITHUB_REPOSITORY=${GITHUB_REPOSITORY:-}"
+                echo "GITHUB_RUN_ID=${GITHUB_RUN_ID:-}"
+                echo "GITHUB_REF=${GITHUB_REF:-}"
+                echo "RUNNER_OS=${RUNNER_OS:-}"
+                echo "RUNNER_ARCH=${RUNNER_ARCH:-}"
+                date -Iseconds
+              } > "${STAGE}/configs/CI_ENV.txt"
+            fi
+
             ISO="${GITHUB_WORKSPACE}/${NAME}.iso"
-            hdiutil makehybrid -o "${ISO}" "${SRC}" -iso -joliet -default-volume-name "${NAME}" >>"${LOG_DIR}/mac.log" 2>&1 || true
-            if [ -f "${ISO}" ] && [ ${DO_SUM} -eq 1 ]; then
+            hdiutil makehybrid -o "${ISO}" "${STAGE}" -iso -joliet -default-volume-name "${NAME}" >>"${LOG_DIR}/mac.log" 2>&1 || true
+            if [ -f "${ISO}" ] && [ "${DO_SUM}" = "1" ]; then
               shasum -a 256 "${ISO}" > "${ISO}.sha256" || true
             fi
+            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || true
+            [ -f "${ISO}.sha256" ] && mv "${ISO}.sha256" "${ART_DIR}/" || true
           fi
 
           # 리포트
@@ -324,12 +529,13 @@ jobs:
             echo; echo "=== tree (2 levels) ==="
             find "${MOUNT}" -maxdepth 2 -print 2>/dev/null | head -n 200 || true
           } > "${ART_DIR}/mac_report.txt"
-          echo -e "## macOS Summary\n- Volume: ${LABEL}\n- FS: ${FS}\n- ISO: ${ISO:-none}\n- Checksum: $([ -f "${ISO}" ] && [ ${DO_SUM} -eq 1 ] && echo "generated" || echo "n/a")" >> "$GITHUB_STEP_SUMMARY"
+          echo -e "## macOS Summary\n- Volume: ${LABEL}\n- FS: ${FS}\n- ISO: $([ -f "${ART_DIR}/${NAME}.iso" ] && echo "${NAME}.iso" || echo "none")" >> "$GITHUB_STEP_SUMMARY"
 
           # 선택적 정리
-          if [ ${DO_CLN} -eq 1 ]; then
+          if [ "${DO_CLN}" = "1" ]; then
             [ -d "${MOUNT}" ] && hdiutil detach "${MOUNT}" || true
             rm -f "${DMG}" || true
+            rm -rf "${STAGE:-}" || true
           fi
 
       - name: Upload artifacts (macOS)
