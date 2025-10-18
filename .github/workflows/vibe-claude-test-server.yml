@@ -1,5 +1,5 @@
 # .github/workflows/vibe-claude-test-server.yml
-name: "🟢 Vibe + Claude Code + Test Server — No-Skip v2 (Runner Fallback + Cleanup Fix)"
+name: "🟢 Vibe + Claude Code + Test Server — No-Skip v3 (Runner Fallback + Cleanup Fix + Files/Perms)"
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
         if: always()
         uses: actions/checkout@v4
 
-      - name: Echo helpers (Safe-Continue v2)
+      - name: Echo helpers (Safe-Continue v3)
         if: always()
         shell: bash
         run: |
@@ -97,7 +97,7 @@ jobs:
           OK(){   echo "${ECHO_OK} [$(TS)] $*"; }
           WARN(){ echo "${ECHO_WARN} [$(TS)] $*" >&2; }
           FAIL(){ echo "${ECHO_FAIL} [$(TS)] $*" >&2; }
-          # 실패도 기록하고 항상 0으로 반환(진행 보장)
+          # 실패도 기록하고 항상 0 반환(진행 보장)
           safe_run(){
             local name="$1"; shift
             ( "$@" ) >>"${LOG_DIR}/${name}.log" 2>&1
@@ -129,11 +129,133 @@ jobs:
             git config --global user.name "vibe-bot"
             git config --global user.email "vibe-bot@users.noreply.github.com"
           '
-          # 함수 호출 대신 인라인 find 사용(서브쉘/컨텍스트 문제 제거)
           safe_run "cleanup.old" bash -lc '
             D=${{ github.event.inputs.cleanup_days }}
             find "${LOG_DIR}" -type f -mtime +${D} -print -delete 2>/dev/null || true
             find "${ARTIFACT_DIR}" -type f -mtime +${D} -print -delete 2>/dev/null || true
+          '
+
+      # [NEW] Claude Code 워크스페이스 부트스트랩 (필수 디렉토리/파일/권한)
+      - name: Claude Workspace Bootstrap (dirs/files/perms)
+        if: always()
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          source /tmp/echo_helpers.sh
+
+          safe_run "dirs.create" bash -lc '
+            mkdir -p \
+              .claude \
+              .claude/prompt_templates \
+              .claude/sessions \
+              .github/permissions \
+              .github/hooks \
+              .github/echo_logs \
+              .github/echo_artifacts \
+              .github/echo_downloads
+          '
+
+          # 기본 컨피그/프롬프트
+          safe_run "claude.config.write" bash -lc '
+            cat > .claude/config.json <<JSON
+            {
+              "projectName": "${{ github.repository }}",
+              "defaultOutputFormat": "${{ github.event.inputs.output_format }}",
+              "autosaveSessions": true,
+              "telemetry": false
+            }
+            JSON
+          '
+          safe_run "prompt.template.write" bash -lc '
+            cat > .claude/prompt_templates/vibe.md <<TXT
+            # Vibe Coding — Project Guide
+            - 목적: 작은 단위 변경, 테스트 통과, README/CHANGELOG 갱신
+            - 제약: 대규모 무단 리팩토링 금지, 라이선스/컨벤션 준수
+            - 산출물: 수정 파일 목록 + 실행 방법 + 다음 액션
+            TXT
+          '
+
+          # 권한/허용 리스트
+          safe_run "perms.allow.write" bash -lc '
+            cat > .github/permissions/allowed_tools.json <<JSON
+            {
+              "allowedTools": [
+                "Edit",
+                "Search",
+                "Bash(git *)",
+                "Bash(python *)",
+                "Bash(npm *)"
+              ],
+              "denyShellPatterns": [
+                "rm -rf /",
+                ":(){ :|:& };:",
+                "mkfs*",
+                "dd if=* of=/dev/*",
+                "chmod 777 -R /",
+                "chown -R * /*"
+              ]
+            }
+            JSON
+          '
+          safe_run "perms.commands.write" bash -lc '
+            cat > .github/permissions/allowed_commands.sh <<BASH
+            #!/usr/bin/env bash
+            # 단순 커맨드 가드 (위험 커맨드 탐지 시 2 반환)
+            set -Eeuo pipefail
+            BAD_PATTERNS=("rm -rf /" ":(){ :|:& };:" "mkfs" "dd if=" "chmod 777 -R /" "chown -R " "/dev/sd")
+            INPUT="\$*"
+            for p in "\${BAD_PATTERNS[@]}"; do
+              if grep -qi -- "\$p" <<< "\$INPUT"; then
+                echo "[GUARD] blocked: \$p"
+                exit 2
+              fi
+            done
+            exit 0
+            BASH
+            chmod +x .github/permissions/allowed_commands.sh
+          '
+          safe_run "perms.readme.write" bash -lc '
+            cat > .github/permissions/README.md <<MD
+            # Permissions Policy for Claude Code
+            - 허용 도구는 \`allowed_tools.json\`의 \`allowedTools\`를 따름
+            - 위험 커맨드는 \`denyShellPatterns\` / \`allowed_commands.sh\` 로 가드
+            - 워크플로우 입력 \`allow_tools\`와의 교집합을 사용 권장
+            MD
+          '
+
+          # 에디터/깃 속성
+          safe_run "repo.dotfiles.write" bash -lc '
+            cat > .editorconfig <<EC
+            root = true
+            [*]
+            charset = utf-8
+            end_of_line = lf
+            indent_style = space
+            indent_size = 2
+            insert_final_newline = true
+            trim_trailing_whitespace = true
+            EC
+
+            cat > .gitattributes <<GA
+            * text=auto eol=lf
+            GA
+
+            # .gitignore는 append (존재하면 유지)
+            {
+              echo ".github/echo_logs/"
+              echo ".github/echo_artifacts/"
+              echo ".github/echo_downloads/"
+              echo ".claude/sessions/"
+              echo "node_modules/"
+              echo ".venv/"
+              echo "__pycache__/"
+            } | tee -a .gitignore >/dev/null
+          '
+
+          # 실행 권한 일괄 정리
+          safe_run "chmod.exec" bash -lc '
+            chmod -R a+rX .github || true
+            find .github -type f -name "*.sh" -exec chmod +x {} \; || true
           '
 
       - name: Node 설치
@@ -256,6 +378,14 @@ jobs:
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
+
+          # [NEW] 워크플로우 입력 allow_tools ↔ 리포 allowlist 교차 검사(로그용)
+          safe_run "perms.cross-check" bash -lc '
+            echo "INPUT allow_tools: ${{ github.event.inputs.allow_tools }}" | tee "${LOG_DIR}/allow_tools.input.txt"
+            jq -r ".allowedTools[]" .github/permissions/allowed_tools.json 2>/dev/null \
+              | tee "${LOG_DIR}/allow_tools.repo.txt" || true
+          '
+
           PROMPT_FILE="${ARTIFACT_DIR}/prompt.txt"
           cat > "$PROMPT_FILE" <<'TXT'
           당신은 "바이브 코딩" 에이전트입니다.
@@ -275,6 +405,9 @@ jobs:
           EXTRA=""
           if [ -f ".mcp.json" ]; then EXTRA="--mcp-debug"; fi
 
+          # [NEW] 간이 커맨드 가드(허용되지 않은 위험 커맨드 탐지 시 경고만 남김, 중단 X)
+          safe_run "guard.commands" bash -lc '.github/permissions/allowed_commands.sh "$ALLOW" || true'
+
           safe_run "claude.run" bash -lc '
             claude -p "$(cat "'"$PROMPT_FILE"'")" \
               --output-format "'"$OUT_FMT"'" \
@@ -282,7 +415,6 @@ jobs:
               '"$EXTRA"' | tee "'"$LOG_DIR"'/claude_output.jsonl"
           '
 
-          # tail 요약
           {
             echo "# Claude Headless Output (tail)"
             tail -n 200 "$LOG_DIR/claude_output.jsonl" || true
@@ -333,6 +465,7 @@ jobs:
             - 허용 도구: `${{ github.event.inputs.allow_tools }}`
             - MCP: `${{ github.event.inputs.mcp_enable }}`
             - 테스트 서버/헬스체크: 적용
+            - 파일/디렉토리/권한 정책 자동 부트스트랩 포함
           branch: ${{ env.BRANCH_NAME }}
           base: ${{ github.ref_name }}
 
