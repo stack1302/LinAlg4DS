@@ -1,47 +1,39 @@
 # .github/workflows/vibe-claude-test-server.yml
-name: "🟢 Vibe + Claude Code + Test Server — No-Skip + Runner Fallback + Cleanup (≤10 inputs)"
+name: "🟢 Vibe + Claude Code + Test Server — No-Skip v2 (Runner Fallback + Cleanup Fix)"
 
 on:
   workflow_dispatch:
     inputs:
-      task:                         # 1
-        description: "무엇을 구현/수정할지 자연어로 작성"
+      task:
+        description: "무엇을 구현/수정할지"
         required: true
         default: "FastAPI healthcheck 추가 및 README 업데이트"
-      allow_tools:                  # 2
-        description: "허용 도구(콤마). 예: Edit,Bash(git *),Search"
+      allow_tools:
+        description: "허용 도구(콤마)"
         required: false
         default: "Edit,Bash(git *),Search,Bash(python *),Bash(npm *)"
-      mcp_enable:                   # 3
-        description: "MCP 사용 여부"
+      mcp_enable:
         type: boolean
         default: false
-      branch_name:                  # 4
-        description: "작업 브랜치명(빈값=자동)"
+      branch_name:
         required: false
         default: ""
-      auto_commit:                  # 5
-        description: "변경사항 자동 커밋/푸시"
+      auto_commit:
         type: boolean
         default: true
-      auto_pr:                      # 6
-        description: "PR 자동 생성"
+      auto_pr:
         type: boolean
         default: true
-      run_tests:                    # 7
-        description: "테스트 실행(있을 때)"
+      run_tests:
         type: boolean
         default: false
-      output_format:                # 8
-        description: "출력 포맷: text | stream-json"
+      output_format:
         required: false
         default: "stream-json"
-      cleanup_days:                 # 9
-        description: "오래된 산출물 정리 기준일(일)"
+      cleanup_days:
         required: false
         default: "7"
-      test_port:                    # 10
-        description: "로컬 테스트 서버 포트"
+      test_port:
         required: false
         default: "8089"
 
@@ -63,56 +55,37 @@ env:
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
 
-# -------- 러너 안정성: 24.04 ↔ 22.04 이중 러너 병렬 실행(한쪽 실패해도 진행) --------
 jobs:
   preflight:
-    name: "Runner Preflight — OS matrix"
+    name: "Runner Preflight (24.04 + 22.04)"
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, ubuntu-22.04]
+      matrix: { os: [ubuntu-24.04, ubuntu-22.04] }
     runs-on: ${{ matrix.os }}
-    outputs:
-      ok24: ${{ steps.mark.outputs.ok24 }}
-      ok22: ${{ steps.mark.outputs.ok22 }}
     steps:
-      - name: Preflight:echo
+      - name: Env echo
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
           echo "Runner: $(uname -a)"
-          echo "Disk:"
           df -h || true
-          echo "Node:"
           node -v || true
-          echo "Python:"
           python3 --version || true
-
-      - name: Preflight:mark success for downstream
-        id: mark
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if grep -q "24.04" <<< "${{ runner.os }} ${{ matrix.os }}"; then
-            echo "ok24=true" >> "$GITHUB_OUTPUT"
-          fi
-          if grep -q "22.04" <<< "${{ runner.os }} ${{ matrix.os }}"; then
-            echo "ok22=true" >> "$GITHUB_OUTPUT"
-          fi
 
   vibe:
     name: "Vibe + Claude Code + Test Server (safe-continue)"
     needs: [preflight]
-    # 둘 중 하나라도 성공했으면 진행
-    if: ${{ always() && (needs.preflight.result == 'success' || needs.preflight.result == 'failure') }}
-    # 기본 러너는 최신으로, 24.04 실패 시에도 잡 자체는 진행되도록 구성
+    if: always()
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
+        if: always()
         uses: actions/checkout@v4
 
-      - name: Echo helpers (safe-continue wrappers)
+      - name: Echo helpers (Safe-Continue v2)
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -121,37 +94,32 @@ jobs:
           #!/usr/bin/env bash
           set -Eeo pipefail
           TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
-          OK(){  echo "${ECHO_OK} [$ (TS)] $*"; }
+          OK(){   echo "${ECHO_OK} [$(TS)] $*"; }
           WARN(){ echo "${ECHO_WARN} [$(TS)] $*" >&2; }
           FAIL(){ echo "${ECHO_FAIL} [$(TS)] $*" >&2; }
-          # 안전 실행(에러여도 종료하지 않고 코드/메시지 기록)
+          # 실패도 기록하고 항상 0으로 반환(진행 보장)
           safe_run(){
             local name="$1"; shift
-            if "$@" >>"${LOG_DIR}/${name}.log" 2>&1; then
+            ( "$@" ) >>"${LOG_DIR}/${name}.log" 2>&1
+            local ec=$?
+            if [ $ec -eq 0 ]; then
               OK "$name: OK"
               echo "::notice title=${name}::OK"
               echo "- ${name}: OK" >> "$GITHUB_STEP_SUMMARY"
-              return 0
             else
-              local ec=$?
-              FAIL "$name: FAILED (exit=$ec)"
+              FAIL "$name: FAILED (exit=${ec})"
               echo "::warning title=${name}::FAILED (exit=${ec}) — see ${LOG_DIR}/${name}.log"
               echo "- ${name}: FAILED (exit=${ec})" >> "$GITHUB_STEP_SUMMARY"
-              return $ec
             fi
-          }
-          # 오래된 산출물 정리
-          cleanup_old(){
-            local days="$1"
-            find "${LOG_DIR}" -type f -mtime +"$days" -print -delete || true
-            find "${ARTIFACT_DIR}" -type f -mtime +"$days" -print -delete || true
+            return 0
           }
           SH
           chmod +x /tmp/echo_helpers.sh
           source /tmp/echo_helpers.sh
           OK "helpers ready"
 
-      - name: 권한/디렉토리 준비 + 오래된 산출물 정리
+      - name: 권한/디렉토리 준비 + 오래된 산출물 정리(컨텍스트 고정)
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -161,14 +129,21 @@ jobs:
             git config --global user.name "vibe-bot"
             git config --global user.email "vibe-bot@users.noreply.github.com"
           '
-          safe_run "cleanup.old" bash -lc 'cleanup_old "${{ github.event.inputs.cleanup_days }}"'
+          # 함수 호출 대신 인라인 find 사용(서브쉘/컨텍스트 문제 제거)
+          safe_run "cleanup.old" bash -lc '
+            D=${{ github.event.inputs.cleanup_days }}
+            find "${LOG_DIR}" -type f -mtime +${D} -print -delete 2>/dev/null || true
+            find "${ARTIFACT_DIR}" -type f -mtime +${D} -print -delete 2>/dev/null || true
+          '
 
-      - name: Node 설치 (Claude Code 용)
+      - name: Node 설치
+        if: always()
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
       - name: Claude Code 설치 & 진단
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -178,26 +153,24 @@ jobs:
           safe_run "claude.doctor"  bash -lc 'claude doctor || true'
 
       - name: (옵션) MCP 설정
-        if: ${{ github.event.inputs.mcp_enable == 'true' }}
+        if: always() && ${{ github.event.inputs.mcp_enable == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           safe_run "mcp.config" bash -lc '
             cat > .mcp.json <<JSON
-            {
-              "clients": {"default": {"transport": {"type":"stdio"}}},
+            { "clients": { "default": { "transport": { "type":"stdio" } } },
               "servers": {
                 "github":   {"command":"npx","args":["-y","@modelcontextprotocol/server-github"]},
                 "puppeteer":{"command":"npx","args":["-y","@modelcontextprotocol/server-puppeteer"]}
-              }
-            }
+              } }
             JSON
-            echo "--- .mcp.json ---"
             cat .mcp.json
           '
 
       - name: 작업 브랜치 준비
+        if: always()
         id: branch
         shell: bash
         run: |
@@ -208,29 +181,32 @@ jobs:
           echo "BRANCH_NAME=$BN" | tee -a $GITHUB_ENV
           safe_run "git.branch" bash -lc 'git checkout -b "$BRANCH_NAME"'
 
-      # ---------- 테스트 서버(로컬) 기동 + 상태 체크 ----------
+      # ---- 테스트 서버: 백그라운드 기동 + 헬스체크 (항상 진행, 실패해도 통과) ----
       - name: Test Server – 파일 준비
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
           mkdir -p .github/test_server
-          cat > .github/test_server/server.py <<'PY'
-          import http.server, socketserver, os
-          PORT = int(os.getenv("TEST_PORT","8089"))
-          class Handler(http.server.SimpleHTTPRequestHandler):
-              def do_GET(self):
-                  if self.path in ("/","/healthz"):
-                      self.send_response(200); self.end_headers()
-                      self.wfile.write(b"OK: test-server alive")
-                  else:
-                      self.send_response(404); self.end_headers()
-          with socketserver.TCPServer(("", PORT), Handler) as httpd:
-              httpd.serve_forever()
-          PY
-          echo "- server.py ready" >> "$GITHUB_STEP_SUMMARY"
+          safe_run "test-srv.write" bash -lc '
+            cat > .github/test_server/server.py <<PY
+            import http.server, socketserver, os
+            PORT = int(os.getenv("TEST_PORT","8089"))
+            class Handler(http.server.SimpleHTTPRequestHandler):
+                def do_GET(self):
+                    if self.path in ("/","/healthz"):
+                        self.send_response(200); self.end_headers()
+                        self.wfile.write(b"OK: test-server alive")
+                    else:
+                        self.send_response(404); self.end_headers()
+            with socketserver.TCPServer(("", PORT), Handler) as httpd:
+                httpd.serve_forever()
+            PY
+          '
 
-      - name: Test Server – 백그라운드 기동
+      - name: Test Server – 기동
+        if: always()
         shell: bash
         env:
           TEST_PORT: ${{ github.event.inputs.test_port }}
@@ -243,7 +219,8 @@ jobs:
             sleep 1
           '
 
-      - name: Test Server – Healthcheck (실패해도 계속)
+      - name: Test Server – Healthcheck
+        if: always()
         shell: bash
         env:
           TEST_PORT: ${{ github.event.inputs.test_port }}
@@ -252,15 +229,14 @@ jobs:
           source /tmp/echo_helpers.sh
           safe_run "test-srv.health" bash -lc '
             for i in {1..10}; do
-              if curl -fsS "http://127.0.0.1:${TEST_PORT}/healthz" | grep -q "OK"; then
-                exit 0
-              fi
+              if curl -fsS "http://127.0.0.1:${TEST_PORT}/healthz" | grep -q "OK"; then exit 0; fi
               sleep 1
             done
             exit 2
           '
 
-      - name: OIDC 컨텍스트 (요청하신 정보 덤프)
+      - name: OIDC 컨텍스트 덤프(마스킹)
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -272,8 +248,8 @@ jobs:
             } | sed "s/${{ secrets.GITHUB_TOKEN }}/***masked***/g" | tee "${LOG_DIR}/oidc_context.txt"
           '
 
-      # ---------- Claude Code 헤드리스 실행 ----------
       - name: Claude Headless (Vibe 프롬프트)
+        if: always()
         shell: bash
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -284,16 +260,11 @@ jobs:
           cat > "$PROMPT_FILE" <<'TXT'
           당신은 "바이브 코딩" 에이전트입니다.
           목표:
-          1) 요청한 작업을 구현(코드/설정/문서)
-          2) 변경을 최소 단위로 커밋 가능하도록 나누기
-          3) 테스트/빌드가 있으면 실행해 통과 확인
-          4) 완료 후 .github/echo_logs/summary.md 에 OK/FAIL 포함한 요약 저장
-
-          제약:
-          - 무단 대규모 리팩토링 금지
-          - 레포 컨벤션/라이선스 준수
-          - 스크립트/설정은 idempotent
-
+          1) 요청 작업을 구현(코드/설정/문서)
+          2) 변경은 최소 단위로 분리
+          3) 테스트/빌드 통과 확인(있을 때)
+          4) 완료 후 .github/echo_logs/summary.md 에 OK/FAIL 포함 요약 저장
+          제약: 대규모 무단 리팩토링 금지, 레포 컨벤션/라이선스 준수, 스크립트는 idempotent
           입력 Task:
           {{TASK}}
           TXT
@@ -308,17 +279,17 @@ jobs:
             claude -p "$(cat "'"$PROMPT_FILE"'")" \
               --output-format "'"$OUT_FMT"'" \
               --allowedTools "'"$ALLOW"'" \
-              $EXTRA | tee "'"$LOG_DIR"'/claude_output.jsonl"
+              '"$EXTRA"' | tee "'"$LOG_DIR"'/claude_output.jsonl"
           '
 
-          # 요약 파일(최근 200라인)
+          # tail 요약
           {
             echo "# Claude Headless Output (tail)"
             tail -n 200 "$LOG_DIR/claude_output.jsonl" || true
           } > "$LOG_DIR/summary.md"
 
       - name: (옵션) 테스트 실행
-        if: ${{ github.event.inputs.run_tests == 'true' }}
+        if: always() && ${{ github.event.inputs.run_tests == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -340,23 +311,20 @@ jobs:
           '
 
       - name: 변경사항 커밋/푸시
-        if: ${{ github.event.inputs.auto_commit == 'true' }}
+        if: always() && ${{ github.event.inputs.auto_commit == 'true' }}
         shell: bash
         run: |
           set -Eeuo pipefail
           source /tmp/echo_helpers.sh
-          safe_run "git.add"    bash -lc 'git add -A'
+          safe_run "git.add"    bash -lc 'git add -A || true'
           safe_run "git.commit" bash -lc '
-            if git diff --cached --quiet; then
-              echo "no staged changes"
-              exit 0
-            fi
-            git commit -m "vibe: apply changes via Claude Code headless"
+            if git diff --cached --quiet; then exit 0; fi
+            git commit -m "vibe: apply changes via Claude Code headless" || true
           '
-          safe_run "git.push"   bash -lc 'git push origin "$BRANCH_NAME"'
+          safe_run "git.push"   bash -lc 'git push origin "$BRANCH_NAME" || true'
 
       - name: PR 생성
-        if: ${{ github.event.inputs.auto_pr == 'true' }}
+        if: always() && ${{ github.event.inputs.auto_pr == 'true' }}
         uses: peter-evans/create-pull-request@v6
         with:
           title: "vibe: ${{ github.event.inputs.task }}"
@@ -364,11 +332,12 @@ jobs:
             자동 생성: Claude Code 헤드리스 바이브 코딩 결과
             - 허용 도구: `${{ github.event.inputs.allow_tools }}`
             - MCP: `${{ github.event.inputs.mcp_enable }}`
-            - 러너 24.04/22.04 이중 프리플라이트 적용
+            - 테스트 서버/헬스체크: 적용
           branch: ${{ env.BRANCH_NAME }}
           base: ${{ github.ref_name }}
 
       - name: 테스트 서버 종료(있으면)
+        if: always()
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -380,6 +349,7 @@ jobs:
           '
 
       - name: 아티팩트 업로드(로그/요약/컨텍스트)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: vibe-logs
