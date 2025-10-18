@@ -1,5 +1,4 @@
-# .github/workflows/disk-ops.yml
-name: "💽 Disk Ops — Linux / Windows / macOS — No-Skip (≤10 inputs)"
+name: "💽 Disk Ops — Linux / Windows / macOS — No-Skip + Reports (≤10 inputs)"
 
 on:
   workflow_dispatch:
@@ -37,7 +36,7 @@ on:
         type: boolean
         default: true
       iso_cfg:       # 10
-        description: 'ISO 생성 설정(비우면 생성 안함) 예: name=MYISO,src=/mnt/data (Linux/macOS 지원)'
+        description: 'ISO/옵션: name=MYISO,src=/mnt/data,checksum=1,cleanup=1'
         default: ""
 
 permissions:
@@ -49,13 +48,12 @@ env:
   ART_DIR: .github/echo_artifacts
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
-  ECHO_FAIL: "❌"
 
-# --- Linux Job ---
 jobs:
+  # ===================== Linux =====================
   linux:
     if: ${{ inputs.runner == 'ubuntu-24.04' || inputs.runner == 'all' }}
-    name: "Linux — ${ { inputs.mode } }"
+    name: "Linux — ${{ inputs.mode }}"
     runs-on: ubuntu-24.04
 
     steps:
@@ -72,8 +70,9 @@ jobs:
           #!/usr/bin/env bash
           set -Euo pipefail
           TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
-          ok(){ echo "${ECHO_OK} [$(TS)] $*"; }
-          warn(){ echo "${ECHO_WARN} [$(TS)] $*" >&2; }
+          ok(){ echo "✅ [$(TS)] $*"; }
+          warn(){ echo "⚠️ [$(TS)] $*" >&2; }
+
           run_sh_req(){ # <name> <retries> "<cmd>"
             local n="$1" r="$2" c="$3" a=0 s=1
             echo "▶ ${n} :: ${c} (retries=${r})"
@@ -86,7 +85,8 @@ jobs:
             local n="$1" ch="$2"; echo "▶ ${n} (chain)"
             bash -lc "${ch}" >>"${LOG_DIR}/linux.log" 2>&1 || true; ok "${n} OK"
           }
-          kv(){ local k="$1" s="$2"; IFS=',' read -ra P <<< "$s"; for p in "${P[@]}"; do p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"; [[ "$p" == "$k="* ]] && echo "${p#*=}" && return 0; done; return 1; }
+          kv(){ local k="$1" s="${2:-}"; IFS=',' read -ra P <<< "${s}"; for p in "${P[@]:-}"; do p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"; [[ "$p" == "$k="* ]] && echo "${p#*=}" && return 0; done; return 1; }
+          kv_bool(){ local v; v="$(kv "$1" "${2:-}" || true)"; [[ "$v" =~ ^(1|true|yes|on)$ ]] && echo 1 || echo 0; }
           SH
           chmod +x /tmp/echo_helpers.sh
           echo "helpers ready"
@@ -100,6 +100,10 @@ jobs:
           MP="${{ inputs.mount_path }}"; FS="${{ inputs.fs }}"
           LABEL="${{ inputs.label }}"; FSTAB="${{ inputs.fstab }}"
           DEV="${{ inputs.device }}"
+          NAME="$(kv name '${{ inputs.iso_cfg }}' || echo 'DISK_IMG')"
+          SRC="$(kv src  '${{ inputs.iso_cfg }}' || echo "${MP}")"
+          DO_SUM="$(kv_bool checksum '${{ inputs.iso_cfg }}')"
+          DO_CLN="$(kv_bool cleanup  '${{ inputs.iso_cfg }}')"
 
           # 공통 패키지 + ISO 도구(있으면 설치)
           run_sh_req "apt.update" 2 "sudo apt-get update -y"
@@ -114,51 +118,72 @@ jobs:
             TGT="${LOOP}"
             PART="${LOOP}p1"
           else
+            if [ -z "${DEV}" ]; then warn "linux_device: device가 지정되지 않아 파괴적 작업을 생략합니다"; fi
             TGT="${DEV}"
             PART="${DEV}1"
           fi
 
           # 파티션/포맷/마운트
-          run_sh_req "gpt.label" 1 "sudo parted -s '${TGT}' mklabel gpt"
-          run_sh_req "gpt.part"  1 "sudo parted -s '${TGT}' mkpart primary ${FS} 0% 100%"
-          run_chain  "part.probe" "sudo partprobe '${TGT}' || sudo udevadm settle || true"
-          if [ "${FS}" = "xfs" ]; then
-            run_sh_req "mkfs.xfs" 1 "sudo mkfs.xfs -f -L '${LABEL}' '${PART}'"
-          else
-            run_sh_req "mkfs.ext4" 2 "sudo mkfs.ext4 -F -L '${LABEL}' '${PART}'"
+          [ -n "${TGT}" ] && run_sh_req "gpt.label" 1 "sudo parted -s '${TGT}' mklabel gpt" || true
+          [ -n "${TGT}" ] && run_sh_req "gpt.part"  1 "sudo parted -s '${TGT}' mkpart primary ${FS} 0% 100%" || true
+          [ -n "${TGT}" ] && run_chain  "part.probe" "sudo partprobe '${TGT}' || sudo udevadm settle || true" || true
+          if [ -n "${PART}" ]; then
+            if [ "${FS}" = "xfs" ]; then
+              run_sh_req "mkfs.xfs" 1 "sudo mkfs.xfs -f -L '${LABEL}' '${PART}'"
+            else
+              run_sh_req "mkfs.ext4" 2 "sudo mkfs.ext4 -F -L '${LABEL}' '${PART}'"
+            fi
+            run_sh_req "mkdir.mountpoint" 1 "sudo mkdir -p '${MP}'"
+            run_sh_req "mount" 2 "sudo mount '${PART}' '${MP}'"
           fi
-          run_sh_req "mkdir.mountpoint" 1 "sudo mkdir -p '${MP}'"
-          run_sh_req "mount" 2 "sudo mount '${PART}' '${MP}'"
 
           # fstab (UUID 우선, 실패시 LABEL)
-          UUID=""; for i in {1..5}; do UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true); [ -n "$UUID" ] && break || sleep 1; done
-          if [ "${FSTAB}" = "true" ]; then
+          if [ -n "${PART:-}" ] && [ "${FSTAB}" = "true" ]; then
+            UUID=""; for i in {1..5}; do UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true); [ -n "$UUID" ] && break || sleep 1; done
             LINE=$([ -n "$UUID" ] && echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" || echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2")
             echo "${LINE}" | sudo tee -a /etc/fstab >/dev/null || true
           fi
-          echo "mounted ${MP} (${PART})"
 
           # 권한 이양(소유자/ACL/퍼미션)
           USERN="$(id -un)"; GROUPN="$(id -gn)"
-          run_chain "fix.perms" "sudo chown -R '${USERN}:${GROUPN}' '${MP}' || (command -v setfacl >/dev/null && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || sudo chmod -R a+rwx '${MP}' || true"
+          [ -d "${MP}" ] && run_chain "fix.perms" "sudo chown -R '${USERN}:${GROUPN}' '${MP}' || (command -v setfacl >/dev/null && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || sudo chmod -R a+rwx '${MP}' || true" || true
 
-          # 대량 생성(일반 → sudo 대체)
-          run_sh_req  "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done"
-          run_sh_req  "mass.dirs.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done && chown -R '${USERN}:${GROUPN}' .\""
-          run_sh_req  "mass.files" 1 "cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env"
-          run_sh_req  "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true"
+          # 대량 생성
+          [ -d "${MP}" ] && run_sh_req  "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done" || true
+          [ -d "${MP}" ] && run_sh_req  "mass.files" 1 "cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env" || true
+          [ -d "${MP}" ] && run_sh_req  "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true" || true
 
-          # ISO (요청 시)
+          # ISO (요청 시) + 체크섬
+          ISO=""
           if [ -n "${{ inputs.iso_cfg }}" ]; then
-            NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
-            SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MP}")
             ISO="${{ github.workspace }}/${NAME}.iso"
             run_chain "iso.create" "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || true"
-            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || true
+            if [ -f "${ISO}" ] && [ "${DO_SUM}" = "1" ]; then
+              sha256sum "${ISO}" > "${ISO}.sha256" || true
+            fi
           fi
 
-          run_sh_req "health.mount" 0 "[ -d '${MP}' ] && mountpoint -q '${MP}'"
-          run_sh_req "health.write" 0 "echo ok > '${MP}/.ok' && sync || sudo bash -lc \"echo ok > '${MP}/.ok' && sync\""
+          # 리포트(시스템/마운트/구조) + 요약
+          {
+            echo "=== lsblk -f ==="; lsblk -f || true
+            echo; echo "=== df -h ==="; df -h || true
+            echo; echo "=== mount | grep ${MP} ==="; mount | grep "${MP}" || true
+            echo; echo "=== /etc/fstab tail ==="; tail -n 5 /etc/fstab || true
+            echo; echo "=== tree (2 levels) ==="
+            command -v tree >/dev/null 2>&1 && (tree -L 2 "${MP}" || true) || (find "${MP}" -maxdepth 2 -type d -print 2>/dev/null | head -n 200 || true)
+          } > "${ART_DIR}/linux_report.txt"
+          echo -e "## Linux Summary\n- Mode: ${MODE}\n- Mount: ${MP}\n- FS: ${FS}\n- Label: ${LABEL}\n- ISO: ${ISO:-none}\n- Checksum: $([ -n "${ISO}" ] && [ "${DO_SUM}" = "1" ] && echo "generated" || echo "n/a")" >> "$GITHUB_STEP_SUMMARY"
+
+          # 선택적 정리
+          if [ "${DO_CLN}" = "1" ]; then
+            sudo sync || true
+            [ -d "${MP}" ] && sudo umount "${MP}" || true
+            if [[ "${MODE}" = "linux_loop" ]]; then
+              LOOP_DEV="$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1)"
+              [ -n "${LOOP_DEV}" ] && sudo losetup -d "${LOOP_DEV}" || true
+              sudo rm -f "${IMG}" || true
+            fi
+          fi
 
       - name: Upload artifacts (Linux)
         uses: actions/upload-artifact@v4
@@ -166,10 +191,12 @@ jobs:
           name: linux-artifacts
           path: |
             .github/echo_logs/linux.log
+            .github/echo_artifacts/linux_report.txt
             .github/echo_artifacts/*.iso
+            .github/echo_artifacts/*.iso.sha256
           if-no-files-found: warn
 
-  # --- Windows Job ---
+  # ===================== Windows =====================
   windows:
     if: ${{ inputs.runner == 'windows-latest' || inputs.runner == 'all' }}
     name: "Windows — VHDX"
@@ -188,8 +215,13 @@ jobs:
           $Vhdx = Join-Path $VRoot "data.vhdx"
           $DL = "${{ inputs.drive_letter }}"
           $Label = "${{ inputs.label }}"
+          $Summary = @()
 
-          Write-Host "▶ Create VHDX $Vhdx ($(${{ inputs.size_gb }}) GB)"
+          $Summary += "## Windows Summary"
+          $Summary += "- DriveLetter: $DL"
+          $Summary += "- VHDX: $Vhdx"
+
+          Write-Host "▶ Create VHDX $Vhdx"
           try { New-VHD -Path $Vhdx -SizeBytes $Size -Dynamic -ErrorAction Continue } catch { $_ | Out-String | Write-Warning }
 
           Write-Host "▶ Mount VHDX"
@@ -207,14 +239,38 @@ jobs:
             Write-Warning "VHDX mount failed — continue"
           }
 
+          # 보고서
+          $rep = Join-Path $env:GITHUB_WORKSPACE ".github\echo_artifacts\windows_report.txt"
+          New-Item -ItemType Directory -Force -Path (Split-Path $rep) | Out-Null
+          "=== Get-Disk ===" | Out-File -Encoding utf8 $rep
+          Get-Disk | Format-List * | Out-String | Out-File -Append -Encoding utf8 $rep
+          "`n=== Get-Partition ===" | Out-File -Append -Encoding utf8 $rep
+          Get-Partition | Format-List * | Out-String | Out-File -Append -Encoding utf8 $rep
+          "`n=== Get-Volume ===" | Out-File -Append -Encoding utf8 $rep
+          Get-Volume | Format-List * | Out-String | Out-File -Append -Encoding utf8 $rep
+          "`n=== Directory (depth 2) ===" | Out-File -Append -Encoding utf8 $rep
+          if (Test-Path "$DL`:") { Get-ChildItem "$DL`:\" -Recurse -Depth 2 | Select-Object FullName, Length | Out-String | Out-File -Append -Encoding utf8 $rep }
+
+          # 선택적 정리: iso_cfg에 cleanup=1 이 있으면 분리
+          $doCleanup = 0
+          if ("${{ inputs.iso_cfg }}".ToLower().Contains("cleanup=1")) { $doCleanup = 1 }
+          if ($doCleanup -eq 1) {
+            try { Dismount-VHD -Path $Vhdx -ErrorAction Continue } catch { $_ | Out-String | Write-Warning }
+          }
+
+          # 요약 출력
+          $Summary | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
       - name: Upload artifacts (Windows)
         uses: actions/upload-artifact@v4
         with:
           name: windows-artifacts
-          path: vdisks
+          path: |
+            vdisks
+            .github/echo_artifacts/windows_report.txt
           if-no-files-found: warn
 
-  # --- macOS Job ---
+  # ===================== macOS =====================
   macos:
     if: ${{ inputs.runner == 'macos-latest' || inputs.runner == 'all' }}
     name: "macOS — DMG"
@@ -228,32 +284,52 @@ jobs:
         run: |
           set -Eeuo pipefail
           TZ=Asia/Seoul
-          LOG="${LOG_DIR}/mac.log"; mkdir -p "${LOG_DIR}" "${ART_DIR}"
+          mkdir -p "${LOG_DIR}" "${ART_DIR}"
           DMG="${GITHUB_WORKSPACE}/vdata.dmg"
           SIZE="${{ inputs.size_gb }}"
           FS="${{ inputs.fs }}"; [ "${FS}" = "APFS" ] || [ "${FS}" = "JHFS+" ] || FS="APFS"
           LABEL="${{ inputs.label }}"
           MP="${{ inputs.mount_path }}"
+          NAME="$(echo "${{ inputs.iso_cfg }}" | awk -F'name=' '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${NAME}" ] || NAME="DISK_IMG"
+          SRC="$(echo  "${{ inputs.iso_cfg }}" | awk -F'src='  '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${SRC}" ] || SRC="/Volumes/${LABEL}"
+          DO_SUM=0; echo "${{ inputs.iso_cfg }}" | grep -qi "checksum=1" && DO_SUM=1 || true
+          DO_CLN=0; echo "${{ inputs.iso_cfg }}" | grep -qi "cleanup=1" && DO_CLN=1 || true
 
-          echo "▶ create DMG" | tee -a "${LOG}"
-          hdiutil create -size "${SIZE}g" -fs "${FS}" -volname "${LABEL}" "${DMG}" >>"${LOG}" 2>&1 || true
-          echo "▶ attach DMG" | tee -a "${LOG}"
-          hdiutil attach "${DMG}" >>"${LOG}" 2>&1 || true
+          echo "▶ create DMG"
+          hdiutil create -size "${SIZE}g" -fs "${FS}" -volname "${LABEL}" "${DMG}" >>"${LOG_DIR}/mac.log" 2>&1 || true
+          echo "▶ attach DMG"
+          hdiutil attach "${DMG}" >>"${LOG_DIR}/mac.log" 2>&1 || true
           MOUNT="/Volumes/${LABEL}"
           if [ -d "${MOUNT}" ]; then
-            mkdir -p "${MOUNT}/"{logs,data,backups,scripts,configs,reports} >>"${LOG}" 2>&1 || true
+            mkdir -p "${MOUNT}/"{logs,data,backups,scripts,configs,reports} || true
             echo "KEY=VALUE" > "${MOUNT}/configs/app.env"
             echo "file,ts" > "${MOUNT}/reports/index.csv"
           fi
 
-          # ISO (요청 시)
+          # ISO + 체크섬
+          ISO=""
           if [ -n "${{ inputs.iso_cfg }}" ]; then
-            NAME="$(echo "${{ inputs.iso_cfg }}" | awk -F'name=' '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${NAME}" ] || NAME="DISK_IMG"
-            SRC="$(echo  "${{ inputs.iso_cfg }}" | awk -F'src='  '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${SRC}" ] || SRC="${MOUNT}"
             ISO="${GITHUB_WORKSPACE}/${NAME}.iso"
-            echo "▶ makehybrid ISO" | tee -a "${LOG}"
-            hdiutil makehybrid -o "${ISO}" "${SRC}" -iso -joliet -default-volume-name "${NAME}" >>"${LOG}" 2>&1 || true
-            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || true
+            hdiutil makehybrid -o "${ISO}" "${SRC}" -iso -joliet -default-volume-name "${NAME}" >>"${LOG_DIR}/mac.log" 2>&1 || true
+            if [ -f "${ISO}" ] && [ ${DO_SUM} -eq 1 ]; then
+              shasum -a 256 "${ISO}" > "${ISO}.sha256" || true
+            fi
+          fi
+
+          # 리포트
+          {
+            echo "=== diskutil list ==="; diskutil list || true
+            echo; echo "=== df -h ==="; df -h || true
+            echo; echo "=== mount | grep ${LABEL} ==="; mount | grep "${LABEL}" || true
+            echo; echo "=== tree (2 levels) ==="
+            find "${MOUNT}" -maxdepth 2 -print 2>/dev/null | head -n 200 || true
+          } > "${ART_DIR}/mac_report.txt"
+          echo -e "## macOS Summary\n- Volume: ${LABEL}\n- FS: ${FS}\n- ISO: ${ISO:-none}\n- Checksum: $([ -f "${ISO}" ] && [ ${DO_SUM} -eq 1 ] && echo "generated" || echo "n/a")" >> "$GITHUB_STEP_SUMMARY"
+
+          # 선택적 정리
+          if [ ${DO_CLN} -eq 1 ]; then
+            [ -d "${MOUNT}" ] && hdiutil detach "${MOUNT}" || true
+            rm -f "${DMG}" || true
           fi
 
       - name: Upload artifacts (macOS)
@@ -262,5 +338,7 @@ jobs:
           name: macos-artifacts
           path: |
             .github/echo_logs/mac.log
+            .github/echo_artifacts/mac_report.txt
             .github/echo_artifacts/*.iso
+            .github/echo_artifacts/*.iso.sha256
           if-no-files-found: warn
