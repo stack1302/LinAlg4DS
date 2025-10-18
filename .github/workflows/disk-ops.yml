@@ -1,0 +1,223 @@
+# .github/workflows/disk-ops.yml
+name: "💽 Disk Ops — Create/Format/Mount (Linux/Windows/macOS) — Safe-Continue"
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:        # 1
+        description: "OS (ubuntu-24.04 | windows-latest | macos-latest)"
+        type: choice
+        options: [ubuntu-24.04, windows-latest, macos-latest]
+        default: ubuntu-24.04
+      mode:          # 2
+        description: "동작 (linux_loop | linux_device | windows_vhdx | macos_dmg)"
+        type: choice
+        options: [linux_loop, linux_device, windows_vhdx, macos_dmg]
+        default: linux_loop
+      size_gb:       # 3
+        description: "디스크/이미지 용량(GB)"
+        default: "10"
+      mount_path:    # 4
+        description: "마운트 경로(Linux/macOS), Windows는 무시"
+        default: "/mnt/data"
+      device:        # 5
+        description: "(linux_device 전용) 대상 블록 디바이스 (예: /dev/sdb)"
+        default: ""
+      drive_letter:  # 6
+        description: "(Windows 전용) 드라이브 문자 (예: V)"
+        default: "V"
+      fs:            # 7
+        description: "파일시스템 (linux: ext4/xfs, win: NTFS, mac: APFS/JHFS+)"
+        default: "ext4"
+      label:         # 8
+        description: "볼륨 라벨"
+        default: "DATA"
+      fstab:         # 9
+        description: "(Linux 전용) /etc/fstab 자동등록"
+        type: boolean
+        default: true
+      auto_cleanup:  # 10
+        description: "작업 후 정리(언마운트/분리)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Seoul
+  LOG_DIR: .github/echo_logs
+  ECHO_OK: "✅"
+  ECHO_WARN: "⚠️"
+  ECHO_FAIL: "❌"
+
+jobs:
+  disk-ops:
+    name: "Disk Ops (${{ inputs.mode }})"
+    runs-on: ${{ inputs.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Echo helpers
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${LOG_DIR}"
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Euo pipefail
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          ok(){ echo "${ECHO_OK} [$(TS)] $*"; }
+          warn(){ echo "${ECHO_WARN} [$(TS)] $*" >&2; }
+          fail(){ echo "${ECHO_FAIL} [$(TS)] $*" >&2; }
+          run(){
+            local name="$1"; shift
+            echo "▶ $name :: $*"
+            if "$@" >>"${LOG_DIR}/disk-ops.log" 2>&1; then
+              ok "$name OK"
+            else
+              warn "$name FAILED (see ${LOG_DIR}/disk-ops.log)"
+            fi
+          }
+          SH
+          chmod +x /tmp/echo_helpers.sh
+          echo "${ECHO_OK} echo helper ready"
+
+      # Linux - loop image
+      - name: Linux loop image
+        if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_loop' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          IMG="/var/disk.img"
+          SIZE="${{ inputs.size_gb }}G"
+          MP="${{ inputs.mount_path }}"
+          FS="${{ inputs.fs }}"
+          LABEL="${{ inputs.label }}"
+          FSTAB="${{ inputs.fstab }}"
+
+          run "apt.update" sudo apt-get update -y
+          run "apt.install" sudo apt-get install -y parted util-linux xfsprogs
+
+          run "img.create" sudo fallocate -l "${SIZE}" "${IMG}" || sudo dd if=/dev/zero of="${IMG}" bs=1M count=$(( ${{ inputs.size_gb }} * 1024 ))
+          run "loop.attach" sudo losetup -fP "${IMG}"
+          LOOP=$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1)
+          [ -n "${LOOP:-}" ] || fail "loop device not found"
+
+          run "gpt.label" sudo parted -s "${LOOP}" mklabel gpt
+          run "gpt.part"  sudo parted -s "${LOOP}" mkpart primary ${FS} 0% 100%
+          PART="${LOOP}p1"
+
+          if [ "${FS}" = "xfs" ]; then
+            run "mkfs.xfs" sudo mkfs.xfs -f "${PART}"
+          else
+            run "mkfs.ext4" sudo mkfs.ext4 -F -L "${LABEL}" "${PART}"
+          fi
+
+          run "mkdir.mountpoint" sudo mkdir -p "${MP}"
+          run "mount" sudo mount "${PART}" "${MP}"
+
+          if [ "${FSTAB}" = "true" ]; then
+            UUID=$(blkid -s UUID -o value "${PART}" || true)
+            if [ -n "${UUID:-}" ]; then
+              echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null
+              ok "fstab updated"
+            else
+              warn "UUID not found; skip fstab"
+            fi
+          fi
+          ok "Mounted at ${MP} (part=${PART})"
+
+      # Linux - real device
+      - name: Linux device
+        if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_device' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          DEV="${{ inputs.device }}"
+          MP="${{ inputs.mount_path }}"
+          FS="${{ inputs.fs }}"
+          LABEL="${{ inputs.label }}"
+          FSTAB="${{ inputs.fstab }}"
+
+          [ -n "${DEV}" ] || fail "device is empty (e.g., /dev/sdb)"
+
+          run "apt.update" sudo apt-get update -y
+          run "apt.install" sudo apt-get install -y parted util-linux xfsprogs
+
+          run "gpt.label" sudo parted -s "${DEV}" mklabel gpt
+          run "gpt.part"  sudo parted -s "${DEV}" mkpart primary ${FS} 0% 100%
+          PART="${DEV}1"
+
+          if [ "${FS}" = "xfs" ]; then
+            run "mkfs.xfs" sudo mkfs.xfs -f "${PART}"
+          else
+            run "mkfs.ext4" sudo mkfs.ext4 -F -L "${LABEL}" "${PART}"
+          fi
+
+          run "mkdir.mountpoint" sudo mkdir -p "${MP}"
+          run "mount" sudo mount "${PART}" "${MP}"
+
+          if [ "${FSTAB}" = "true" ]; then
+            UUID=$(blkid -s UUID -o value "${PART}" || true)
+            if [ -n "${UUID:-}" ]; then
+              echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null
+              ok "fstab updated"
+            else
+              warn "UUID not found; skip fstab"
+            fi
+          fi
+          ok "Mounted at ${MP} (part=${PART})"
+
+      # Windows - VHDX
+      - name: Windows VHDX
+        if: ${{ startsWith(inputs.runner, 'windows') && inputs.mode == 'windows_vhdx' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $VRoot = Join-Path $env:GITHUB_WORKSPACE "vdisks"
+          New-Item -ItemType Directory -Force -Path $VRoot | Out-Null
+          $Size = [int]${{ inputs.size_gb }} * 1GB
+          $Vhdx = Join-Path $VRoot "data.vhdx"
+          $DL = "${{ inputs.drive_letter }}"
+          $Label = "${{ inputs.label }}"
+
+          Write-Host "▶ Create VHDX $Vhdx ($(${{ inputs.size_gb }}) GB)"
+          try { New-VHD -Path $Vhdx -SizeBytes $Size -Dynamic -ErrorAction Continue } catch { $_ | Out-String | Write-Warning }
+
+          Write-Host "▶ Mount VHDX"
+          try {
+            $disk = Mount-VHD -Path $Vhdx -PassThru | Get-Disk
+            if ($disk) {
+              Initialize-Disk -Number $disk.Number -PartitionStyle GPT -ErrorAction Continue
+              New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter $DL -ErrorAction Continue | Out-Null
+              Format-Volume -DriveLetter $DL -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false -ErrorAction Continue | Out-Null
+              Write-Host "✅ Mounted: $DL`:"
+            } else {
+              Write-Warning "VHDX mount failed"
+            }
+          } catch { $_ | Out-String | Write-Warning }
+
+      # macOS - DMG
+      - name: macOS DMG
+        if: ${{ startsWith(inputs.runner, 'macos') && inputs.mode == 'macos_dmg' }}
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          SIZE="${{ inputs.size_gb }}"
+          FS="${{ inputs.fs }}"
+          LABEL="${{ inputs.label }}"
+          DMG="${{ github.workspace }}/vdata.dmg"
+          [ "${FS}" = "APFS" ] || [ "${FS}" = "JHFS+" ] || FS="APFS"
+          run "dmg.create" hdiutil create -size "${SIZE}g" -fs "${FS}" -volname "${LABEL}" "${DMG}"
+          run "dmg.attach" hdiutil attach "${DMG}"
+          [ -d "/Volumes/${LABEL}" ] && ok "Mounted: /Volumes/${LABEL}" || warn "mount not found"
+
+      - name: Upload logs
+        uses: actions/upload-artifact@v4
+        with:
+          name: disk-ops-logs
+          path: .github/echo_logs/disk-ops.log
+          if-no-files-found: warn
