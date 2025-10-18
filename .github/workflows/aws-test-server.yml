@@ -3,45 +3,45 @@ name: "🟢 AWS Test Server — Lite/Full (No-Skip + Safe-Continue + 10-Input Di
 on:
   workflow_dispatch:
     inputs:
-      mode:                 # 1
+      mode:
         description: "배포 모드: lite(EC2 1대) | full(ALB+ASG+VPC)"
         type: choice
         options: [lite, full]
         default: lite
-      aws_region:           # 2
+      aws_region:
         description: "AWS Region (빈값이면 us-east-1)"
         required: false
         default: ""
-      instance_type:        # 3
+      instance_type:
         description: "EC2 Instance Type"
         required: false
         default: "t3.micro"
-      vpc_id:               # 4 (lite 전용)
+      vpc_id:
         description: "(lite) 기존 VPC (빈값이면 기본 VPC)"
         required: false
         default: ""
-      subnet_id:            # 5 (lite 전용)
+      subnet_id:
         description: "(lite) 기존 Subnet (빈값이면 기본 Subnet)"
         required: false
         default: ""
-      create_new_sg:        # 6
+      create_new_sg:
         description: "보안그룹 새로 생성 (true/false)"
         required: false
         default: "true"
-      open_http:            # 7
+      open_http:
         description: "0.0.0.0/0 80포트 오픈 (테스트)"
         required: false
         default: "true"
-      keypair_name:         # 8
+      keypair_name:
         description: "키페어 이름(빈값 자동)"
         required: false
         default: ""
-      teardown:             # 9
+      teardown:
         description: "마지막에 리소스 삭제 (true/false)"
         required: false
         default: "false"
-      features:             # 10
-        description: "추가 기능: ssm,eip,cwlogs,alb_https,oidc_guide,userdata_url=https://...,bulk=5,prefix=team-a"
+      features:
+        description: "예: ssm,eip,cwagent,alb_https,oidc_guide,userdata_url=https://...,bulk=5,prefix=team-a,spot,scale_tgt=50,tags_kv=env=dev;team=blue,budget_usd=100"
         required: false
         default: "ssm"
 
@@ -84,7 +84,7 @@ jobs:
         uses: actions/checkout@v4
         continue-on-error: true
 
-      - name: Prepare helpers (safe_run + feature flags) & dirs
+      - name: Prepare helpers (safe_run + features) & dirs
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -103,7 +103,6 @@ jobs:
             if "$@"; then ok "[OK][$name]"
             else warn "[CONTINUE][$name] 실패했지만 계속 진행"; return 0; fi
           }
-          # ------- feature helpers -------
           in_features(){ local f="$1"
             local s=",$(printf '%s' "${FEATURES:-}" | tr -d '[:space:]'),"
             case "$s" in *,"$f",*) return 0;; *) return 1;; esac
@@ -123,7 +122,24 @@ jobs:
             [[ "$n" -gt 10 ]] && n=10
             printf '%s' "$n"
           }
-          # ------- AWS CLI 설치 (bundled → pipx → snap → apt) -------
+          # Parse semi-colon tags: tags_kv=key1=val1;key2=val2
+          build_tag_spec(){
+            local extra="$(get_feature_val tags_kv || true)"
+            local items=()
+            if [[ -n "$extra" ]]; then
+              IFS=';' read -r -a kvs <<< "$extra"
+              for kv in "${kvs[@]}"; do
+                [[ "$kv" == *"="* ]] || continue
+                k="${kv%%=*}"; v="${kv#*=}"
+                items+=("{Key=${k},Value=${v}}")
+              done
+            fi
+            # always include defaults
+            items+=("{Key=Project,Value=${TAG_PROJECT}}")
+            items+=("{Key=Repo,Value=${TAG_REPO}}")
+            items+=("{Key=RunID,Value=${TAG_RUN_ID}}")
+            (IFS=,; printf '%s' "${items[*]}")
+          }
           install_awscli(){
             set +e
             ok "AWS CLI 설치 시작 (bundled → pipx → snap → apt)"
@@ -156,7 +172,7 @@ jobs:
           chmod +x /tmp/echo_helpers.sh
           echo "Helpers ready" | tee "${LOG_DIR}/00_helpers.log"
 
-      - name: Parse features / Export region & bulk settings
+      - name: Parse features / Export region & bulk/prefix/tags
         id: feats
         shell: bash
         run: |
@@ -164,15 +180,14 @@ jobs:
           echo "AWS_REGION=${AWS_DEFAULT_REGION}" >> $GITHUB_ENV
           echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}" >> $GITHUB_ENV
           echo "features=${FEATURES}" | tee "${OUT_DIR}/features.txt"
-          # bulk= / prefix=/name_prefix= 파싱
-          B=$(get_feature_val bulk || true)
-          [[ -z "$B" ]] && B=1
-          # 1~10 범위 보정
-          if [[ "$B" -lt 1 ]]; then B=1; fi
-          if [[ "$B" -gt 10 ]]; then B=10; fi
+          B=$(get_feature_val bulk || true); [[ -z "$B" ]] && B=1
+          [[ "$B" -lt 1 ]] && B=1; [[ "$B" -gt 10 ]] && B=10
           echo "BULK_COUNT=$B" >> "$GITHUB_ENV"
           P=$(get_feature_val prefix || get_feature_val name_prefix || true)
           echo "NAME_SUFFIX_PREFIX=${P:-}" >> "$GITHUB_ENV"
+          # scale target (CPU%) default 50
+          ST=$(get_feature_val scale_tgt || true); [[ -z "$ST" ]] && ST=50
+          echo "SCALE_TGT=${ST}" >> "$GITHUB_ENV"
 
       - name: Decide auth mode (OIDC/Keys/DryRun)
         id: mode
@@ -218,7 +233,7 @@ jobs:
           echo "region=${AWS_DEFAULT_REGION}" >> "$GITHUB_OUTPUT"
           ok "AWS Account: $ACC"
 
-      # ---------- OIDC 구성 가이드 팩 ----------
+      # ---------- OIDC Pack (role policy에 budgets 추가) ----------
       - name: OIDC — Generate Config Pack (guide + trust policy + commands)
         if: always()
         shell: bash
@@ -226,103 +241,22 @@ jobs:
           source /tmp/echo_helpers.sh
           in_features oidc_guide || { ok "oidc_guide 비활성화"; exit 0; }
           PACK="${OUT_DIR}/oidc"; mkdir -p "$PACK"
-          ORG_REPO="${TAG_REPO}"
-          OWNER="${ORG_REPO%%/*}"
-          REPO="${ORG_REPO##*/}"
-          BRANCH="${GITHUB_REF_NAME:-*}"
-          ROLE_NAME="gha-${OWNER}-${REPO}-oidc"
-          echo "$ROLE_NAME" > "${PACK}/suggested-role-name.txt"
-          TMPD="$(mktemp -d)"
-          set +e
+          ORG_REPO="${TAG_REPO}"; OWNER="${ORG_REPO%%/*}"; REPO="${ORG_REPO##*/}"; BRANCH="${GITHUB_REF_NAME:-*}"
+          ROLE_NAME="gha-${OWNER}-${REPO}-oidc"; echo "$ROLE_NAME" > "${PACK}/suggested-role-name.txt"
+          TMPD="$(mktemp -d)"; set +e
           CNT=$(openssl s_client -servername token.actions.githubusercontent.com -showcerts -connect token.actions.githubusercontent.com:443 </dev/null 2>/dev/null | awk '/BEGIN CERTIFICATE/{n++}{print > "'$TMPD'/cert" n ".pem"} END{print n}')
-          set -e
-          ROOT="$TMPD/cert${CNT}.pem"; THUMB=""
-          if [[ -f "$ROOT" ]]; then
-            THUMB=$(openssl x509 -in "$ROOT" -fingerprint -sha1 -noout | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f' || true)
-          fi
+          set -e; ROOT="$TMPD/cert${CNT}.pem"; THUMB=""
+          [[ -f "$ROOT" ]] && THUMB=$(openssl x509 -in "$ROOT" -fingerprint -sha1 -noout | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f' || true)
           echo "${THUMB:-unknown}" > "${PACK}/thumbprint.txt"
-          ok "OIDC thumbprint: ${THUMB:-unknown}"
           cat > "${PACK}/trust-policy.json" <<JSON
-          {
-            "Version": "2012-10-17",
-            "Statement": [
-              {
-                "Effect": "Allow",
-                "Principal": {
-                  "Federated": "arn:aws:iam::${{ steps.acct.outputs.account_id }}:oidc-provider/token.actions.githubusercontent.com"
-                },
-                "Action": "sts:AssumeRoleWithWebIdentity",
-                "Condition": {
-                  "StringEquals": {
-                    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
-                  },
-                  "StringLike": {
-                    "token.actions.githubusercontent.com:sub": "repo:${OWNER}/${REPO}:ref:refs/heads/${BRANCH}"
-                  }
-                }
-              }
-            ]
-          }
+          {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Federated":"arn:aws:iam::${{ steps.acct.outputs.account_id }}:oidc-provider/token.actions.githubusercontent.com"},"Action":"sts:AssumeRoleWithWebIdentity","Condition":{"StringEquals":{"token.actions.githubusercontent.com:aud":"sts.amazonaws.com"},"StringLike":{"token.actions.githubusercontent.com:sub":"repo:${OWNER}/${REPO}:ref:refs/heads/${BRANCH}"}}}]}
           JSON
           cat > "${PACK}/role-policy-min.json" <<'JSON'
-          {
-            "Version": "2012-10-17",
-            "Statement": [
-              { "Effect": "Allow", "Action": [
-                  "ec2:*","elasticloadbalancing:*","autoscaling:*","iam:PassRole",
-                  "logs:*","ssm:*","cloudwatch:*"
-                ], "Resource": "*" }
-            ]
-          }
+          {"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["ec2:*","elasticloadbalancing:*","autoscaling:*","iam:PassRole","logs:*","ssm:*","cloudwatch:*","budgets:*"],"Resource":"*"}
+          ]}
           JSON
-          cat > "${PACK}/create-commands.sh" <<'SH'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          : "${AWS_REGION:=us-east-1}"
-          ACC="$(aws sts get-caller-identity --query Account --output text)"
-          echo "Account=$ACC Region=$AWS_REGION"
-          THUMB="$(cat thumbprint.txt)"
-          if ! aws iam list-open-id-connect-providers --query "OpenIDConnectProviderList[?contains(Arn, 'token.actions.githubusercontent.com')]" --output text | grep -q token.actions.githubusercontent.com; then
-            echo "Creating OIDC Provider..."
-            aws iam create-open-id-connect-provider \
-              --url https://token.actions.githubusercontent.com \
-              --client-id-list sts.amazonaws.com \
-              --thumbprint-list "$THUMB"
-          else
-            echo "OIDC Provider already exists (token.actions.githubusercontent.com)"
-          fi
-          ROLE_NAME="$(cat suggested-role-name.txt)"
-          if ! aws iam get-role --role-name "$ROLE_NAME" >/dev_NULL 2>&1; then
-            echo "Creating role: $ROLE_NAME"
-            aws iam create-role --role-name "$ROLE_NAME" \
-              --assume-role-policy-document file://trust-policy.json
-            aws iam put-role-policy --role-name "$ROLE_NAME" \
-              --policy-name "${ROLE_NAME}-inline" \
-              --policy-document file://role-policy-min.json
-          else
-            echo "Role exists: $ROLE_NAME"
-          fi
-          echo "ROLE ARN: arn:aws:iam::$ACC:role/$ROLE_NAME"
-          SH
-          chmod +x "${PACK}/create-commands.sh"
-          cat > "${PACK}/README.md" <<MD
-          # GitHub Actions → AWS OIDC 구성 가이드
-          - 리포지토리: \`${OWNER}/${REPO}\`
-          - 권장 역할명: \`${ROLE_NAME}\`
-          - 리전: \`${AWS_DEFAULT_REGION}\`
-          - OIDC Thumbprint: \`${THUMB:-unknown}\`
-          ## 실행
-          \`\`\`bash
-          cd oidc
-          ./create-commands.sh
-          \`\`\`
-          MD
           ok "OIDC config pack generated at ${PACK}"
-          {
-            echo "### 📦 OIDC Config Pack"
-            echo "- Files: trust-policy.json, role-policy-min.json, create-commands.sh, thumbprint.txt, README.md"
-            echo "- Suggested Role: \`${ROLE_NAME}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
 
       # ============ LITE FLOW ============
       - name: LITE — Resolve default VPC/Subnet
@@ -334,14 +268,11 @@ jobs:
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
             echo "vpc_id=vpc-DRY" >> "$GITHUB_OUTPUT"
             echo "subnet_id=subnet-DRY" >> "$GITHUB_OUTPUT"
-            ok "Dry-Run: VPC/Subnet 가정"
-            exit 0
-          fi
+            ok "Dry-Run: VPC/Subnet 가정"; exit 0; fi
           VPC="${VPC_ID_INPUT}"; SUB="${SUBNET_ID_INPUT}"
           [[ -z "$VPC" ]] && VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true --query "Vpcs[0].VpcId" --output text 2>/dev/null || true); [[ "$VPC" == "None" ]] && VPC=""
           [[ -z "$SUB" ]] && SUB=$(aws ec2 describe-subnets --filters Name=default-for-az,Values=true --query "Subnets[0].SubnetId" --output text 2>/dev/null || true); [[ "$SUB" == "None" ]] && SUB=""
           echo "vpc_id=$VPC" >> "$GITHUB_OUTPUT"; echo "subnet_id=$SUB" >> "$GITHUB_OUTPUT"
-          ok "LITE Net => VPC:${VPC:-N/A} SUBNET:${SUB:-N/A}"
 
       - name: LITE — SG create (optional)
         id: lite_sg
@@ -352,15 +283,14 @@ jobs:
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
             echo "sg_id=sg-DRY" >> "$GITHUB_OUTPUT"; ok "Dry-Run: SG 가정"; exit 0; fi
           if [[ "${CREATE_NEW_SG,,}" == "true" ]]; then
-            VPC="${{ steps.lite_net.outputs.vpc_id }}"
-            SG_NAME="${NAME_PREFIX}-sg"
+            VPC="${{ steps.lite_net.outputs.vpc_id }}"; SG_NAME="${NAME_PREFIX}-sg"
             SG_ID=$(aws ec2 create-security-group --group-name "$SG_NAME" --description "gha lite sg" --vpc-id "$VPC" --query GroupId --output text 2>/dev/null || true)
             if [[ -n "$SG_ID" && "${OPEN_HTTP,,}" == "true" ]]; then
               safe_run "open80" aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 80 --cidr 0.0.0.0/0
             fi
             echo "sg_id=${SG_ID:-}" >> "$GITHUB_OUTPUT"
           else
-            echo "sg_id=" >> "$GITHUB_OUTPUT"; ok "기존 SG 사용 가정"
+            echo "sg_id=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Resolve AMI (AL2023)
@@ -375,22 +305,16 @@ jobs:
           echo "ami_id=${AMI}" >> "$GITHUB_OUTPUT"
           ok "AMI: ${AMI:-N/A}"
 
-      - name: LITE — EC2 run (Nginx+Docker+SSM/CW optional, bulk ≤10)
+      - name: LITE — EC2 run (bulk ≤10, spot/cwagent/tags)
         id: lite_ec2
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           [[ "${{ github.event.inputs.mode }}" != "lite" ]] && { ok "LITE EC2 스킵(모드=full)"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
-            echo "instance_id=i-DRY-1" >> "$GITHUB_OUTPUT"
-            echo "public_ip=203.0.113.10" >> "$GITHUB_OUTPUT"
-            ok "Dry-Run: EC2 가정(1개)"
-            mkdir -p "${OUT_DIR}"
-            printf "index,instance_id,public_ip\n1,i-DRY-1,203.0.113.10\n" > "${OUT_DIR}/lite_instances.csv"
-            exit 0
-          fi
+            echo "instance_id=i-DRY-1" >> "$GITHUB_OUTPUT"; echo "public_ip=203.0.113.10" >> "$GITHUB_OUTPUT"
+            mkdir -p "${OUT_DIR}"; printf "index,instance_id,public_ip\n1,i-DRY-1,203.0.113.10\n" > "${OUT_DIR}/lite_instances.csv"; exit 0; fi
 
-          # Base UserData
           cat > "${OUT_DIR}/userdata.sh" <<'UD'
           #!/bin/bash
           set -Eeuo pipefail
@@ -400,53 +324,53 @@ jobs:
           systemctl enable --now nginx || true
           echo "<h1>AWS Lite</h1><p>$(date)</p>" > /usr/share/nginx/html/index.html
           UD
-
-          # Optional features
+          # Optional agents
           if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features ssm'; then
-            echo "[ECHO] features: ssm=on" >> "${OUT_DIR}/echo.log"
             cat >> "${OUT_DIR}/userdata.sh" <<'UD'
           dnf -y install amazon-ssm-agent || true
           systemctl enable --now amazon-ssm-agent || true
           UD
           fi
-          if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features cwlogs'; then
-            echo "[ECHO] features: cwlogs=on" >> "${OUT_DIR}/echo.log"
+          if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features cwagent'; then
             cat >> "${OUT_DIR}/userdata.sh" <<'UD'
-          dnf -y install awslogs || true
-          systemctl enable --now awslogsd || true
+          dnf -y install amazon-cloudwatch-agent || true
+          cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+          {
+            "agent":{"metrics_collection_interval":60,"logfile":"/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log"},
+            "metrics":{"append_dimensions":{"AutoScalingGroupName":"${aws:AutoScalingGroupName}","InstanceId":"${aws:InstanceId}","InstanceType":"${aws:InstanceType}","ImageId":"${aws:ImageId}"},"metrics_collected":{"cpu":{"measurement":["cpu_usage_idle","cpu_usage_iowait","cpu_usage_user","cpu_usage_system"],"resources":["*"],"totalcpu":true},"mem":{"measurement":["mem_used_percent"]}}},
+            "logs":{"logs_collected":{"files":{"collect_list":[{"file_path":"/var/log/messages","log_group_name":"gha-lite-messages","log_stream_name":"{instance_id}","timestamp_format":"%b %d %H:%M:%S"}]}}}
+          }
+          JSON
+          systemctl enable amazon-cloudwatch-agent || true
+          systemctl restart amazon-cloudwatch-agent || true
           UD
           fi
           URL="$(/bin/bash -lc 'source /tmp/echo_helpers.sh; get_feature_val userdata_url || true')"
-          if [[ -n "$URL" ]]; then
-            echo "[ECHO] userdata_url=${URL}" >> "${OUT_DIR}/echo.log"
-            echo "curl -fsSL \"$URL\" | bash -s -- || true" >> "${OUT_DIR}/userdata.sh"
-          else
-            echo "[ECHO] userdata_url=(none)" >> "${OUT_DIR}/echo.log"
-          fi
+          [[ -n "$URL" ]] && echo "curl -fsSL \"$URL\" | bash -s -- || true" >> "${OUT_DIR}/userdata.sh"
 
           SG="${{ steps.lite_sg.outputs.sg_id }}"
           NET=( --subnet-id "${{ steps.lite_net.outputs.subnet_id }}" )
           [[ -n "$SG" ]] && NET+=( --security-group-ids "$SG" )
-          IMAGE_ID="${{ steps.ami.outputs.ami_id }}"
-          [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "None" ]] && IMAGE_ID="ami-0"
+          IMAGE_ID="${{ steps.ami.outputs.ami_id }}"; [[ -z "$IMAGE_ID" || "$IMAGE_ID" == "None" ]] && IMAGE_ID="ami-0"
           KEYNAME="${{ steps.lite_key.outputs.key_name }}"
+          EXTRA_TAGS="$(build_tag_spec)"
 
           N="$(cap_bulk)"
-          LISTCSV="${OUT_DIR}/lite_instances.csv"
-          printf "index,instance_id,public_ip\n" > "$LISTCSV"
+          LISTCSV="${OUT_DIR}/lite_instances.csv"; printf "index,instance_id,public_ip\n" > "$LISTCSV"
+
+          # Spot 옵션 여부
+          USE_SPOT=0; in_features spot && USE_SPOT=1
 
           for i in $(seq 1 "$N"); do
             OUTJ="${OUT_DIR}/lite_run_$i.json"
             NAME="$(with_suffix "${NAME_PREFIX}-lite" "$i")"
-            safe_run "run-$i" aws ec2 run-instances \
-              --image-id "$IMAGE_ID" \
-              --instance-type "${INSTANCE_TYPE}" \
-              --key-name "$KEYNAME" \
-              --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Project,Value=${TAG_PROJECT}},{Key=Repo,Value=${TAG_REPO}},{Key=RunID,Value=${TAG_RUN_ID}}]" \
-              "${NET[@]}" \
-              --user-data "file://${OUT_DIR}/userdata.sh" \
-              --output json > "$OUTJ" || true
-
+            ARGS=( --image-id "$IMAGE_ID" --instance-type "${INSTANCE_TYPE}" --key-name "$KEYNAME"
+                   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},${EXTRA_TAGS}]" "${NET[@]}"
+                   --user-data "file://${OUT_DIR}/userdata.sh" --output json )
+            if [[ "$USE_SPOT" -eq 1 ]]; then
+              ARGS+=( --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' )
+            fi
+            safe_run "run-$i" aws ec2 run-instances "${ARGS[@]}" > "$OUTJ" || true
             IID=$(jq -r '.Instances[0].InstanceId // empty' "$OUTJ" 2>/dev/null || echo "")
             if [[ -n "$IID" ]]; then
               safe_run "wait-$i" aws ec2 wait instance-running --instance-ids "$IID"
@@ -458,10 +382,7 @@ jobs:
                 [[ -n "$ALLOC" ]] && safe_run "eip-$i" aws ec2 associate-address --instance-id "$IID" --allocation-id "$ALLOC"
               fi
               printf "%s,%s,%s\n" "$i" "$IID" "${PIP:-}" >> "$LISTCSV"
-              if [[ "$i" -eq 1 ]]; then
-                echo "instance_id=$IID" >> "$GITHUB_OUTPUT"
-                echo "public_ip=$PIP" >> "$GITHUB_OUTPUT"
-              fi
+              [[ "$i" -eq 1 ]] && { echo "instance_id=$IID" >> "$GITHUB_OUTPUT"; echo "public_ip=$PIP" >> "$GITHUB_OUTPUT"; }
             else
               printf "%s,,\n" "$i" >> "$LISTCSV"
             fi
@@ -476,25 +397,19 @@ jobs:
           source /tmp/echo_helpers.sh
           [[ "${{ github.event.inputs.mode }}" != "full" ]] && { ok "FULL 네트워크 스킵(모드=lite)"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
-            echo "vpc_id=vpc-DRY" >> "$GITHUB_OUTPUT"; echo "subnet_a=subnet-DRY-A" >> "$GITHUB_OUTPUT"; echo "subnet_b=subnet-DRY-B" >> "$GITHUB_OUTPUT"; ok "Dry-Run: 네트워크 가정"; exit 0; fi
-
+            echo "vpc_id=vpc-DRY" >> "$GITHUB_OUTPUT"; echo "subnet_a=subnet-DRY-A" >> "$GITHUB_OUTPUT"; echo "subnet_b=subnet-DRY-B" >> "$GITHUB_OUTPUT"; exit 0; fi
           VPC_ID=$(aws ec2 create-vpc --cidr-block 10.10.0.0/16 --query Vpc.VpcId --output text 2>/dev/null || true)
           safe_run "enable-dns" aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-hostnames '{"Value":true}'
-
           mapfile -t AZS < <(aws ec2 describe-availability-zones --query "AvailabilityZones[?State=='available'].ZoneName" --output text 2>/dev/null | tr '\t' '\n' | head -n 2)
           AZA="${AZS[0]:-$(aws configure get region) a}"; AZB="${AZS[1]:-$AZA}"
-
           SUBA=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block 10.10.1.0/24 --availability-zone "$AZA" --query Subnet.SubnetId --output text 2>/dev/null || true)
           SUBB=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block 10.10.2.0/24 --availability-zone "$AZB" --query Subnet.SubnetId --output text 2>/dev/null || true)
-
           IGW=$(aws ec2 create-internet-gateway --query InternetGateway.InternetGatewayId --output text 2>/dev/null || true)
           safe_run "igw-attach" aws ec2 attach-internet-gateway --internet-gateway-id "$IGW" --vpc-id "$VPC_ID"
-
           RT=$(aws ec2 create-route-table --vpc-id "$VPC_ID" --query RouteTable.RouteTableId --output text 2>/dev/null || true)
           safe_run "rt-assoc-a" aws ec2 associate-route-table --route-table-id "$RT" --subnet-id "$SUBA"
           safe_run "rt-assoc-b" aws ec2 associate-route-table --route-table-id "$RT" --subnet-id "$SUBB"
           safe_run "rt-0.0.0.0" aws ec2 create-route --route-table-id "$RT" --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW"
-
           echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"; echo "subnet_a=$SUBA" >> "$GITHUB_OUTPUT"; echo "subnet_b=$SUBB" >> "$GITHUB_OUTPUT"
 
       - name: FULL — SG(EC2/ALB)
@@ -504,8 +419,7 @@ jobs:
           source /tmp/echo_helpers.sh
           [[ "${{ github.event.inputs.mode }}" != "full" ]] && { ok "FULL SG 스킵(모드=lite)"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
-            echo "sg_app=sg-DRY-APP" >> "$GITHUB_OUTPUT"; echo "sg_alb=sg-DRY-ALB" >> "$GITHUB_OUTPUT"; ok "Dry-Run: SG 가정"; exit 0; fi
-
+            echo "sg_app=sg-DRY-APP" >> "$GITHUB_OUTPUT"; echo "sg_alb=sg-DRY-ALB" >> "$GITHUB_OUTPUT"; exit 0; fi
           VPC="${{ steps.full_net.outputs.vpc_id }}"
           SG_APP=$(aws ec2 create-security-group --group-name "${NAME_PREFIX}-app" --description "app sg" --vpc-id "$VPC" --query GroupId --output text 2>/dev/null || true)
           SG_ALB=$(aws ec2 create-security-group --group-name "${NAME_PREFIX}-alb" --description "alb sg" --vpc-id "$VPC" --query GroupId --output text 2>/dev/null || true)
@@ -513,23 +427,21 @@ jobs:
           safe_run "app-80-from-alb" aws ec2 authorize-security-group-ingress --group-id "$SG_APP" --protocol tcp --port 80 --source-group "$SG_ALB"
           echo "sg_app=$SG_APP" >> "$GITHUB_OUTPUT"; echo "sg_alb=$SG_ALB" >> "$GITHUB_OUTPUT"
 
-      - name: FULL — KeyPair/AMI/LaunchTemplate (UserData + ssm/cwlogs/userdata_url)
+      - name: FULL — KeyPair/AMI/LaunchTemplate (spot/cwagent/tags)
         id: full_lt
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           [[ "${{ github.event.inputs.mode }}" != "full" ]] && { ok "FULL LT 스킵(모드=lite)"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
-
           NAME="${KEYP_NAME_INPUT:-${NAME_PREFIX}-kp}"
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
-            echo "key_name=$NAME" >> "$GITHUB_OUTPUT"; echo "lt_id=lt-DRY" >> "$GITHUB_OUTPUT"; ok "Dry-Run: LT 가정"; exit 0; fi
-
+            echo "key_name=$NAME" >> "$GITHUB_OUTPUT"; echo "lt_id=lt-DRY" >> "$GITHUB_OUTPUT"; exit 0; fi
           EXISTS=$(aws ec2 describe-key-pairs --key-names "$NAME" --query "KeyPairs[0].KeyName" --output text 2>/dev/null || true)
           [[ "$EXISTS" != "$NAME" ]] && aws ec2 create-key-pair --key-name "$NAME" --key-type rsa --key-format pem >/dev/null 2>&1 || true
-
           AMI=$(aws ssm get-parameters --names /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 --query "Parameters[0].Value" --output text 2>/dev/null || true)
           [[ "$AMI" == "None" || -z "$AMI" ]] && AMI="ami-0"
 
+          # userdata (cwagent optional)
           cat > "${OUT_DIR}/full_userdata.sh" <<'UD'
           #!/bin/bash
           set -Eeuo pipefail
@@ -540,38 +452,44 @@ jobs:
           echo "<h1>AWS FULL — ALB+ASG</h1><p>$(date)</p>" > /usr/share/nginx/html/index.html
           UD
           if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features ssm'; then
-            echo "[ECHO] features: ssm=on" >> "${OUT_DIR}/echo.log"
             cat >> "${OUT_DIR}/full_userdata.sh" <<'UD'
           dnf -y install amazon-ssm-agent || true
           systemctl enable --now amazon-ssm-agent || true
           UD
           fi
-          if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features cwlogs'; then
-            echo "[ECHO] features: cwlogs=on" >> "${OUT_DIR}/echo.log"
+          if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features cwagent'; then
             cat >> "${OUT_DIR}/full_userdata.sh" <<'UD'
-          dnf -y install awslogs || true
-          systemctl enable --now awslogsd || true
+          dnf -y install amazon-cloudwatch-agent || true
+          cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+          {"agent":{"metrics_collection_interval":60},"metrics":{"metrics_collected":{"cpu":{"resources":["*"],"totalcpu":true},"mem":{"measurement":["mem_used_percent"]}}}}
+          JSON
+          systemctl enable amazon-cloudwatch-agent || true
+          systemctl restart amazon-cloudwatch-agent || true
           UD
           fi
           URL="$(/bin/bash -lc 'source /tmp/echo_helpers.sh; get_feature_val userdata_url || true')"
-          if [[ -n "$URL" ]]; then
-            echo "[ECHO] userdata_url=${URL}" >> "${OUT_DIR}/echo.log"
-            echo "curl -fsSL \"$URL\" | bash -s -- || true" >> "${OUT_DIR}/full_userdata.sh"
-          else
-            echo "[ECHO] userdata_url=(none)" >> "${OUT_DIR}/echo.log"
-          fi
+          [[ -n "$URL" ]] && echo "curl -fsSL \"$URL\" | bash -s -- || true" >> "${OUT_DIR}/full_userdata.sh"
 
           LT_NAME="$(slug32 "${NAME_PREFIX}-lt")"
-          LT_ID=$(aws ec2 create-launch-template \
-            --launch-template-name "$LT_NAME" --version-description "v1" \
-            --launch-template-data "{
+          EXTRA_TAGS="$(/bin/bash -lc 'source /tmp/echo_helpers.sh; build_tag_spec')"
+
+          # Spot 여부
+          USE_SPOT=0; in_features spot && USE_SPOT=1
+
+          LDATA_BASE="{
               \"ImageId\":\"${AMI}\",
               \"InstanceType\":\"${INSTANCE_TYPE}\",
               \"KeyName\":\"${NAME}\",
               \"SecurityGroupIds\":[\"${{ steps.full_sg.outputs.sg_app }}\"],
+              \"TagSpecifications\":[{\"ResourceType\":\"instance\",\"Tags\":[${EXTRA_TAGS}]}],
               \"UserData\":\"$(base64 -w0 ${OUT_DIR}/full_userdata.sh)\"
-            }" --query LaunchTemplate.LaunchTemplateId --output text 2>/dev/null || true)
-
+            }"
+          if [[ "$USE_SPOT" -eq 1 ]]; then
+            LDATA=$(jq -c '. + {"InstanceMarketOptions":{"MarketType":"spot"}}' <<<"$LDATA_BASE")
+          else
+            LDATA="$LDATA_BASE"
+          fi
+          LT_ID=$(aws ec2 create-launch-template --launch-template-name "$LT_NAME" --version-description "v1" --launch-template-data "$LDATA" --query LaunchTemplate.LaunchTemplateId --output text 2>/dev/null || true)
           echo "key_name=$NAME" >> "$GITHUB_OUTPUT"; echo "ami_id=$AMI" >> "$GITHUB_OUTPUT"; echo "lt_id=$LT_ID" >> "$GITHUB_OUTPUT"
 
       - name: FULL — ALB/TG/Listener(HTTP + optional HTTPS)
@@ -581,56 +499,60 @@ jobs:
           source /tmp/echo_helpers.sh
           [[ "${{ github.event.inputs.mode }}" != "full" ]] && { ok "FULL ALB 스킵(모드=lite)"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
-            echo "alb_arn=alb-DRY" >> "$GITHUB_OUTPUT"; echo "tg_arn=tg-DRY" >> "$GITHUB_OUTPUT"; echo "alb_dns=alb.dry.run" >> "$GITHUB_OUTPUT"; ok "Dry-Run: ALB 가정"; exit 0; fi
-
+            echo "alb_arn=alb-DRY" >> "$GITHUB_OUTPUT"; echo "tg_arn=tg-DRY" >> "$GITHUB_OUTPUT"; echo "alb_dns=alb.dry.run" >> "$GITHUB_OUTPUT"; exit 0; fi
           SUBA="${{ steps.full_net.outputs.subnet_a }}"; SUBB="${{ steps.full_net.outputs.subnet_b }}"; SG_ALB="${{ steps.full_sg.outputs.sg_alb }}"
-          ALB_NAME="$(slug32 "${NAME_PREFIX}-alb")"
-          TG_NAME="$(slug32 "${NAME_PREFIX}-tg")"
+          ALB_NAME="$(slug32 "${NAME_PREFIX}-alb")"; TG_NAME="$(slug32 "${NAME_PREFIX}-tg")"
+          EXTRA_TAGS="$(/bin/bash -lc 'source /tmp/echo_helpers.sh; build_tag_spec')"
 
           ALB_ARN=$(aws elbv2 create-load-balancer --name "$ALB_NAME" --subnets "$SUBA" "$SUBB" --security-groups "$SG_ALB" --scheme internet-facing --type application --query LoadBalancers[0].LoadBalancerArn --output text 2>/dev/null || true)
+          # ALB 태그
+          safe_run "tag-alb" aws elbv2 add-tags --resource-arns "$ALB_ARN" --tags Key=Project,Value="${TAG_PROJECT}" Key=Repo,Value="${TAG_REPO}" Key=RunID,Value="${TAG_RUN_ID}" >/dev/null
+
           TG_ARN=$(aws elbv2 create-target-group --name "$TG_NAME" --protocol HTTP --port 80 --vpc-id "${{ steps.full_net.outputs.vpc_id }}" --target-type instance --health-check-path "/" --query TargetGroups[0].TargetGroupArn --output text 2>/dev/null || true)
+          safe_run "tag-tg" aws elbv2 add-tags --resource-arns "$TG_ARN" --tags Key=Project,Value="${TAG_PROJECT}" Key=Repo,Value="${TAG_REPO}" Key=RunID,Value="${TAG_RUN_ID}" >/dev/null
 
           safe_run "listener-80" aws elbv2 create-listener --load-balancer-arn "$ALB_ARN" --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn="$TG_ARN" >/dev/null
           DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns "$ALB_ARN" --query LoadBalancers[0].DNSName --output text 2>/dev/null || true)
-
           if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features alb_https'; then
             if [[ -n "${ACM_CERT_ARN}" ]]; then
               safe_run "listener-443" aws elbv2 create-listener --load-balancer-arn "$ALB_ARN" --protocol HTTPS --port 443 --certificates CertificateArn="${ACM_CERT_ARN}" --default-actions Type=forward,TargetGroupArn="$TG_ARN" >/dev/null
             else
-              warn "ACM_CERT_ARN 미지정 — HTTPS 리스너 생략(성공 처리)"
+              warn "ACM_CERT_ARN 미지정 — HTTPS 리스너 생략"
             fi
           fi
-
           echo "alb_arn=$ALB_ARN" >> "$GITHUB_OUTPUT"; echo "tg_arn=$TG_ARN" >> "$GITHUB_OUTPUT"; echo "alb_dns=$DNS" >> "$GITHUB_OUTPUT"
 
-      - name: FULL — AutoScalingGroup attach (bulk desired ≤10)
+      - name: FULL — AutoScalingGroup attach (bulk desired ≤10) + TargetTracking
         id: full_asg
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
           [[ "${{ github.event.inputs.mode }}" != "full" ]] && { ok "FULL ASG 스킵(모드=lite)"; echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then
-            echo "asg_name=${NAME_PREFIX}-asg" >> "$GITHUB_OUTPUT"; ok "Dry-Run: ASG 가정"; exit 0; fi
+            echo "asg_name=${NAME_PREFIX}-asg" >> "$GITHUB_OUTPUT"; exit 0; fi
 
           DESIRED="${BULK_COUNT:-1}"; [[ "$DESIRED" -lt 1 ]] && DESIRED=1; [[ "$DESIRED" -gt 10 ]] && DESIRED=10
           MAX=$(( DESIRED > 2 ? DESIRED : 2 ))
-
           ASG="$(slug32 "${NAME_PREFIX}-asg")"
-          LT_ID="${{ steps.full_lt.outputs.lt_id }}"
-          SUBA="${{ steps.full_net.outputs.subnet_a }}"
-          SUBB="${{ steps.full_net.outputs.subnet_b }}"
-          TG="${{ steps.full_alb.outputs.tg_arn }}"
+          LT_ID="${{ steps.full_lt.outputs.lt_id }}"; SUBA="${{ steps.full_net.outputs.subnet_a }}"; SUBB="${{ steps.full_net.outputs.subnet_b }}"; TG="${{ steps.full_alb.outputs.tg_arn }}"
 
           safe_run "create-asg" aws autoscaling create-auto-scaling-group \
             --auto-scaling-group-name "$ASG" \
             --launch-template "LaunchTemplateId=$LT_ID,Version=1" \
             --min-size 1 --max-size "$MAX" --desired-capacity "$DESIRED" \
             --vpc-zone-identifier "$SUBA,$SUBB" >/dev/null
+          safe_run "attach-tg" aws autoscaling attach-load-balancer-target-groups --auto-scaling-group-name "$ASG" --target-group-arns "$TG" >/dev/null
 
-          safe_run "attach-tg" aws autoscaling attach-load-balancer-target-groups \
-            --auto-scaling-group-name "$ASG" \
-            --target-group-arns "$TG" >/dev/null
+          # Target Tracking Scaling Policy (CPUUtilization)
+          if /bin/bash -lc 'source /tmp/echo_helpers.sh; in_features scale_tgt || get_feature_val scale_tgt >/dev/null 2>&1'; then
+            safe_run "scale-policy" aws autoscaling put-scaling-policy \
+              --auto-scaling-group-name "$ASG" \
+              --policy-name "${ASG}-tgt-cpu" \
+              --policy-type TargetTrackingScaling \
+              --target-tracking-configuration "PredefinedMetricSpecification={PredefinedMetricType=ASGAverageCPUUtilization},TargetValue=${SCALE_TGT}" >/dev/null
+          fi
 
+          # 최소 1 healthy 확인
           for _ in {1..40}; do
             CNT=$(aws elbv2 describe-target-health --target-group-arn "$TG" --query "TargetHealthDescriptions[?TargetHealth.State=='healthy'] | length(@)" --output text 2>/dev/null || echo 0)
             [[ "$CNT" -ge 1 ]] && ok "ALB healthy target ≥1 확인 (desired=$DESIRED)" && break
@@ -638,16 +560,34 @@ jobs:
           done
           echo "asg_name=$ASG" >> "$GITHUB_OUTPUT"
 
+      - name: OPTIONAL — Monthly Budget (budgets API, safe-continue)
+        if: always()
+        shell: bash
+        run: |
+          source /tmp/echo_helpers.sh
+          BVAL="$(get_feature_val budget_usd || true)"
+          [[ -z "$BVAL" ]] && { ok "budget_usd 미설정: skip"; exit 0; }
+          if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then ok "Dry-Run: budget skip"; exit 0; fi
+          ACC="${{ steps.acct.outputs.account_id }}"
+          NAME="${NAME_PREFIX}-budget"
+          # budgets는 us-east-1 고정 권장
+          safe_run "budget" aws budgets create-budget --account-id "$ACC" --budget '{
+            "BudgetName":"'"$NAME"'",
+            "BudgetLimit":{"Amount":"'"$BVAL"'", "Unit":"USD"},
+            "TimeUnit":"MONTHLY",
+            "BudgetType":"COST",
+            "CostFilters":{},
+            "CostTypes":{"IncludeTax":true,"IncludeSubscription":true},
+            "TimePeriod":{"Start":"2020-01-01_00:00","End":"2080-01-01_00:00"}
+          }' >/dev/null
+
       - name: Summary
         if: always()
         shell: bash
         run: |
-          MODE="${{ steps.mode.outputs.mode }}"
-          RUN_MODE="${{ github.event.inputs.mode }}"
-          ACC="${{ steps.acct.outputs.account_id }}"
-          REG="${{ steps.acct.outputs.region }}"
-          L_IID="${{ steps.lite_ec2.outputs.instance_id }}"
-          L_IP="${{ steps.lite_ec2.outputs.public_ip }}"
+          MODE="${{ steps.mode.outputs.mode }}"; RUN_MODE="${{ github.event.inputs.mode }}"
+          ACC="${{ steps.acct.outputs.account_id }}"; REG="${{ steps.acct.outputs.region }}"
+          L_IID="${{ steps.lite_ec2.outputs.instance_id }}"; L_IP="${{ steps.lite_ec2.outputs.public_ip }}"
           F_ALB="${{ steps.full_alb.outputs.alb_dns }}"
           {
             echo "## ✅ AWS ${RUN_MODE^^} Summary"
@@ -674,28 +614,19 @@ jobs:
           source /tmp/echo_helpers.sh
           [[ "${TEARDOWN}" != "true" ]] && { ok "Teardown 비활성화"; exit 0; }
           if [[ "${{ steps.mode.outputs.mode }}" == "dry" || -z "$(which aws || true)" ]]; then ok "Dry-Run: 삭제 가정"; exit 0; fi
-
           if [[ "${{ github.event.inputs.mode }}" == "lite" ]]; then
-            # bulk로 여러 개 생성했을 수 있으므로 CSV 기준으로 정리
             if [[ -f "${OUT_DIR}/lite_instances.csv" ]]; then
               tail -n +2 "${OUT_DIR}/lite_instances.csv" | while IFS=, read -r idx iid pip; do
                 [[ -n "$iid" ]] && { safe_run "terminate-$idx" aws ec2 terminate-instances --instance-ids "$iid"; safe_run "wait-term-$idx" aws ec2 wait instance-terminated --instance-ids "$iid"; }
               done
             fi
-            SG="${{ steps.lite_sg.outputs.sg_id }}"
-            KP="${{ steps.lite_key.outputs.key_name }}"
+            SG="${{ steps.lite_sg.outputs.sg_id }}"; KP="${{ steps.lite_key.outputs.key_name }}"
             [[ -n "$SG"  ]] && safe_run "delete-sg" aws ec2 delete-security-group --group-id "$SG"
             [[ -n "$KP"  ]] && safe_run "delete-kp" aws ec2 delete-key-pair --key-name "$KP"
           else
-            ASG="${{ steps.full_asg.outputs.asg_name }}"
-            TG="${{ steps.full_alb.outputs.tg_arn }}"
-            ALB="${{ steps.full_alb.outputs.alb_arn }}"
-            LT="${{ steps.full_lt.outputs.lt_id }}"
-            SG_APP="${{ steps.full_sg.outputs.sg_app }}"
-            SG_ALB="${{ steps.full_sg.outputs.sg_alb }}"
-            VPC="${{ steps.full_net.outputs.vpc_id }}"
-            SUBA="${{ steps.full_net.outputs.subnet_a }}"
-            SUBB="${{ steps.full_net.outputs.subnet_b }}"
+            ASG="${{ steps.full_asg.outputs.asg_name }}"; TG="${{ steps.full_alb.outputs.tg_arn }}"; ALB="${{ steps.full_alb.outputs.alb_arn }}"
+            LT="${{ steps.full_lt.outputs.lt_id }}"; SG_APP="${{ steps.full_sg.outputs.sg_app }}"; SG_ALB="${{ steps.full_sg.outputs.sg_alb }}"
+            VPC="${{ steps.full_net.outputs.vpc_id }}"; SUBA="${{ steps.full_net.outputs.subnet_a }}"; SUBB="${{ steps.full_net.outputs.subnet_b }}"
             [[ -n "$ASG" ]] && { safe_run "asg-down" aws autoscaling update-auto-scaling-group --auto-scaling-group-name "$ASG" --min-size 0 --desired-capacity 0; sleep 5; safe_run "asg-del" aws autoscaling delete-auto-scaling-group --auto-scaling-group-name "$ASG" --force-delete; }
             [[ -n "$ALB" ]] && safe_run "del-listeners" bash -lc 'for L in $(aws elbv2 describe-listeners --load-balancer-arn "'"$ALB"'" --query "Listeners[].ListenerArn" --output text 2>/dev/null); do aws elbv2 delete-listener --listener-arn "$L" || true; done'
             [[ -n "$ALB" ]] && safe_run "del-alb" aws elbv2 delete-load-balancer --load-balancer-arn "$ALB"
