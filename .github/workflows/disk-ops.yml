@@ -74,7 +74,7 @@ jobs:
           ok(){ echo "${ECHO_OK} [$(TS)] $*"; }
           warn(){ echo "${ECHO_WARN} [$(TS)] $*" >&2; }
 
-          # 문자열 단일 커맨드를 실행하고 종료코드를 정확히 수집
+          # 문자열 단일 커맨드를 실행하고 종료코드 수집(실패해도 계속)
           run_sh_req(){ # run_sh_req <name> <retries> "<command>"
             local name="$1"; local retries="$2"; local cmd="$3"
             local attempt=0; local status=1
@@ -96,17 +96,13 @@ jobs:
             done
           }
 
-          # A || B || C || true 체인 실행 (항상 0 귀결)
-          run_chain(){ # run_chain <name> "<command1 || command2 || true>"
+          # A || B || C || true 체인 (항상 0)
+          run_chain(){ # run_chain <name> "<cmd1 || cmd2 || true>"
             local name="$1"; local chain="$2"
             echo "▶ ${name} (chain)"
             local status=0
             bash -lc "${chain}" >>"${LOG_DIR}/disk-ops.log" 2>&1 || status=$?
-            if [ ${status} -eq 0 ]; then
-              ok "${name} OK"
-            else
-              warn "${name} chain non-zero(${status}) — forced continue"
-            fi
+            if [ ${status} -eq 0 ]; then ok "${name} OK"; else warn "${name} chain non-zero(${status}) — forced continue"; fi
           }
 
           kv(){ # key=value 파서
@@ -123,7 +119,7 @@ jobs:
           echo "${ECHO_OK} helpers ready"
 
       # ---------- Linux: loop image ----------
-      - name: Linux — loop image (create/partition/format/mount + UUID + mass + ISO)
+      - name: Linux — loop image (create/partition/format/mount + fix-perms + mass + ISO)
         if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_loop' }}
         shell: bash
         run: |
@@ -162,7 +158,7 @@ jobs:
           run_sh_req "mkdir.mountpoint" 1 "sudo mkdir -p '${MP}'"
           run_sh_req "mount" 2 "sudo mount '${PART}' '${MP}'"
 
-          # UUID 확보(5회 재시도) → 실패 시 LABEL 기반 fstab
+          # fstab 등록(가능하면 UUID, 실패 시 LABEL)
           UUID=""
           for i in {1..5}; do
             UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true)
@@ -176,15 +172,26 @@ jobs:
               echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
             fi
           fi
-
           ok "Mounted at ${MP} (part=${PART})"
 
-          # --- 대량 생성(문자열 커맨드로 실행) ---
+          # --- 중요: 권한 이양(3단계 대체 루틴) ---
+          # 1) 소유자 runner로 변경 → 2) ACL(있으면) 부여 → 3) 최후수단 퍼미션 개방
+          USERN="$(id -un)"; GROUPN="$(id -gn)"
+          run_chain "fix.perms" "\
+            sudo chown -R '${USERN}:${GROUPN}' '${MP}' || \
+            (command -v setfacl >/dev/null 2>&1 && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || \
+            sudo chmod -R a+rwx '${MP}' || true"
+
+          # --- 대량 생성(일반 실행 → 실패 시 sudo로 재시도) ---
           run_sh_req "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done"
+          run_sh_req "mass.dirs.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done && chown -R '${USERN}:${GROUPN}' .\""
+
           run_sh_req "mass.files" 1 "cd '${MP}' && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env"
+          run_sh_req "mass.files.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo 'file-'\\\$i,\\\$(date -Iseconds) >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env && chown -R '${USERN}:${GROUPN}' .\""
+
           run_sh_req "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true"
 
-          # ISO 생성(옵션) — xorriso → genisoimage → mkisofs
+          # ISO 생성(옵션)
           if [ -n "${{ inputs.iso_cfg }}" ]; then
             NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
             SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MP}")
@@ -194,10 +201,10 @@ jobs:
           fi
 
           run_sh_req "health.mount" 0 "[ -d '${MP}' ] && mountpoint -q '${MP}'"
-          run_sh_req "health.write" 0 "echo ok > '${MP}/.ok' && sync"
+          run_sh_req "health.write" 0 "echo ok > '${MP}/.ok' && sync || sudo bash -lc \"echo ok > '${MP}/.ok' && sync\""
 
       # ---------- Linux: real device ----------
-      - name: Linux — real device (partition/format/mount + UUID + mass + ISO)
+      - name: Linux — real device (partition/format/mount + fix-perms + mass + ISO)
         if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_device' }}
         shell: bash
         run: |
@@ -228,6 +235,7 @@ jobs:
           run_sh_req "mkdir.mountpoint" 1 "sudo mkdir -p '${MP}'"
           run_sh_req "mount" 2 "sudo mount '${PART}' '${MP}'"
 
+          # fstab
           UUID=""
           for i in {1..5}; do
             UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true)
@@ -241,13 +249,25 @@ jobs:
               echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
             fi
           fi
-
           ok "Mounted at ${MP} (part=${PART})"
 
+          # 권한 이양
+          USERN="$(id -un)"; GROUPN="$(id -gn)"
+          run_chain "fix.perms" "\
+            sudo chown -R '${USERN}:${GROUPN}' '${MP}' || \
+            (command -v setfacl >/dev/null 2>&1 && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || \
+            sudo chmod -R a+rwx '${MP}' || true"
+
+          # 대량 생성(일반→sudo 백업)
           run_sh_req "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done"
+          run_sh_req "mass.dirs.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done && chown -R '${USERN}:${GROUPN}' .\""
+
           run_sh_req "mass.files" 1 "cd '${MP}' && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env"
+          run_sh_req "mass.files.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo 'file-'\\\$i,\\\$(date -Iseconds) >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env && chown -R '${USERN}:${GROUPN}' .\""
+
           run_sh_req "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true"
 
+          # ISO
           if [ -n "${{ inputs.iso_cfg }}" ]; then
             NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
             SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MP}")
@@ -257,7 +277,7 @@ jobs:
           fi
 
           run_sh_req "health.mount" 0 "[ -d '${MP}' ] && mountpoint -q '${MP}'"
-          run_sh_req "health.write" 0 "echo ok > '${MP}/.ok' && sync"
+          run_sh_req "health.write" 0 "echo ok > '${MP}/.ok' && sync || sudo bash -lc \"echo ok > '${MP}/.ok' && sync\""
 
       # ---------- Windows: VHDX ----------
       - name: Windows — VHDX (create/mount/format + mass)
