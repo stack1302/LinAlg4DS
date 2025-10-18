@@ -1,13 +1,14 @@
-name: "💽 Disk Ops — Disk + ISO + Mass Setup — No-Skip (≤10 inputs)"
+# .github/workflows/disk-ops.yml
+name: "💽 Disk Ops — Linux / Windows / macOS — No-Skip (≤10 inputs)"
 
 on:
   workflow_dispatch:
     inputs:
       runner:        # 1
-        description: "OS (ubuntu-24.04 | windows-latest | macos-latest)"
+        description: "OS (ubuntu-24.04 | windows-latest | macos-latest | all)"
         type: choice
-        options: [ubuntu-24.04, windows-latest, macos-latest]
-        default: ubuntu-24.04
+        options: [ubuntu-24.04, windows-latest, macos-latest, all]
+        default: all
       mode:          # 2
         description: "동작 (linux_loop | linux_device | windows_vhdx | macos_dmg)"
         type: choice
@@ -36,7 +37,7 @@ on:
         type: boolean
         default: true
       iso_cfg:       # 10
-        description: 'ISO 생성 설정 (비우면 생성 안함). 예: name=MYISO,src=/mnt/data'
+        description: 'ISO 생성 설정(비우면 생성 안함) 예: name=MYISO,src=/mnt/data (Linux/macOS 지원)'
         default: ""
 
 permissions:
@@ -50,21 +51,21 @@ env:
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
 
+# --- Linux Job ---
 jobs:
-  disk-ops:
-    name: "Disk + ISO Ops (${{ inputs.mode }}) — No-Skip"
-    runs-on: ${{ inputs.runner }}
+  linux:
+    if: ${{ inputs.runner == 'ubuntu-24.04' || inputs.runner == 'all' }}
+    name: "Linux — ${ { inputs.mode } }"
+    runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Prep dirs
         shell: bash
-        run: |
-          mkdir -p "${LOG_DIR}" "${ART_DIR}"
+        run: mkdir -p "${LOG_DIR}" "${ART_DIR}"
 
-      - name: Echo helpers (fixed status capture)
+      - name: Helpers
         shell: bash
         run: |
           cat > /tmp/echo_helpers.sh <<'SH'
@@ -73,215 +74,111 @@ jobs:
           TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
           ok(){ echo "${ECHO_OK} [$(TS)] $*"; }
           warn(){ echo "${ECHO_WARN} [$(TS)] $*" >&2; }
-
-          # 문자열 단일 커맨드를 실행하고 종료코드 수집(실패해도 계속)
-          run_sh_req(){ # run_sh_req <name> <retries> "<command>"
-            local name="$1"; local retries="$2"; local cmd="$3"
-            local attempt=0; local status=1
-            echo "▶ ${name} :: ${cmd} (retries=${retries})"
-            while true; do
-              status=0
-              bash -lc "${cmd}" >>"${LOG_DIR}/disk-ops.log" 2>&1 || status=$?
-              if [ ${status} -eq 0 ]; then
-                ok "${name} OK"; return 0
-              fi
-              attempt=$((attempt+1))
-              if [ ${attempt} -le ${retries} ]; then
-                warn "${name} FAILED (exit=${status}) — retry ${attempt}/${retries}"
-                sleep 2
-              else
-                warn "${name} FAILED (exit=${status}) — continue (no-skip)"
-                return 0
-              fi
+          run_sh_req(){ # <name> <retries> "<cmd>"
+            local n="$1" r="$2" c="$3" a=0 s=1
+            echo "▶ ${n} :: ${c} (retries=${r})"
+            while true; do s=0; bash -lc "${c}" >>"${LOG_DIR}/linux.log" 2>&1 || s=$?
+              if [ $s -eq 0 ]; then ok "${n} OK"; return 0; fi
+              a=$((a+1)); if [ $a -le $r ]; then warn "${n} FAIL(${s}) retry ${a}/${r}"; sleep 2; else warn "${n} FAIL(${s}) continue"; return 0; fi
             done
           }
-
-          # A || B || C || true 체인 (항상 0)
-          run_chain(){ # run_chain <name> "<cmd1 || cmd2 || true>"
-            local name="$1"; local chain="$2"
-            echo "▶ ${name} (chain)"
-            local status=0
-            bash -lc "${chain}" >>"${LOG_DIR}/disk-ops.log" 2>&1 || status=$?
-            if [ ${status} -eq 0 ]; then ok "${name} OK"; else warn "${name} chain non-zero(${status}) — forced continue"; fi
+          run_chain(){ # <name> "<A || B || true>"
+            local n="$1" ch="$2"; echo "▶ ${n} (chain)"
+            bash -lc "${ch}" >>"${LOG_DIR}/linux.log" 2>&1 || true; ok "${n} OK"
           }
-
-          kv(){ # key=value 파서
-            local key="$1" str="$2"
-            IFS=',' read -ra PAIRS <<< "$str"
-            for p in "${PAIRS[@]}"; do
-              p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
-              [[ "$p" == "$key="* ]] && echo "${p#*=}" && return 0
-            done
-            return 1
-          }
+          kv(){ local k="$1" s="$2"; IFS=',' read -ra P <<< "$s"; for p in "${P[@]}"; do p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"; [[ "$p" == "$k="* ]] && echo "${p#*=}" && return 0; done; return 1; }
           SH
           chmod +x /tmp/echo_helpers.sh
-          echo "${ECHO_OK} helpers ready"
+          echo "helpers ready"
 
-      # ---------- Linux: loop image ----------
-      - name: Linux — loop image (create/partition/format/mount + fix-perms + mass + ISO)
-        if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_loop' }}
+      - name: Disk Ops (Linux)
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
-          IMG="/var/disk.img"
-          SIZE="${{ inputs.size_gb }}G"
-          MP="${{ inputs.mount_path }}"
-          FS="${{ inputs.fs }}"
-          LABEL="${{ inputs.label }}"
-          FSTAB="${{ inputs.fstab }}"
-
-          run_sh_req "apt.update" 2 "sudo apt-get update -y"
-          run_sh_req "apt.install.core" 2 "sudo apt-get install -y parted util-linux xfsprogs udev"
-          run_chain "apt.install.iso" "sudo apt-get install -y xorriso || sudo apt-get install -y genisoimage || sudo apt-get install -y cdrtools || true"
-
-          run_chain "img.create" "sudo fallocate -l '${SIZE}' '${IMG}' || sudo dd if=/dev/zero of='${IMG}' bs=1M count=$(( ${{ inputs.size_gb }} * 1024 )) || true"
-          run_sh_req "loop.attach" 2 "sudo losetup -fP '${IMG}'"
-
-          LOOP=$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1)
-          if [ -z "${LOOP:-}" ]; then
-            run_sh_req "loop.attach.retry" 1 "sudo losetup -fP '${IMG}'"
-            LOOP=$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1)
-          fi
-
-          run_sh_req "gpt.label" 1 "sudo parted -s '${LOOP}' mklabel gpt"
-          run_sh_req "gpt.part"  1 "sudo parted -s '${LOOP}' mkpart primary ${FS} 0% 100%"
-          run_chain "part.probe" "sudo partprobe '${LOOP}' || sudo udevadm settle || true"
-
-          PART="${LOOP}p1"
-          if [ "${FS}" = "xfs" ]; then
-            run_sh_req "mkfs.xfs" 1 "sudo mkfs.xfs -f -L '${LABEL}' '${PART}'"
-          else
-            run_sh_req "mkfs.ext4" 2 "sudo mkfs.ext4 -F -L '${LABEL}' '${PART}'"
-          fi
-
-          run_sh_req "mkdir.mountpoint" 1 "sudo mkdir -p '${MP}'"
-          run_sh_req "mount" 2 "sudo mount '${PART}' '${MP}'"
-
-          # fstab 등록(가능하면 UUID, 실패 시 LABEL)
-          UUID=""
-          for i in {1..5}; do
-            UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true)
-            [ -z "$UUID" ] && UUID=$(lsblk -no UUID "${PART}" 2>/dev/null || true)
-            [ -n "$UUID" ] && break || sleep 1
-          done
-          if [ "${FSTAB}" = "true" ]; then
-            if [ -n "$UUID" ]; then
-              echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
-            else
-              echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
-            fi
-          fi
-          ok "Mounted at ${MP} (part=${PART})"
-
-          # --- 중요: 권한 이양(3단계 대체 루틴) ---
-          # 1) 소유자 runner로 변경 → 2) ACL(있으면) 부여 → 3) 최후수단 퍼미션 개방
-          USERN="$(id -un)"; GROUPN="$(id -gn)"
-          run_chain "fix.perms" "\
-            sudo chown -R '${USERN}:${GROUPN}' '${MP}' || \
-            (command -v setfacl >/dev/null 2>&1 && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || \
-            sudo chmod -R a+rwx '${MP}' || true"
-
-          # --- 대량 생성(일반 실행 → 실패 시 sudo로 재시도) ---
-          run_sh_req "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done"
-          run_sh_req "mass.dirs.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done && chown -R '${USERN}:${GROUPN}' .\""
-
-          run_sh_req "mass.files" 1 "cd '${MP}' && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env"
-          run_sh_req "mass.files.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo 'file-'\\\$i,\\\$(date -Iseconds) >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env && chown -R '${USERN}:${GROUPN}' .\""
-
-          run_sh_req "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true"
-
-          # ISO 생성(옵션)
-          if [ -n "${{ inputs.iso_cfg }}" ]; then
-            NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
-            SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MP}")
-            ISO="${{ github.workspace }}/${NAME}.iso"
-            run_chain "iso.create" "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || true"
-            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || warn "ISO not created"
-          fi
-
-          run_sh_req "health.mount" 0 "[ -d '${MP}' ] && mountpoint -q '${MP}'"
-          run_sh_req "health.write" 0 "echo ok > '${MP}/.ok' && sync || sudo bash -lc \"echo ok > '${MP}/.ok' && sync\""
-
-      # ---------- Linux: real device ----------
-      - name: Linux — real device (partition/format/mount + fix-perms + mass + ISO)
-        if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_device' }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
+          MODE="${{ inputs.mode }}"
+          IMG="/var/disk.img"; SIZE="${{ inputs.size_gb }}G"
+          MP="${{ inputs.mount_path }}"; FS="${{ inputs.fs }}"
+          LABEL="${{ inputs.label }}"; FSTAB="${{ inputs.fstab }}"
           DEV="${{ inputs.device }}"
-          MP="${{ inputs.mount_path }}"
-          FS="${{ inputs.fs }}"
-          LABEL="${{ inputs.label }}"
-          FSTAB="${{ inputs.fstab }}"
 
-          [ -n "${DEV}" ] || warn "device empty — 예: /dev/sdb"
-
+          # 공통 패키지 + ISO 도구(있으면 설치)
           run_sh_req "apt.update" 2 "sudo apt-get update -y"
           run_sh_req "apt.install.core" 2 "sudo apt-get install -y parted util-linux xfsprogs udev"
-          run_chain "apt.install.iso" "sudo apt-get install -y xorriso || sudo apt-get install -y genisoimage || sudo apt-get install -y cdrtools || true"
+          run_chain  "apt.install.iso"  "sudo apt-get install -y xorriso || sudo apt-get install -y genisoimage || sudo apt-get install -y cdrtools || true"
 
-          run_sh_req "gpt.label" 1 "sudo parted -s '${DEV}' mklabel gpt"
-          run_sh_req "gpt.part"  1 "sudo parted -s '${DEV}' mkpart primary ${FS} 0% 100%"
-          PART="${DEV}1"
-          run_chain "part.probe" "sudo partprobe '${DEV}' || sudo udevadm settle || true"
+          if [ "$MODE" = "linux_loop" ]; then
+            run_chain "img.create" "sudo fallocate -l '${SIZE}' '${IMG}' || sudo dd if=/dev/zero of='${IMG}' bs=1M count=$(( ${{ inputs.size_gb }} * 1024 )) || true"
+            run_sh_req "loop.attach" 2 "sudo losetup -fP '${IMG}'"
+            LOOP=$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1)
+            [ -n "${LOOP:-}" ] || LOOP="/dev/loop0"
+            TGT="${LOOP}"
+            PART="${LOOP}p1"
+          else
+            TGT="${DEV}"
+            PART="${DEV}1"
+          fi
 
+          # 파티션/포맷/마운트
+          run_sh_req "gpt.label" 1 "sudo parted -s '${TGT}' mklabel gpt"
+          run_sh_req "gpt.part"  1 "sudo parted -s '${TGT}' mkpart primary ${FS} 0% 100%"
+          run_chain  "part.probe" "sudo partprobe '${TGT}' || sudo udevadm settle || true"
           if [ "${FS}" = "xfs" ]; then
             run_sh_req "mkfs.xfs" 1 "sudo mkfs.xfs -f -L '${LABEL}' '${PART}'"
           else
             run_sh_req "mkfs.ext4" 2 "sudo mkfs.ext4 -F -L '${LABEL}' '${PART}'"
           fi
-
           run_sh_req "mkdir.mountpoint" 1 "sudo mkdir -p '${MP}'"
           run_sh_req "mount" 2 "sudo mount '${PART}' '${MP}'"
 
-          # fstab
-          UUID=""
-          for i in {1..5}; do
-            UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true)
-            [ -z "$UUID" ] && UUID=$(lsblk -no UUID "${PART}" 2>/dev/null || true)
-            [ -n "$UUID" ] && break || sleep 1
-          done
+          # fstab (UUID 우선, 실패시 LABEL)
+          UUID=""; for i in {1..5}; do UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true); [ -n "$UUID" ] && break || sleep 1; done
           if [ "${FSTAB}" = "true" ]; then
-            if [ -n "$UUID" ]; then
-              echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
-            else
-              echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
-            fi
+            LINE=$([ -n "$UUID" ] && echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" || echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2")
+            echo "${LINE}" | sudo tee -a /etc/fstab >/dev/null || true
           fi
-          ok "Mounted at ${MP} (part=${PART})"
+          echo "mounted ${MP} (${PART})"
 
-          # 권한 이양
+          # 권한 이양(소유자/ACL/퍼미션)
           USERN="$(id -un)"; GROUPN="$(id -gn)"
-          run_chain "fix.perms" "\
-            sudo chown -R '${USERN}:${GROUPN}' '${MP}' || \
-            (command -v setfacl >/dev/null 2>&1 && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || \
-            sudo chmod -R a+rwx '${MP}' || true"
+          run_chain "fix.perms" "sudo chown -R '${USERN}:${GROUPN}' '${MP}' || (command -v setfacl >/dev/null && sudo setfacl -R -m u:${USERN}:rwx -m g:${GROUPN}:rwx '${MP}') || sudo chmod -R a+rwx '${MP}' || true"
 
-          # 대량 생성(일반→sudo 백업)
-          run_sh_req "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done"
-          run_sh_req "mass.dirs.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done && chown -R '${USERN}:${GROUPN}' .\""
+          # 대량 생성(일반 → sudo 대체)
+          run_sh_req  "mass.dirs" 1 "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done"
+          run_sh_req  "mass.dirs.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done && chown -R '${USERN}:${GROUPN}' .\""
+          run_sh_req  "mass.files" 1 "cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env"
+          run_sh_req  "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true"
 
-          run_sh_req "mass.files" 1 "cd '${MP}' && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env"
-          run_sh_req "mass.files.sudo" 0 "sudo bash -lc \"cd '${MP}' && mkdir -p reports backups scripts configs && for i in \$(seq 1 200); do echo 'file-'\\\$i,\\\$(date -Iseconds) >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env && chown -R '${USERN}:${GROUPN}' .\""
-
-          run_sh_req "checksums" 1 "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true"
-
-          # ISO
+          # ISO (요청 시)
           if [ -n "${{ inputs.iso_cfg }}" ]; then
             NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
             SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MP}")
             ISO="${{ github.workspace }}/${NAME}.iso"
             run_chain "iso.create" "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || true"
-            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || warn "ISO not created"
+            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || true
           fi
 
           run_sh_req "health.mount" 0 "[ -d '${MP}' ] && mountpoint -q '${MP}'"
           run_sh_req "health.write" 0 "echo ok > '${MP}/.ok' && sync || sudo bash -lc \"echo ok > '${MP}/.ok' && sync\""
 
-      # ---------- Windows: VHDX ----------
-      - name: Windows — VHDX (create/mount/format + mass)
-        if: ${{ startsWith(inputs.runner, 'windows') && inputs.mode == 'windows_vhdx' }}
+      - name: Upload artifacts (Linux)
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            .github/echo_logs/linux.log
+            .github/echo_artifacts/*.iso
+          if-no-files-found: warn
+
+  # --- Windows Job ---
+  windows:
+    if: ${{ inputs.runner == 'windows-latest' || inputs.runner == 'all' }}
+    name: "Windows — VHDX"
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disk Ops (Windows)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
@@ -307,43 +204,63 @@ jobs:
             "KEY=VALUE" | Out-File -Encoding utf8 -FilePath "$($DL):\configs\app.env"
             "file,ts"   | Out-File -Encoding utf8 -FilePath "$($DL):\reports\index.csv"
           } else {
-            Write-Warning "VHDX mount failed — continue (no-skip)"
+            Write-Warning "VHDX mount failed — continue"
           }
 
-      # ---------- macOS: DMG ----------
-      - name: macOS — DMG (create/mount + mass + ISO makehybrid)
-        if: ${{ startsWith(inputs.runner, 'macos') && inputs.mode == 'macos_dmg' }}
-        shell: bash
-        run: |
-          source /tmp/echo_helpers.sh
-          SIZE="${{ inputs.size_gb }}"
-          FS="${{ inputs.fs }}"
-          LABEL="${{ inputs.label }}"
-          DMG="${{ github.workspace }}/vdata.dmg"
-          [ "${FS}" = "APFS" ] || [ "${FS}" = "JHFS+" ] || FS="APFS"
-
-          run_sh_req "dmg.create" 1 "hdiutil create -size '${SIZE}g' -fs '${FS}' -volname '${LABEL}' '${DMG}'"
-          run_sh_req "dmg.attach" 1 "hdiutil attach '${DMG}'"
-          MOUNT="/Volumes/${LABEL}"
-          if [ -d "${MOUNT}" ]; then
-            run_sh_req "mass.dirs.files" 1 "cd '${MOUNT}' && mkdir -p {logs,data,backups,scripts,configs,reports} && echo 'KEY=VALUE' > configs/app.env && echo 'file,ts' > reports/index.csv"
-          else
-            warn "mount not found — continue (no-skip)"
-          fi
-
-          if [ -n "${{ inputs.iso_cfg }}" ]; then
-            NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
-            SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MOUNT}")
-            ISO="${{ github.workspace }}/${NAME}.iso"
-            run_sh_req "iso.makehybrid" 1 "hdiutil makehybrid -o '${ISO}' '${SRC}' -iso -joliet -default-volume-name '${NAME}'"
-            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || warn "ISO not created"
-          fi
-
-      - name: Upload artifacts (logs + ISO)
+      - name: Upload artifacts (Windows)
         uses: actions/upload-artifact@v4
         with:
-          name: disk-ops-artifacts
+          name: windows-artifacts
+          path: vdisks
+          if-no-files-found: warn
+
+  # --- macOS Job ---
+  macos:
+    if: ${{ inputs.runner == 'macos-latest' || inputs.runner == 'all' }}
+    name: "macOS — DMG"
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Disk Ops (macOS)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          TZ=Asia/Seoul
+          LOG="${LOG_DIR}/mac.log"; mkdir -p "${LOG_DIR}" "${ART_DIR}"
+          DMG="${GITHUB_WORKSPACE}/vdata.dmg"
+          SIZE="${{ inputs.size_gb }}"
+          FS="${{ inputs.fs }}"; [ "${FS}" = "APFS" ] || [ "${FS}" = "JHFS+" ] || FS="APFS"
+          LABEL="${{ inputs.label }}"
+          MP="${{ inputs.mount_path }}"
+
+          echo "▶ create DMG" | tee -a "${LOG}"
+          hdiutil create -size "${SIZE}g" -fs "${FS}" -volname "${LABEL}" "${DMG}" >>"${LOG}" 2>&1 || true
+          echo "▶ attach DMG" | tee -a "${LOG}"
+          hdiutil attach "${DMG}" >>"${LOG}" 2>&1 || true
+          MOUNT="/Volumes/${LABEL}"
+          if [ -d "${MOUNT}" ]; then
+            mkdir -p "${MOUNT}/"{logs,data,backups,scripts,configs,reports} >>"${LOG}" 2>&1 || true
+            echo "KEY=VALUE" > "${MOUNT}/configs/app.env"
+            echo "file,ts" > "${MOUNT}/reports/index.csv"
+          fi
+
+          # ISO (요청 시)
+          if [ -n "${{ inputs.iso_cfg }}" ]; then
+            NAME="$(echo "${{ inputs.iso_cfg }}" | awk -F'name=' '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${NAME}" ] || NAME="DISK_IMG"
+            SRC="$(echo  "${{ inputs.iso_cfg }}" | awk -F'src='  '{print $2}' | awk -F',' '{print $1}')" ; [ -n "${SRC}" ] || SRC="${MOUNT}"
+            ISO="${GITHUB_WORKSPACE}/${NAME}.iso"
+            echo "▶ makehybrid ISO" | tee -a "${LOG}"
+            hdiutil makehybrid -o "${ISO}" "${SRC}" -iso -joliet -default-volume-name "${NAME}" >>"${LOG}" 2>&1 || true
+            [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || true
+          fi
+
+      - name: Upload artifacts (macOS)
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
           path: |
-            .github/echo_logs/disk-ops.log
+            .github/echo_logs/mac.log
             .github/echo_artifacts/*.iso
           if-no-files-found: warn
