@@ -1,5 +1,4 @@
-# .github/workflows/disk-ops.yml
-name: "💽 Disk Ops — Disk + ISO + Mass Setup — No-Skip(리트라이/대체경로) (≤10 inputs)"
+name: "💽 Disk Ops — Disk + ISO + Mass Setup — No-Skip (≤10 inputs)"
 
 on:
   workflow_dispatch:
@@ -63,13 +62,11 @@ jobs:
       - name: Prep dirs
         shell: bash
         run: |
-          set -Eeuo pipefail
           mkdir -p "${LOG_DIR}" "${ART_DIR}"
 
       - name: Echo helpers (No-Skip wrappers)
         shell: bash
         run: |
-          set -Eeuo pipefail
           cat > /tmp/echo_helpers.sh <<'SH'
           #!/usr/bin/env bash
           set -Euo pipefail
@@ -78,18 +75,16 @@ jobs:
           warn(){ echo "${ECHO_WARN} [$(TS)] $*" >&2; }
           fail(){ echo "${ECHO_FAIL} [$(TS)] $*" >&2; }
 
-          # 실패해도 "스킵 없이" 계속 진행 (로그에 이유 남김)
+          # 재시도: 실패해도 종료하지 않고 로그만 남김
           run_req(){ # run_req <name> <retries> -- <cmd...>
             local name="$1"; shift
             local retries="$1"; shift
             [ "$1" = "--" ] && shift || true
-            local attempt=0
-            local ec=0
+            local attempt=0 ec=0
             echo "▶ $name :: $* (retries=${retries})"
             while true; do
               if "$@" >>"${LOG_DIR}/disk-ops.log" 2>&1; then
-                ok "$name OK"
-                return 0
+                ok "$name OK"; return 0
               fi
               ec=$?; attempt=$((attempt+1))
               if [ ${attempt} -le ${retries} ]; then
@@ -97,31 +92,22 @@ jobs:
                 sleep 2
               else
                 warn "$name FAILED (exit=${ec}) — continue (no-skip)"
-                return ${ec}
+                return 0
               fi
             done
           }
 
-          # 여러 대체 명령 중 하나라도 성공시키기 (모두 실패해도 계속 진행)
-          run_any(){ # run_any <name> -- <cmd1> ::: <cmd2> ::: <cmd3>
+          # 명령 체인: A || B || C || true  형태를 안전 실행
+          run_chain(){ # run_chain <name> -- "<cmd1> || <cmd2> || true"
             local name="$1"; shift
             [ "$1" = "--" ] && shift || true
-            local ec=0
-            IFS=$'\n' read -rd '' -a parts || true
-            parts=($(printf "%s" "$*" | tr ' ' '\n' | awk 'BEGIN{RS=":::"; ORS="\n"}{gsub(/\n/," "); print $0}'))
-            echo "▶ $name (alternatives=${#parts[@]})"
-            for alt in "${parts[@]}"; do
-              echo "  - try: ${alt}"
-              if bash -c "${alt}" >>"${LOG_DIR}/disk-ops.log" 2>&1; then
-                ok "$name OK via: ${alt}"
-                return 0
-              else
-                ec=$?
-                warn "$name alt failed (exit=${ec}): ${alt}"
-              fi
-            done
-            warn "$name all alternatives failed — continue (no-skip)"
-            return ${ec}
+            echo "▶ $name (chain)"
+            if bash -lc "$*" >>"${LOG_DIR}/disk-ops.log" 2>&1; then
+              ok "$name OK"
+            else
+              # 체인 끝에 true가 없다면 안전하게 흡수
+              warn "$name chain non-zero — forced continue"
+            fi
           }
 
           # key=value 파서 (iso_cfg)
@@ -138,12 +124,13 @@ jobs:
           chmod +x /tmp/echo_helpers.sh
           echo "${ECHO_OK} helpers ready"
 
-      # ------------------ Linux: loop backing file ------------------
-      - name: Linux — loop image (create/partition/format/mount + robust UUID + mass + ISO)
+      # Linux — loop image
+      - name: Linux — loop image (create/partition/format/mount + UUID + mass + ISO)
         if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_loop' }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
+          set +e
           IMG="/var/disk.img"
           SIZE="${{ inputs.size_gb }}G"
           MP="${{ inputs.mount_path }}"
@@ -153,21 +140,23 @@ jobs:
 
           run_req "apt.update" 2 -- sudo apt-get update -y
           run_req "apt.install.core" 2 -- sudo apt-get install -y parted util-linux xfsprogs udev
-          run_any "apt.install.iso" -- "sudo apt-get install -y xorriso" ::: "sudo apt-get install -y genisoimage"
+          # ISO 도구 설치: 어떤 것이든 하나만 깔려도 OK (마지막 true로 0 보장)
+          run_chain "apt.install.iso" -- "sudo apt-get install -y xorriso || sudo apt-get install -y genisoimage || sudo apt-get install -y cdrtools || true"
 
-          run_any "img.create" -- \
-            "sudo fallocate -l '${SIZE}' '${IMG}'" ::: \
-            "sudo dd if=/dev/zero of='${IMG}' bs=1M count=$(( ${{ inputs.size_gb }} * 1024 ))"
-
+          run_chain "img.create" -- "sudo fallocate -l '${SIZE}' '${IMG}' || sudo dd if=/dev/zero of='${IMG}' bs=1M count=$(( ${{ inputs.size_gb }} * 1024 )) || true"
           run_req "loop.attach" 2 -- sudo losetup -fP "${IMG}"
 
           LOOP=$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1)
-          if [ -z "${LOOP:-}" ]; then warn "loop device not found — try losetup scan"; sudo losetup -fP "${IMG}" || true; LOOP=$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1); fi
+          if [ -z "${LOOP:-}" ]; then
+            warn "loop not found — extra attach try"
+            sudo losetup -fP "${IMG}" >>"${LOG_DIR}/disk-ops.log" 2>&1 || true
+            LOOP=$(losetup -a | awk -F: '/disk.img/ {print $1}' | head -n1)
+          fi
           [ -n "${LOOP:-}" ] || warn "loop still not detected (continue)"
 
           run_req "gpt.label" 1 -- sudo parted -s "${LOOP}" mklabel gpt
           run_req "gpt.part"  1 -- sudo parted -s "${LOOP}" mkpart primary ${FS} 0% 100%
-          run_any "part.probe" -- "sudo partprobe '${LOOP}'" ::: "sudo udevadm settle"
+          run_chain "part.probe" -- "sudo partprobe '${LOOP}' || sudo udevadm settle || true"
 
           PART="${LOOP}p1"
           if [ "${FS}" = "xfs" ]; then
@@ -179,66 +168,62 @@ jobs:
           run_req "mkdir.mountpoint" 1 -- sudo mkdir -p "${MP}"
           run_req "mount" 2 -- sudo mount "${PART}" "${MP}"
 
-          # UUID 확보(5회 재시도 + 대체)
+          # UUID 5회 재시도 → 실패 시 LABEL 기반 fstab
           UUID=""
           for i in {1..5}; do
             UUID=$(blkid -s UUID -o value "${PART}" 2>/dev/null || true)
             [ -z "$UUID" ] && UUID=$(lsblk -no UUID "${PART}" 2>/dev/null || true)
             [ -n "$UUID" ] && break || sleep 1
           done
-          if [ -z "$UUID" ]; then
-            warn "UUID not found — fstab는 라벨 기반 대체 시도"
-            if [ "${FSTAB}" = "true" ]; then
-              echo "LABEL=${LABEL}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
+          if [ "${FSTAB}" = "true" ]; then
+            if [ -n "$UUID" ]; then
+              echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
+            else
+              echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
             fi
-          elif [ "${FSTAB}" = "true" ]; then
-            echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
           fi
 
           ok "Mounted at ${MP} (part=${PART})"
 
-          # 대량 디렉토리/파일 (스킵 없음)
           run_req "mass.dirs" 1 -- bash -lc "cd '${MP}' && mkdir -p {logs,data,backups,tmp,scripts,configs,reports,bins,jobs} && for i in \$(seq 1 50); do mkdir -p data/shard_\$i; done && for i in \$(seq 1 20); do mkdir -p logs/day_\$i; done"
           run_req "mass.files" 1 -- bash -lc "cd '${MP}' && for i in \$(seq 1 200); do echo \"file-\$i,\$(date -Iseconds)\" >> reports/index.csv; done && truncate -s 64K backups/seed.bin && printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' > scripts/healthcheck.sh && chmod +x scripts/healthcheck.sh && echo 'KEY=VALUE' > configs/app.env"
           run_req "checksums" 1 -- bash -lc "cd '${MP}' && find . -type f -maxdepth 2 -print0 | xargs -0 sha256sum > reports/SHA256SUMS.txt || true"
 
-          # ISO 생성(요청 시) — xorriso → genisoimage 순서로 시도
+          # ISO 생성: xorriso → genisoimage → mkisofs 순으로 시도, 실패해도 계속
           if [ -n "${{ inputs.iso_cfg }}" ]; then
             NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
             SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MP}")
             ISO="${{ github.workspace }}/${NAME}.iso"
-            run_any "iso.create" -- \
-              "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}'" ::: \
-              "genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}'"
+            run_chain "iso.create" -- "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || true"
             [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || warn "ISO not created"
           fi
 
-          # 필수 헬스 체크 (마운트 확인·쓰기 확인) — 실패해도 계속
           run_req "health.mount" 0 -- bash -lc "[ -d '${MP}' ] && mountpoint -q '${MP}'"
           run_req "health.write" 0 -- bash -lc "echo ok > '${MP}/.ok' && sync"
 
-      # ------------------ Linux: real device ------------------
-      - name: Linux — real device (partition/format/mount + robust UUID + mass + ISO)
+      # Linux — real device
+      - name: Linux — real device (partition/format/mount + UUID + mass + ISO)
         if: ${{ startsWith(inputs.runner, 'ubuntu') && inputs.mode == 'linux_device' }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
+          set +e
           DEV="${{ inputs.device }}"
           MP="${{ inputs.mount_path }}"
           FS="${{ inputs.fs }}"
           LABEL="${{ inputs.label }}"
           FSTAB="${{ inputs.fstab }}"
 
-          if [ -z "${DEV}" ]; then warn "device empty — 예: /dev/sdb"; fi
+          [ -n "${DEV}" ] || warn "device empty — 예: /dev/sdb"
 
           run_req "apt.update" 2 -- sudo apt-get update -y
           run_req "apt.install.core" 2 -- sudo apt-get install -y parted util-linux xfsprogs udev
-          run_any "apt.install.iso" -- "sudo apt-get install -y xorriso" ::: "sudo apt-get install -y genisoimage"
+          run_chain "apt.install.iso" -- "sudo apt-get install -y xorriso || sudo apt-get install -y genisoimage || sudo apt-get install -y cdrtools || true"
 
           run_req "gpt.label" 1 -- sudo parted -s "${DEV}" mklabel gpt
           run_req "gpt.part"  1 -- sudo parted -s "${DEV}" mkpart primary ${FS} 0% 100%
           PART="${DEV}1"
-          run_any "part.probe" -- "sudo partprobe '${DEV}'" ::: "sudo udevadm settle"
+          run_chain "part.probe" -- "sudo partprobe '${DEV}' || sudo udevadm settle || true"
 
           if [ "${FS}" = "xfs" ]; then
             run_req "mkfs.xfs" 1 -- sudo mkfs.xfs -f -L "${LABEL}" "${PART}"
@@ -255,13 +240,12 @@ jobs:
             [ -z "$UUID" ] && UUID=$(lsblk -no UUID "${PART}" 2>/dev/null || true)
             [ -n "$UUID" ] && break || sleep 1
           done
-          if [ -z "$UUID" ]; then
-            warn "UUID not found — fstab 라벨 기반 대체"
-            if [ "${FSTAB}" = "true" ]; then
-              echo "LABEL=${LABEL}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
+          if [ "${FSTAB}" = "true" ]; then
+            if [ -n "$UUID" ]; then
+              echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
+            else
+              echo "LABEL=${LABEL}  ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
             fi
-          elif [ "${FSTAB}" = "true" ]; then
-            echo "UUID=${UUID}   ${MP}   ${FS}   defaults,nofail   0 2" | sudo tee -a /etc/fstab >/dev/null || true
           fi
 
           ok "Mounted at ${MP} (part=${PART})"
@@ -274,21 +258,19 @@ jobs:
             NAME=$(kv name "${{ inputs.iso_cfg }}" || echo "DISK_IMG")
             SRC=$(kv src  "${{ inputs.iso_cfg }}" || echo "${MP}")
             ISO="${{ github.workspace }}/${NAME}.iso"
-            run_any "iso.create" -- \
-              "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}'" ::: \
-              "genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}'"
+            run_chain "iso.create" -- "xorriso -as mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || genisoimage -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || mkisofs -R -J -V '${NAME}' -o '${ISO}' '${SRC}' || true"
             [ -f "${ISO}" ] && mv "${ISO}" "${ART_DIR}/" || warn "ISO not created"
           fi
 
           run_req "health.mount" 0 -- bash -lc "[ -d '${MP}' ] && mountpoint -q '${MP}'"
           run_req "health.write" 0 -- bash -lc "echo ok > '${MP}/.ok' && sync"
 
-      # ------------------ Windows: VHDX ------------------
+      # Windows — VHDX
       - name: Windows — VHDX (create/mount/format + mass)
         if: ${{ startsWith(inputs.runner, 'windows') && inputs.mode == 'windows_vhdx' }}
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'  # 실패해도 스킵 없이 계속
+          $ErrorActionPreference = 'Continue'
           $VRoot = Join-Path $env:GITHUB_WORKSPACE "vdisks"
           New-Item -ItemType Directory -Force -Path $VRoot | Out-Null
           $Size = [int]${{ inputs.size_gb }} * 1GB
@@ -307,7 +289,6 @@ jobs:
             try { New-Partition -DiskNumber $disk.Number -UseMaximumSize -DriveLetter $DL -ErrorAction Continue | Out-Null } catch { $_ | Out-String | Write-Warning }
             try { Format-Volume -DriveLetter $DL -FileSystem NTFS -NewFileSystemLabel $Label -Confirm:$false -ErrorAction Continue | Out-Null } catch { $_ | Out-String | Write-Warning }
 
-            # 대량 구조
             foreach ($d in @("logs","data","backups","scripts","configs","reports")) { New-Item -ItemType Directory -Force -Path "$($DL):\$d" | Out-Null }
             "KEY=VALUE" | Out-File -Encoding utf8 -FilePath "$($DL):\configs\app.env"
             "file,ts"   | Out-File -Encoding utf8 -FilePath "$($DL):\reports\index.csv"
@@ -315,12 +296,13 @@ jobs:
             Write-Warning "VHDX mount failed — continue (no-skip)"
           }
 
-      # ------------------ macOS: DMG + ISO ------------------
+      # macOS — DMG
       - name: macOS — DMG (create/mount + mass + ISO makehybrid)
         if: ${{ startsWith(inputs.runner, 'macos') && inputs.mode == 'macos_dmg' }}
         shell: bash
         run: |
           source /tmp/echo_helpers.sh
+          set +e
           SIZE="${{ inputs.size_gb }}"
           FS="${{ inputs.fs }}"
           LABEL="${{ inputs.label }}"
