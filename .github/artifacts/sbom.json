@@ -2,10 +2,10 @@
   "$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json",
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:3c5ea810-c72f-42c2-aafc-c71d908e01c1",
+  "serialNumber": "urn:uuid:8945c340-cf3e-446f-95eb-589c2835b155",
   "version": 1,
   "metadata": {
-    "timestamp": "2025-10-19T11:21:26+09:00",
+    "timestamp": "2025-10-19T11:44:32+09:00",
     "tools": {
       "components": [
         {
@@ -20,7 +20,7 @@
       "bom-ref": "af63bd4c8601b7f1",
       "type": "file",
       "name": "LinAlg4DS",
-      "version": "0.0.0-6aa4658-20251019"
+      "version": "0.0.0-0c575c7-20251019"
     }
   },
   "components": [
@@ -5298,11 +5298,11 @@
       "hashes": [
         {
           "alg": "SHA-1",
-          "content": "fc5db104128916da1e659835069d402d62cb9659"
+          "content": "9cfdd731ae9d7db94a43cc4831de5d1720430b06"
         },
         {
           "alg": "SHA-256",
-          "content": "9f0f93f13e2814b32a541fa4fd03f1fcb0e7325d8d047d64af69432e7d6ff4a5"
+          "content": "29f0627535226ad13345fd276a9e100bd0a1d27e1a13fce4422b6514b03bfb34"
         }
       ]
     },

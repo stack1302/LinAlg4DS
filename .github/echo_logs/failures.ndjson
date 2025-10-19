@@ -1,2 +1,4 @@
 {"step":"security","level":"warn","msg":"pip-audit run"}
 {"step":"security:trivy","level":"info","summary":0}
+{"step":"security","level":"warn","msg":"pip-audit run"}
+{"step":"security:trivy","level":"info","summary":0}
