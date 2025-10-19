@@ -1,4 +1,4 @@
-name: "🎧 Vibe Coding Pilot — Split Jobs + TimeGuard + No-Skip + Always-Continue"
+name: "🎧 Vibe Coding Pilot — Split Jobs + No-Skip + Always-Continue + Failure Report"
 
 on:
   workflow_dispatch:
@@ -53,6 +53,9 @@ env:
   ECHO_OK: "✅"
   ECHO_WARN: "⚠️"
   ECHO_FAIL: "❌"
+  FAIL_COUNT_FILE: .github/echo_logs/.fail.count
+  FAIL_LOG_FILE: .github/echo_logs/failures.ndjson
+  FAIL_MD: .github/artifacts/failure_report.md
 
   BULK_GLOBS: ".github/echo_files/*.txt docs/**/*.md README.md"
   REPLACE_FROM: "echo-file"
@@ -85,7 +88,7 @@ env:
 
 jobs:
   prep:
-    name: "1) Prep & Scaffold (No heredoc / Always-Continue)"
+    name: "1) Prep & Scaffold (No heredoc / No-Skip / Always-Continue)"
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
@@ -101,6 +104,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
+
+      - name: Normalize workspace permissions (always)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" || true
+          chmod -R u+rwX,go+rX "$GITHUB_WORKSPACE" || true
+          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
+          chmod -R u+rwX,go+rX "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
+          : > "${FAIL_LOG_FILE}"
+          echo 0 > "${FAIL_COUNT_FILE}"
+          echo "permissions normalized for workspace and artifact dirs"
 
       - name: Resolve inputs (no-skip policy)
         id: cfg
@@ -128,99 +144,136 @@ jobs:
             echo "force_success=$force_success"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Setup toolchains (pin)
+        uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', check-latest: true }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+
       - name: System utils (jq/zip/rsync/curl/lsof)
         shell: bash
         continue-on-error: true
         run: |
           set +e
           sudo apt-get update -y
-          sudo apt-get install -y jq zip rsync curl lsof || true
-          echo "utils installed (or already present)"
+          sudo apt-get install -y jq zip rsync curl lsof || {
+            echo '{"step":"utils","level":"error","msg":"apt install failed"}' >> "${FAIL_LOG_FILE}"
+            n=$(cat "${FAIL_COUNT_FILE}"); echo $((n+1)) > "${FAIL_COUNT_FILE}"
+          }
 
       - name: Directories & Files
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
-          FAIL_COUNT_FILE="${LOG_DIR}/.fail.count"; [ -f "$FAIL_COUNT_FILE" ] || echo 0 > "$FAIL_COUNT_FILE"
-          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
-          faile(){ printf '%s %s (rc=%s)\n' "$ECHO_FAIL" "$1" "${2:-1}" | tee -a "$LOG_FILE"; }
-          inc_fail(){ n=$(cat "$FAIL_COUNT_FILE"); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
-          safe_run(){ local cmd="$*"; echoe "▶ ${cmd}"; bash -lc "$cmd"; rc=$?; [ $rc -ne 0 ] && faile "FAILED: $cmd" $rc && inc_fail; }
-          summarize(){ n=$(cat "$FAIL_COUNT_FILE"); echoe "단계 완료 (실패 ${n}건, 계속 진행)"; }
-          safe_run "mkdir -p '${{ steps.cfg.outputs.dirs_root }}' '${{ steps.cfg.outputs.files_root }}' app tests docs/adr docs/api"
-          i=1; while [ $i -le "${{ steps.cfg.outputs.dirs_count }}" ]; do d=$(printf '%s/d%04d' "${{ steps.cfg.outputs.dirs_root }}" "$i"); safe_run "mkdir -p \"$d\""; i=$((i+1)); done
-          i=1; while [ $i -le "${{ steps.cfg.outputs.files_count }}" ]; do f=$(printf '%s/file%04d.txt' "${{ steps.cfg.outputs.files_root }}" "$i"); safe_run "printf '%s %s\n' \"echo-file-$i\" \"$(date -Iseconds)\" > \"$f\""; i=$((i+1)); done
-          safe_run "printf '# Vibe Coding Pilot\n- Created: %s\n' \"$(date -Iseconds)\" > README.md"
-          safe_run "printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md"
-          safe_run "printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md"
-          summarize
+          ok(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          fail(){ printf '%s %s\n' "${ECHO_FAIL}" "$*"; echo "{\"step\":\"prep:dirs_files\",\"level\":\"error\",\"msg\":\"$*\"}" >> "${FAIL_LOG_FILE}"; n=$(cat "${FAIL_COUNT_FILE}"); echo $((n+1)) > "${FAIL_COUNT_FILE}"; }
+          mkdir -p '${{ steps.cfg.outputs.dirs_root }}' '${{ steps.cfg.outputs.files_root }}' app tests docs/adr docs/api || fail "mkdir failed"
+          i=1; while [ $i -le "${{ steps.cfg.outputs.dirs_count }}" ]; do d=$(printf '%s/d%04d' "${{ steps.cfg.outputs.dirs_root }}" "$i"); mkdir -p "$d" || fail "mkdir $d"; i=$((i+1)); done
+          i=1; while [ $i -le "${{ steps.cfg.outputs.files_count }}" ]; do f=$(printf '%s/file%04d.txt' "${{ steps.cfg.outputs.files_root }}" "$i"); printf '%s %s\n' "echo-file-$i" "$(date -Iseconds)" > "$f" || fail "write $f"; i=$((i+1)); done
+          printf '# Vibe Coding Pilot\n- Created: %s\n' "$(date -Iseconds)" > README.md || fail "write README"
+          printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md || fail "write ADR"
+          printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md || fail "write API notes"
+          ok "Directories & files prepared"
 
       - name: Scaffold (FastAPI | Spring | Node) — no heredoc
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          ECHO_OK="${ECHO_OK:-✅}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
-          FAIL_COUNT_FILE="${LOG_DIR}/.fail.count"; [ -f "$FAIL_COUNT_FILE" ] || echo 0 > "$FAIL_COUNT_FILE"
-          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
-          faile(){ printf '%s %s (rc=%s)\n' "$ECHO_FAIL" "$1" "${2:-1}" | tee -a "$LOG_FILE"; }
-          inc_fail(){ n=$(cat "$FAIL_COUNT_FILE"); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
-          safe_run(){ local cmd="$*"; echoe "▶ ${cmd}"; bash -lc "$cmd"; rc=$?; [ $rc -ne 0 ] && faile "FAILED: $cmd" $rc && inc_fail; }
-          summarize(){ n=$(cat "$FAIL_COUNT_FILE"); echoe "단계 완료 (실패 ${n}건, 계속 진행)"; }
+          ok(){ printf '%s %s\n' "${ECHO_OK}" "$*"; }
+          fail(){ printf '%s %s\n' "${ECHO_FAIL}" "$*"; echo "{\"step\":\"prep:scaffold\",\"level\":\"error\",\"msg\":\"$*\"}" >> "${FAIL_LOG_FILE}"; n=$(cat "${FAIL_COUNT_FILE}"); echo $((n+1)) > "${FAIL_COUNT_FILE}"; }
           fw="${{ steps.cfg.outputs.framework }}"
           if [ "$fw" = "fastapi" ]; then
-            safe_run "python -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx"
-            safe_run "mkdir -p app tests"
-            printf '%s\n' 'from fastapi import FastAPI' 'app = FastAPI()' '@app.get("/health")' 'def h(): return {"status":"ok"}' > app/main.py
-            printf '%s\n' 'from fastapi.testclient import TestClient' 'from app.main import app' 'c=TestClient(app)' 'def test_health(): assert c.get("/health").json()["status"]=="ok"' > tests/test_app.py
+            python -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx || fail "fastapi deps"
+            mkdir -p app tests || true
+            printf '%s\n' 'from fastapi import FastAPI' 'app = FastAPI()' '@app.get("/health")' 'def h(): return {"status":"ok"}' > app/main.py || fail "write app"
+            printf '%s\n' 'from fastapi.testclient import TestClient' 'from app.main import app' 'c=TestClient(app)' 'def test_health(): assert c.get("/health").json()["status"]=="ok"' > tests/test_app.py || fail "write tests"
           elif [ "$fw" = "springboot" ]; then
-            safe_run "sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless"
-            safe_run "mkdir -p demo && cd demo && mvn -q -B archetype:generate -DgroupId=com.example -DartifactId=demo -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.5"
-            safe_run "sed -i 's/junit:junit:4.11/junit:junit:4.13.2/' demo/pom.xml || true"
+            sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless || fail "maven install"
+            mkdir -p demo && cd demo && mvn -q -B archetype:generate -DgroupId=com.example -DartifactId=demo -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.5 || fail "mvn archetype"
+            sed -i 's/junit:junit:4.11/junit:junit:4.13.2/' demo/pom.xml || true
           else
-            safe_run "mkdir -p nodeapp"
+            mkdir -p nodeapp || fail "mkdir nodeapp"
             printf '%s\n' \
               'const e=require("express");const a=e();' \
               'a.get("/health",(_,r)=>r.json({status:"ok"}));' \
               'a.get("/items/:id",(q,r)=>r.json({id:+q.params.id,name:`item-${q.params.id}`}));' \
-              'a.listen(3000,()=>console.log("up"));' > nodeapp/index.js
-            safe_run "cd nodeapp && npm init -y && npm i express"
+              'a.listen(3000,()=>console.log("up"));' > nodeapp/index.js || fail "write node index"
+            (cd nodeapp && npm init -y && npm i express) || fail "npm install"
             jq '.scripts.start="node index.js" | .name="vibe-nodeapp" | .version="0.0.1"' nodeapp/package.json > nodeapp/package.tmp && mv nodeapp/package.tmp nodeapp/package.json || true
-            printf '%s\n' 'registry=https://registry.npmjs.org' 'always-auth=false' > nodeapp/.npmrc
+            printf '%s\n' 'registry=https://registry.npmjs.org' 'always-auth=false' > nodeapp/.npmrc || true
           fi
-          summarize
+          ok "Scaffold finished"
 
-      - name: Cache setup
+      # ====== CACHES (pip / npm / maven) ======
+      - name: Cache pip (requirements/pyproject 기반)
+        id: cache-pip
         uses: actions/cache@v4
+        continue-on-error: true
         with:
           path: |
             ~/.cache/pip
-            ~/.npm
-            ~/.m2/repository
-          key: vibe-${{ runner.os }}-${{ hashFiles('**/requirements*.txt','**/pyproject.toml','**/package*.json','**/pom.xml') }}
+            ~/.cache/uv
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements*.txt', '**/pyproject.toml') }}
           restore-keys: |
-            vibe-${{ runner.os }}-
+            pip-${{ runner.os }}-
+            pip-
+
+      - name: Pip cache status
+        if: always()
+        shell: bash
+        run: |
+          [ "${{ steps.cache-pip.outputs.cache-hit }}" = "true" ] && echo "✅ pip cache hit" || echo "⚠️ pip cache miss (정상)"
+
+      - name: Cache npm (package-lock / package.json 기반)
+        id: cache-npm
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.npm
+            **/node_modules
+          key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/package.json') }}
+          restore-keys: |
+            npm-${{ runner.os }}-
+            npm-
+
+      - name: NPM cache status
+        if: always()
+        shell: bash
+        run: |
+          [ "${{ steps.cache-npm.outputs.cache-hit }}" = "true" ] && echo "✅ npm cache hit" || echo "⚠️ npm cache miss (정상)"
+
+      - name: Cache Maven (~/.m2/repository)
+        id: cache-mvn
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+            maven-
+
+      - name: Maven cache status
+        if: always()
+        shell: bash
+        run: |
+          [ "${{ steps.cache-mvn.outputs.cache-hit }}" = "true" ] && echo "✅ maven cache hit" || echo "⚠️ maven cache miss (정상)"
 
       - name: Smoke (quick) — always continue
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          ECHO_OK="${ECHO_OK:-✅}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
-          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
-          LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
-          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
-          safe(){ bash -lc "$1"; [ $? -eq 0 ] && echoe "$1 OK" || echo "⚠️ $1 failed (but continuing)"; }
           fw="${{ steps.cfg.outputs.framework }}"
           case "$fw" in
-            fastapi) safe ". .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &"; sleep 2; safe "curl -fsS 127.0.0.1:8000/health"; safe "lsof -ti:8000 | xargs -r kill" ;;
-            node-express) safe "node nodeapp/index.js &"; sleep 2; safe "curl -fsS 127.0.0.1:3000/health"; safe "lsof -ti:3000 | xargs -r kill" ;;
+            fastapi) . .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 & sleep 2; curl -fsS 127.0.0.1:8000/health || { echo '{"step":"prep:smoke","level":"warn","msg":"fastapi smoke failed"}' >> "${FAIL_LOG_FILE}"; }; lsof -ti:8000 | xargs -r kill ;;
+            node-express) node nodeapp/index.js & sleep 2; curl -fsS 127.0.0.1:3000/health || { echo '{"step":"prep:smoke","level":"warn","msg":"node smoke failed"}' >> "${FAIL_LOG_FILE}"; }; lsof -ti:3000 | xargs -r kill ;;
             *) echo "spring demo 는 빌드 스킵(성공 처리)";;
           esac
 
@@ -231,6 +284,16 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize workspace permissions (always)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" || true
+          chmod -R u+rwX,go+rX "$GITHUB_WORKSPACE" || true
+          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
+          chmod -R u+rwX,go+rX "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
 
       - name: Install services
         shell: bash
@@ -243,8 +306,10 @@ jobs:
           sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock || true
           sudo dpkg --configure -a || true
           sudo apt-get update -y
-          sudo apt-get install -y nginx apache2 redis-server postgresql postgresql-contrib curl lsof || true
-          echo "Services installed (or already present)"
+          sudo apt-get install -y nginx apache2 redis-server postgresql postgresql-contrib curl lsof || {
+            echo '{"step":"svc:install","level":"error","msg":"apt install services failed"}' >> "${FAIL_LOG_FILE}"
+            n=$(cat "${FAIL_COUNT_FILE}"); echo $((n+1)) > "${FAIL_COUNT_FILE}"
+          }
 
       - name: Start & check services
         shell: bash
@@ -252,45 +317,62 @@ jobs:
         run: |
           set +e
           echo 'OK NGINX' | sudo tee /var/www/html/index.html >/dev/null || true
-          sudo systemctl enable --now nginx || sudo service nginx start || true
-          sudo systemctl enable --now apache2 || sudo service apache2 start || true
-          sudo systemctl enable --now redis-server || sudo service redis-server start || true
-          sudo systemctl enable --now postgresql || sudo service postgresql start || true
-          curl -fsS 127.0.0.1/ | head -n1 || echo "⚠️ nginx check failed (continue)"
+          sudo systemctl enable --now nginx || sudo service nginx start || echo '{"step":"svc:start","level":"warn","msg":"nginx start"}' >> "${FAIL_LOG_FILE}"
+          sudo systemctl enable --now apache2 || sudo service apache2 start || echo '{"step":"svc:start","level":"warn","msg":"apache start"}' >> "${FAIL_LOG_FILE}"
+          sudo systemctl enable --now redis-server || sudo service redis-server start || echo '{"step":"svc:start","level":"warn","msg":"redis start"}' >> "${FAIL_LOG_FILE}"
+          sudo systemctl enable --now postgresql || sudo service postgresql start || echo '{"step":"svc:start","level":"warn","msg":"postgres start"}' >> "${FAIL_LOG_FILE}"
+          curl -fsS 127.0.0.1/ | head -n1 || echo '{"step":"svc:check","level":"warn","msg":"nginx check"}' >> "${FAIL_LOG_FILE}"
 
       - name: Apache change port & verify
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          sudo sed -i 's/^Listen 80$/Listen '"${APACHE_PORT}"'/' /etc/apache2/ports.conf || true
-          sudo sed -i 's@<VirtualHost \*:80>@<VirtualHost *:'"${APACHE_PORT}"'>@' /etc/apache2/sites-available/000-default.conf || true
-          sudo systemctl restart apache2 || true
-          curl -fsS 127.0.0.1:${APACHE_PORT}/ | head -n2 || echo "⚠️ apache check failed (continue)"
+          sudo sed -i 's/^Listen 80$/Listen '"${APACHE_PORT}"'/' /etc/apache2/ports.conf || echo '{"step":"svc:apache","level":"warn","msg":"ports.conf edit"}' >> "${FAIL_LOG_FILE}"
+          sudo sed -i 's@<VirtualHost \*:80>@<VirtualHost *:'"${APACHE_PORT}"'>@' /etc/apache2/sites-available/000-default.conf || echo '{"step":"svc:apache","level":"warn","msg":"vhost edit"}' >> "${FAIL_LOG_FILE}"
+          sudo systemctl restart apache2 || echo '{"step":"svc:apache","level":"warn","msg":"apache restart"}' >> "${FAIL_LOG_FILE}"
+          curl -fsS 127.0.0.1:${APACHE_PORT}/ | head -n2 || echo '{"step":"svc:apache","level":"warn","msg":"apache check"}' >> "${FAIL_LOG_FILE}"
 
-      - name: PostgreSQL init/seed/verify/dump
+      - name: PostgreSQL init/seed/verify/dump (safe /tmp → artifacts)
         shell: bash
         continue-on-error: true
         run: |
           set +e
+          mkdir -p "${ARTIFACT_DIR}" "${LOG_DIR}" || true
+          chmod -R u+rwX,go+rX "${ARTIFACT_DIR}" "${LOG_DIR}" || true
+
           sudo -u postgres psql -c "CREATE DATABASE vibe_db;" || true
           printf '%s\n' '\c vibe_db' \
                          'CREATE TABLE IF NOT EXISTS items(id serial primary key, name text);' \
                          "INSERT INTO items(name) VALUES ('hello'),('world') ON CONFLICT DO NOTHING;" > /tmp/seed.sql
-          sudo -u postgres psql -f /tmp/seed.sql || true
+          sudo -u postgres psql -f /tmp/seed.sql || echo '{"step":"db:seed","level":"warn","msg":"seed failed"}' >> "${FAIL_LOG_FILE}"
+
           printf '%s\n' '\c vibe_db' 'SELECT COUNT(*) FROM items;' > /tmp/test.sql
-          sudo -u postgres psql -f /tmp/test.sql | tee ${LOG_DIR}/pg_test.txt || true
-          sudo -u postgres pg_dump -Fc -d vibe_db -f ${ARTIFACT_DIR}/vibe_db.dump || true
-          echo "DB ready (or continued after soft errors)"
+          sudo -u postgres psql -f /tmp/test.sql | tee ${LOG_DIR}/pg_test.txt || echo '{"step":"db:verify","level":"warn","msg":"verify failed"}' >> "${FAIL_LOG_FILE}"
+
+          sudo -u postgres pg_dump -Fc -d vibe_db -f /tmp/vibe_db.dump || echo '{"step":"db:dump","level":"warn","msg":"pg_dump to /tmp failed"}' >> "${FAIL_LOG_FILE}"
+          sudo install -m 0644 /tmp/vibe_db.dump "${ARTIFACT_DIR}/vibe_db.dump" || echo '{"step":"db:dump","level":"warn","msg":"install dump to artifacts"}' >> "${FAIL_LOG_FILE}"
+          sudo chown "$USER":"$USER" "${ARTIFACT_DIR}/vibe_db.dump" || true
+          echo "DB ready and dump placed at ${ARTIFACT_DIR}/vibe_db.dump (soft errors tolerated)"
 
   finalize:
-    name: "3) Bulk/Sec/Docs/Deps/Publish/Gather (No-Skip / Always-Continue)"
+    name: "3) Bulk/Sec/Docs/Deps/Publish/Gather + Failure Report"
     runs-on: ubuntu-24.04
     needs: [prep, services_db]
     if: ${{ always() }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
+      - name: Normalize workspace permissions (always)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          sudo chown -R "$USER":"$USER" "$GITHUB_WORKSPACE" || true
+          chmod -R u+rwX,go+rX "$GITHUB_WORKSPACE" || true
+          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
+          chmod -R u+rwX,go+rX "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
 
       - name: Bulk modify
         shell: bash
@@ -300,50 +382,110 @@ jobs:
           shopt -s nullglob globstar
           GLOBS="${BULK_GLOBS}"
           FILES=(); for g in ${GLOBS}; do for f in $g; do [ -f "$f" ] && FILES+=("$f"); done; done
-          if [ ${#FILES[@]} -eq 0 ]; then echo "⚠️ 대상 없음 (continue)"; else
+          if [ ${#FILES[@]} -eq 0 ]; then echo '{"step":"bulk","level":"info","msg":"대상 파일 없음"}' >> "${FAIL_LOG_FILE}"; else
             for f in "${FILES[@]}"; do
-              [ -n "${REPLACE_FROM}" ] && sed -i "s/${REPLACE_FROM//\//\\/}/${REPLACE_TO//\//\\/}/g" "$f" || true
-              [ -n "${APPEND_LINE}" ] && printf '%s\n' "${APPEND_LINE}" >> "$f" || true
+              [ -n "${REPLACE_FROM}" ] && sed -i "s/${REPLACE_FROM//\//\\/}/${REPLACE_TO//\//\\/}/g" "$f" || echo '{"step":"bulk","level":"warn","msg":"replace fail"}' >> "${FAIL_LOG_FILE}"
+              [ -n "${APPEND_LINE}" ] && printf '%s\n' "${APPEND_LINE}" >> "$f" || echo '{"step":"bulk","level":"warn","msg":"append fail"}' >> "${FAIL_LOG_FILE}"
               dir=$(dirname "$f"); base=$(basename "$f"); name="${base%.*}"; ext="${base##*.}"; dot="."
               [ "$base" = "$ext" ] && dot=""
               new="${dir}/${RENAME_PREFIX}${name}${RENAME_SUFFIX}${dot}${ext}"
-              if [ -n "${RENAME_PREFIX}${RENAME_SUFFIX}" ]; then mv -f "$f" "$new"; f="$new"; fi
-              if [ "${DUPLICATE_COPIES:-0}" -gt 0 ]; then i=1; while [ $i -le "${DUPLICATE_COPIES}" ]; do cp -f "$f" "${f%.*}_copy${i}${dot}${ext}"; i=$((i+1)); done; fi
+              if [ -n "${RENAME_PREFIX}${RENAME_SUFFIX}" ]; then mv -f "$f" "$new" || echo '{"step":"bulk","level":"warn","msg":"rename fail"}' >> "${FAIL_LOG_FILE}"; f="$new"; fi
+              if [ "${DUPLICATE_COPIES:-0}" -gt 0 ]; then i=1; while [ $i -le "${DUPLICATE_COPIES}" ]; do cp -f "$f" "${f%.*}_copy${i}${dot}${ext}" || echo '{"step":"bulk","level":"warn","msg":"duplicate fail"}' >> "${FAIL_LOG_FILE}"; i=$((i+1)); done; fi
             done
-            find . -type f -not -path './.git/*' -exec chmod ${CHMOD_MODE} {} + || true
-            find . -type d -not -path './.git/*' -exec chmod 755 {} + || true
+            find . -type f -not -path './.git/*' -exec chmod ${CHMOD_MODE} {} + || echo '{"step":"bulk","level":"warn","msg":"chmod files"}' >> "${FAIL_LOG_FILE}"
+            find . -type d -not -path './.git/*' -exec chmod 755 {} + || echo '{"step":"bulk","level":"warn","msg":"chmod dirs"}' >> "${FAIL_LOG_FILE}"
           fi
           git status --porcelain | tee ${LOG_DIR}/bulk_changes.txt || true
-          echo "Bulk modify done (soft errors tolerated)"
 
-      - name: SBOM (Syft)
+      # -------- SBOM (Syft) 개선: 메타데이터 주입 & 경고 제거 --------
+      - name: SBOM (Syft) — metadata enforced
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true
-          syft dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || syft packages dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || true
-          echo "SBOM generated (or continued after soft errors)"
+          curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || {
+            echo '{"step":"sbom","level":"warn","msg":"syft install failed"}' >> "${FAIL_LOG_FILE}"
+          }
+          REPO="${GITHUB_REPOSITORY##*/}"
+          TAG="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -z "$TAG" ]; then SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"; DATE="$(date +%Y%m%d)"; VERSION="0.0.0-${SHORT}-${DATE}"; else VERSION="${TAG#v}"; fi
+          syft dir:. -o cyclonedx-json > "${ARTIFACT_DIR}/sbom.raw.json" 2>> "${LOG_DIR}/syft.stderr.log" || {
+            echo '{"step":"sbom","level":"warn","msg":"syft run failed"}' >> "${FAIL_LOG_FILE}"
+          }
+          if command -v jq >/dev/null 2>&1 && [ -s "${ARTIFACT_DIR}/sbom.raw.json" ]; then
+            jq --arg name "$REPO" --arg ver "$VERSION" '
+              .metadata |= (. // {}) |
+              .metadata.component |= (. // {type:"application"}) |
+              .metadata.component.name = $name |
+              .metadata.component.version = $ver
+            ' "${ARTIFACT_DIR}/sbom.raw.json" > "${ARTIFACT_DIR}/sbom.json" || cp -f "${ARTIFACT_DIR}/sbom.raw.json" "${ARTIFACT_DIR}/sbom.json"
+            rm -f "${ARTIFACT_DIR}/sbom.raw.json"
+          else
+            cp -f "${ARTIFACT_DIR}/sbom.raw.json" "${ARTIFACT_DIR}/sbom.json" 2>/dev/null || true
+          fi
+          echo "SBOM generated at ${ARTIFACT_DIR}/sbom.json (metadata injected; soft errors tolerated)"
 
-      - name: Vulnerability scan (Trivy + pip-audit)
+      # -------- Trivy 개선: 캐시 고정, 스캐너 구성, 요약 리포트 --------
+      - name: Vulnerability scan (Trivy + pip-audit) — cached & summarized
+        shell: bash
+        continue-on-error: true
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
+          TRIVY_TIMEOUT: "5m"
+          # 필요 시 리포지토리/환경 변수로 오버라이드 가능 (예: 'vuln,misconfig')
+          TRIVY_SCANNERS: ${{ env.TRIVY_SCANNERS }}
+        run: |
+          set +e
+          TRIVY_SCANNERS="${TRIVY_SCANNERS:-vuln,secret,misconfig}"
+          mkdir -p "${TRIVY_CACHE_DIR}" "${ARTIFACT_DIR}" || true
+
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin || echo '{"step":"security","level":"warn","msg":"trivy install"}' >> "${FAIL_LOG_FILE}"
+
+          trivy fs \
+            --cache-dir "${TRIVY_CACHE_DIR}" \
+            --timeout "${TRIVY_TIMEOUT}" \
+            --no-progress \
+            --ignore-unfixed \
+            --scanners "${TRIVY_SCANNERS}" \
+            -f json -o "${ARTIFACT_DIR}/trivy.json" . || echo '{"step":"security","level":"warn","msg":"trivy run"}' >> "${FAIL_LOG_FILE}"
+
+          python3 -m pip -q install -U pip-audit || echo '{"step":"security","level":"warn","msg":"pip-audit install"}' >> "${FAIL_LOG_FILE}"
+          pip-audit -f json -o "${ARTIFACT_DIR}/pip-audit.json" || echo '{"step":"security","level":"warn","msg":"pip-audit run"}' >> "${FAIL_LOG_FILE}"
+
+          if command -v jq >/dev/null 2>&1 && [ -s "${ARTIFACT_DIR}/trivy.json" ]; then
+            TOTAL=$(jq '[..|objects|select(has("Vulnerabilities"))|.Vulnerabilities[]]|length' "${ARTIFACT_DIR}/trivy.json" 2>/dev/null || echo 0)
+            PKGS=$(jq '[..|objects|select(has("Vulnerabilities"))|.Target]|unique|length' "${ARTIFACT_DIR}/trivy.json" 2>/dev/null || echo 0)
+            {
+              echo '{"step":"security:trivy","level":"info","summary":'${TOTAL}'}'
+            } >> "${FAIL_LOG_FILE}"
+            {
+              echo ""
+              echo "## Security Summary (Trivy)"
+              echo "- Vulnerabilities: **${TOTAL}**"
+              echo "- Targets scanned: **${PKGS}**"
+            } >> "${FAIL_MD}"
+            echo "Found ${TOTAL} vulns across ${PKGS} targets (Trivy)."
+          fi
+
+          if [ "${TRIVY_SCANNERS}" = "vuln,secret,misconfig" ]; then
+            echo "Tip: 느릴 경우 env.TRIVY_SCANNERS='vuln,misconfig' 로 비밀키 스캔 비활성화 가능."
+          fi
+
+      # -------- Docs pack 안전화 & 크기 출력 --------
+      - name: Docs pack — safe & verbose
         shell: bash
         continue-on-error: true
         run: |
           set +e
-          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || true
-          trivy fs --scanners vuln,secret,misconfig --timeout 5m --no-progress --ignore-unfixed -f json -o ${ARTIFACT_DIR}/trivy.json . || true
-          python3 -m pip -q install -U pip-audit || true
-          pip-audit -f json -o ${ARTIFACT_DIR}/pip-audit.json || true
-          echo "Security scans done (soft errors tolerated)"
-
-      - name: Docs pack
-        shell: bash
-        continue-on-error: true
-        run: |
-          set +e
-          mkdir -p docs/adr docs/api || true
-          zip -qr ${ARTIFACT_DIR}/docs.zip docs || true
-          echo "Docs zipped (soft errors tolerated)"
+          mkdir -p docs/adr docs/api "${ARTIFACT_DIR}" || true
+          zip -qr "${ARTIFACT_DIR}/docs.zip" docs || echo '{"step":"docs","level":"warn","msg":"zip docs"}' >> "${FAIL_LOG_FILE}"
+          if [ -f "${ARTIFACT_DIR}/docs.zip" ]; then
+            SZ=$(du -h "${ARTIFACT_DIR}/docs.zip" | awk '{print $1}')
+            echo "Docs zipped: ${ARTIFACT_DIR}/docs.zip (${SZ})"
+          else
+            echo "⚠️ docs.zip not created (continue)"
+          fi
 
       - name: Language deps upgrade
         shell: bash
@@ -351,25 +493,24 @@ jobs:
         run: |
           set +e
           if [ "${DO_LANG_UPGRADE}" = "true" ]; then
-            python3 -m pip -q install -U uv || true
+            python3 -m pip -q install -U uv || echo '{"step":"deps","level":"warn","msg":"uv install"}' >> "${FAIL_LOG_FILE}"
             shopt -s globstar nullglob
-            for req in **/requirements*.txt; do uv pip compile --upgrade "$req" -o "$req" || true; uv pip sync "$req" || true; done
-            npm i -g npm-check-updates || true
+            for req in **/requirements*.txt; do uv pip compile --upgrade "$req" -o "$req" || echo '{"step":"deps","level":"warn","msg":"uv compile"}' >> "${FAIL_LOG_FILE}"; uv pip sync "$req" || echo '{"step":"deps","level":"warn","msg":"uv sync"}' >> "${FAIL_LOG_FILE}"; done
+            npm i -g npm-check-updates || echo '{"step":"deps","level":"warn","msg":"ncu install"}' >> "${FAIL_LOG_FILE}"
             for d in $(ls -d */ 2>/dev/null); do
               [ -f "$d/package.json" ] || continue
-              ncu -u "$d/package.json" || true
-              npm --prefix "$d" install || true
+              ncu -u "$d/package.json" || echo '{"step":"deps","level":"warn","msg":"ncu update"}' >> "${FAIL_LOG_FILE}"
+              npm --prefix "$d" install || echo '{"step":"deps","level":"warn","msg":"npm install"}' >> "${FAIL_LOG_FILE}"
               [ "$NPM_AUDIT_FIX" = "true" ] && npm --prefix "$d" audit fix || true
             done
-            sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless || true
+            sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless || echo '{"step":"deps","level":"warn","msg":"maven install"}' >> "${FAIL_LOG_FILE}"
             for pom in **/pom.xml; do
-              mvn -q -f "$pom" versions:use-latest-releases -DgenerateBackupPoms=false || true
-              mvn -q -f "$pom" -DskipTests verify || true
+              mvn -q -f "$pom" versions:use-latest-releases -DgenerateBackupPoms=false || echo '{"step":"deps","level":"warn","msg":"mvn versions"}' >> "${FAIL_LOG_FILE}"
+              mvn -q -f "$pom" -DskipTests verify || echo '{"step":"deps","level":"warn","msg":"mvn verify"}' >> "${FAIL_LOG_FILE}"
             done
           else
-            echo "DO_LANG_UPGRADE=false → 업그레이드 noop (continue)"
+            echo '{"step":"deps","level":"info","msg":"DO_LANG_UPGRADE=false (noop)"}' >> "${FAIL_LOG_FILE}"
           fi
-          echo "Deps upgrade stage completed (soft errors tolerated)"
 
       - name: Gather artifacts
         uses: actions/upload-artifact@v4
@@ -411,14 +552,61 @@ jobs:
           git push || true
           echo "Auto-commit attempted (soft errors tolerated)"
 
+      - name: Build failure report (markdown)
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p "$(dirname "${FAIL_MD}")" || true
+          echo "# 🧾 Failure & Warning Report"            >  "${FAIL_MD}"
+          echo ""                                         >> "${FAIL_MD}"
+          echo "- Generated: $(date -Iseconds)"           >> "${FAIL_MD}"
+          echo "- Workspace: ${GITHUB_WORKSPACE}"         >> "${FAIL_MD}"
+          echo ""                                         >> "${FAIL_MD}"
+          echo "## Summary"                               >> "${FAIL_MD}"
+          FAILS=$(cat "${FAIL_COUNT_FILE}" 2>/dev/null || echo 0)
+          echo "- Soft failure count: **${FAILS}**"       >> "${FAIL_MD}"
+          echo ""                                         >> "${FAIL_MD}"
+          echo "## Events (NDJSON excerpt)"               >> "${FAIL_MD}"
+          if [ -s "${FAIL_LOG_FILE}" ]; then
+            echo '```ndjson'                              >> "${FAIL_MD}"
+            cat "${FAIL_LOG_FILE}"                        >> "${FAIL_MD}"
+            echo '```'                                    >> "${FAIL_MD}"
+          else
+            echo "_No events recorded._"                  >> "${FAIL_MD}"
+          fi
+
+      - name: Upload failure report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-failure-report
+          path: .github/artifacts/failure_report.md
+          if-no-files-found: warn
+          compression-level: 0
+          overwrite: true
+          include-hidden-files: false
+
+      - name: Fix artifact/log permissions (final pass)
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          sudo chown -R "$USER":"$USER" "${ARTIFACT_DIR}" "${LOG_DIR}" "${GATHER_DIR}" || true
+          chmod -R u+rwX,go+rX "${ARTIFACT_DIR}" "${LOG_DIR}" "${GATHER_DIR}" || true
+
       - name: ✅ Always-success banner
         if: ${{ needs.prep.outputs.force_success == 'true' || needs.prep.outputs.force_success == 'True' }}
         shell: bash
         continue-on-error: true
         run: |
           set +e
+          FAILS=$(cat "${FAIL_COUNT_FILE}" 2>/dev/null || echo 0)
           echo "## ✅ 전체 파이프라인 완료 (No-Skip / Always-Continue)" >> "$GITHUB_STEP_SUMMARY"
           echo "- 모드: ${{ needs.prep.outputs.mode }} / 프레임워크: ${{ needs.prep.outputs.framework }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 디렉토리/파일: ${{ needs.prep.outputs.dirs_root }} (x${{ needs.prep.outputs.dirs_count }}), ${{ needs.prep.outputs.files_root }} (x${{ needs.prep.outputs.files_count }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 서버 설치 플래그: ${{ needs.prep.outputs.install_servers }} (false면 단계는 실행되나 설치는 noop)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 아티팩트: vibe-artifacts" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 서버 설치 플래그: ${{ needs.prep.outputs.install_servers }} (false면 설치 noop 처리)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Soft failures: ${FAILS}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 보고서: .github/artifacts/failure_report.md (vibe-failure-report 아티팩트)" >> "$GITHUB_STEP_SUMMARY"
