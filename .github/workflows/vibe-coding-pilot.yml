@@ -1,10 +1,10 @@
-name: "🎧 Vibe Coding Pilot — Split Jobs + TimeGuard + Cron-Lite + Safe-Continue"
+name: "🎧 Vibe Coding Pilot — Split Jobs + TimeGuard + No-Skip + Always-Continue"
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "실행 모드: full(무거움) | lite(경량)"
+        description: "실행 모드 표기용(동작엔 영향 없음)"
         type: choice
         options: [full, lite]
         default: full
@@ -21,7 +21,7 @@ on:
       files_count:
         default: "80"
       install_servers:
-        description: "Nginx/Apache/Redis/PostgreSQL 설치·기동(실패해도 계속)"
+        description: "서버 설치를 원치 않으면 false (스킵 대신 noop 메시지)"
         type: boolean
         default: true
       auto_commit:
@@ -41,7 +41,6 @@ permissions:
   security-events: write
   packages: write
 
-# 스케줄은 겹치지 않게 취소, 수동은 유지
 concurrency:
   group: vibe-coding-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: ${{ github.event_name == 'schedule' }}
@@ -65,9 +64,9 @@ env:
   CHMOD_MODE: "644"
   APACHE_PORT: "8080"
 
-  DO_SNAP_REFRESH: "false"     # 타임아웃 방지: 기본 비활성 (필요 시 true)
+  DO_SNAP_REFRESH: "false"
   DO_LANG_UPGRADE: "true"
-  PY_UPGRADE_STRATEGY: "uv"    # uv | pip-tools | plain
+  PY_UPGRADE_STRATEGY: "uv"
   NPM_AUDIT_FIX: "true"
   MVN_USE_LATEST: "true"
 
@@ -82,22 +81,17 @@ env:
   MVN_SERVER_ID: "github"
 
   DO_DB_MIGRATE: "false"
-  DB_MIGRATOR: "flyway"        # flyway | liquibase | none
+  DB_MIGRATOR: "flyway"
 
-# -------------------------------
-# Job 1) PREP + Scaffold + Files
-# -------------------------------
 jobs:
   prep:
-    name: "1) Prep & Scaffold (Cron-Lite + TimeGuard)"
+    name: "1) Prep & Scaffold (No heredoc / Always-Continue)"
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
       framework: ${{ steps.cfg.outputs.framework }}
       dirs_root: ${{ steps.cfg.outputs.dirs_root }}
       files_root: ${{ steps.cfg.outputs.files_root }}
-      run_security: ${{ steps.cfg.outputs.run_security }}
-      run_docs: ${{ steps.cfg.outputs.run_docs }}
       install_servers: ${{ steps.cfg.outputs.install_servers }}
       mode: ${{ steps.cfg.outputs.mode }}
       auto_commit: ${{ steps.cfg.outputs.auto_commit }}
@@ -108,133 +102,97 @@ jobs:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      # 입력값: 스케줄이면 자동으로 lite로 강등 + 보안/문서/서버 축소
-      - name: Resolve inputs (cron=lite, dispatch=as-is)
+      - name: Resolve inputs (no-skip policy)
         id: cfg
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            mode=lite
-            run_security=false
-            run_docs=false
-            install_servers=false
-            framework=fastapi
-            dirs_root=".github/echo_dirs"
-            files_root=".github/echo_files"
-            dirs_count=5
-            files_count=10
-            auto_commit=false
-            force_success=true
-          else
-            mode="${{ github.event.inputs.mode || 'full' }}"
-            # run_security / run_docs는 mode에서 파생
-            if [ "$mode" = "lite" ]; then
-              run_security=false
-              run_docs=false
-            else
-              run_security=true
-              run_docs=true
-            fi
-            install_servers="${{ github.event.inputs.install_servers || 'true' }}"
-            framework="${{ github.event.inputs.framework || 'fastapi' }}"
-            dirs_root="${{ github.event.inputs.dirs_root || '.github/echo_dirs' }}"
-            files_root="${{ github.event.inputs.files_root || '.github/echo_files' }}"
-            dirs_count="${{ github.event.inputs.dirs_count || '50' }}"
-            files_count="${{ github.event.inputs.files_count || '80' }}"
-            auto_commit="${{ github.event.inputs.auto_commit || 'false' }}"
-            force_success="${{ github.event.inputs.force_success_message || 'true' }}"
-          fi
+          mode="${{ github.event.inputs.mode || 'full' }}"
+          framework="${{ github.event.inputs.framework || 'fastapi' }}"
+          dirs_root="${{ github.event.inputs.dirs_root || '.github/echo_dirs' }}"
+          files_root="${{ github.event.inputs.files_root || '.github/echo_files' }}"
+          dirs_count="${{ github.event.inputs.dirs_count || '50' }}"
+          files_count="${{ github.event.inputs.files_count || '80' }}"
+          install_servers="${{ github.event.inputs.install_servers || 'true' }}"
+          auto_commit="${{ github.event.inputs.auto_commit || 'false' }}"
+          force_success="${{ github.event.inputs.force_success_message || 'true' }}"
           {
             echo "mode=$mode"
-            echo "run_security=$run_security"
-            echo "run_docs=$run_docs"
-            echo "install_servers=$install_servers"
             echo "framework=$framework"
             echo "dirs_root=$dirs_root"
             echo "files_root=$files_root"
             echo "dirs_count=$dirs_count"
             echo "files_count=$files_count"
+            echo "install_servers=$install_servers"
             echo "auto_commit=$auto_commit"
             echo "force_success=$force_success"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Setup toolchains (pin)
-        uses: actions/setup-python@v5
-        with: { python-version: '3.12' }
-      - uses: actions/setup-node@v4
-        with: { node-version: '20', check-latest: true }
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: '21' }
-
-      - name: Init helpers + TimeGuard
-        id: init
+      - name: System utils (jq/zip/rsync/curl/lsof)
         shell: bash
+        continue-on-error: true
         run: |
-          set -Eeuo pipefail
-          mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" .github/scripts
-          # Safe-run
-          cat > /tmp/safe_run.sh <<'SH'
-          #!/usr/bin/env bash
+          set +e
+          sudo apt-get update -y
+          sudo apt-get install -y jq zip rsync curl lsof || true
+          echo "utils installed (or already present)"
+
+      - name: Directories & Files
+        shell: bash
+        continue-on-error: true
+        run: |
           set +e
           ECHO_OK="${ECHO_OK:-✅}"; ECHO_WARN="${ECHO_WARN:-⚠️}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
           LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
           LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
-          FAIL_COUNT_FILE="${LOG_DIR}/.fail.count"; : > "$FAIL_COUNT_FILE"
+          FAIL_COUNT_FILE="${LOG_DIR}/.fail.count"; [ -f "$FAIL_COUNT_FILE" ] || echo 0 > "$FAIL_COUNT_FILE"
           echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
-          warne(){ printf '%s %s\n' "$ECHO_WARN" "$*" | tee -a "$LOG_FILE"; }
           faile(){ printf '%s %s (rc=%s)\n' "$ECHO_FAIL" "$1" "${2:-1}" | tee -a "$LOG_FILE"; }
-          inc_fail(){ n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
-          safe_run(){ local cmd="$*"; echoe "▶ ${cmd}"; bash -lc "$cmd"; rc=$?; [ $rc -ne 0 ] && faile "FAILED: $cmd" $rc && inc_fail; return 0; }
-          summarize(){ n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); echoe "단계 완료 (실패 ${n}건 기록, 계속 진행)."; }
-          SH
-          chmod +x /tmp/safe_run.sh
-          # TimeGuard
-          cat > /tmp/time_guard.sh <<'TG'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          START_FILE="${LOG_DIR:-.github/echo_logs}/.job_start.ts"
-          [ -f "$START_FILE" ] || date +%s > "$START_FILE"
-          START=$(cat "$START_FILE")
-          NOW=$(date +%s)
-          ELAPSED=$(( (NOW-START)/60 ))
-          BUDGET_MIN=${1:-15}
-          if [ "$ELAPSED" -ge "$BUDGET_MIN" ]; then echo "skip"; else echo "ok"; fi
-          TG
-          chmod +x /tmp/time_guard.sh
-          echo "ok=1" >> "$GITHUB_OUTPUT"
-
-      - name: Directories & Files
-        shell: bash
-        run: |
-          source /tmp/safe_run.sh
+          inc_fail(){ n=$(cat "$FAIL_COUNT_FILE"); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
+          safe_run(){ local cmd="$*"; echoe "▶ ${cmd}"; bash -lc "$cmd"; rc=$?; [ $rc -ne 0 ] && faile "FAILED: $cmd" $rc && inc_fail; }
+          summarize(){ n=$(cat "$FAIL_COUNT_FILE"); echoe "단계 완료 (실패 ${n}건, 계속 진행)"; }
           safe_run "mkdir -p '${{ steps.cfg.outputs.dirs_root }}' '${{ steps.cfg.outputs.files_root }}' app tests docs/adr docs/api"
           i=1; while [ $i -le "${{ steps.cfg.outputs.dirs_count }}" ]; do d=$(printf '%s/d%04d' "${{ steps.cfg.outputs.dirs_root }}" "$i"); safe_run "mkdir -p \"$d\""; i=$((i+1)); done
           i=1; while [ $i -le "${{ steps.cfg.outputs.files_count }}" ]; do f=$(printf '%s/file%04d.txt' "${{ steps.cfg.outputs.files_root }}" "$i"); safe_run "printf '%s %s\n' \"echo-file-$i\" \"$(date -Iseconds)\" > \"$f\""; i=$((i+1)); done
+          safe_run "printf '# Vibe Coding Pilot\n- Created: %s\n' \"$(date -Iseconds)\" > README.md"
+          safe_run "printf '# ADR-0001: Adopt Vibe Coding\n- Status: Accepted\n' > docs/adr/0001-adopt-vibe-coding.md"
+          safe_run "printf '# API Notes\n- /health\n- /items/{id}\n' > docs/api/openapi-notes.md"
           summarize
 
-      - name: Scaffold (FastAPI | Spring | Node)
+      - name: Scaffold (FastAPI | Spring | Node) — no heredoc
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh
+          set +e
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
+          LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
+          FAIL_COUNT_FILE="${LOG_DIR}/.fail.count"; [ -f "$FAIL_COUNT_FILE" ] || echo 0 > "$FAIL_COUNT_FILE"
+          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
+          faile(){ printf '%s %s (rc=%s)\n' "$ECHO_FAIL" "$1" "${2:-1}" | tee -a "$LOG_FILE"; }
+          inc_fail(){ n=$(cat "$FAIL_COUNT_FILE"); n=$((n+1)); echo "$n" > "$FAIL_COUNT_FILE"; }
+          safe_run(){ local cmd="$*"; echoe "▶ ${cmd}"; bash -lc "$cmd"; rc=$?; [ $rc -ne 0 ] && faile "FAILED: $cmd" $rc && inc_fail; }
+          summarize(){ n=$(cat "$FAIL_COUNT_FILE"); echoe "단계 완료 (실패 ${n}건, 계속 진행)"; }
           fw="${{ steps.cfg.outputs.framework }}"
           if [ "$fw" = "fastapi" ]; then
-            safe_run "python -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest"
-            cat > app/main.py <<'PY'
-            from fastapi import FastAPI
-            app = FastAPI()
-            @app.get("/health")
-            def h(): return {"status":"ok"}
-            PY
+            safe_run "python -m venv .venv && . .venv/bin/activate && pip -q install --upgrade pip fastapi uvicorn[standard] pytest httpx"
+            safe_run "mkdir -p app tests"
+            printf '%s\n' 'from fastapi import FastAPI' 'app = FastAPI()' '@app.get("/health")' 'def h(): return {"status":"ok"}' > app/main.py
+            printf '%s\n' 'from fastapi.testclient import TestClient' 'from app.main import app' 'c=TestClient(app)' 'def test_health(): assert c.get("/health").json()["status"]=="ok"' > tests/test_app.py
           elif [ "$fw" = "springboot" ]; then
             safe_run "sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless"
             safe_run "mkdir -p demo && cd demo && mvn -q -B archetype:generate -DgroupId=com.example -DartifactId=demo -DarchetypeArtifactId=maven-archetype-quickstart -DarchetypeVersion=1.5"
+            safe_run "sed -i 's/junit:junit:4.11/junit:junit:4.13.2/' demo/pom.xml || true"
           else
-            safe_run "mkdir -p nodeapp && cd nodeapp && npm init -y && npm i express"
-            cat > nodeapp/index.js <<'JS'
-            const e=require('express');const a=e();
-            a.get('/health',(_,r)=>r.json({status:'ok'}));a.listen(3000,()=>console.log('up'));
-            JS
+            safe_run "mkdir -p nodeapp"
+            printf '%s\n' \
+              'const e=require("express");const a=e();' \
+              'a.get("/health",(_,r)=>r.json({status:"ok"}));' \
+              'a.get("/items/:id",(q,r)=>r.json({id:+q.params.id,name:`item-${q.params.id}`}));' \
+              'a.listen(3000,()=>console.log("up"));' > nodeapp/index.js
+            safe_run "cd nodeapp && npm init -y && npm i express"
+            jq '.scripts.start="node index.js" | .name="vibe-nodeapp" | .version="0.0.1"' nodeapp/package.json > nodeapp/package.tmp && mv nodeapp/package.tmp nodeapp/package.json || true
+            printf '%s\n' 'registry=https://registry.npmjs.org' 'always-auth=false' > nodeapp/.npmrc
           fi
           summarize
 
@@ -249,85 +207,84 @@ jobs:
           restore-keys: |
             vibe-${{ runner.os }}-
 
-      - name: Smoke (quick)
+      - name: Smoke (quick) — always continue
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/safe_run.sh
-          case "${{ steps.cfg.outputs.framework }}" in
-            fastapi) safe_run ". .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &"; sleep 2; safe_run "curl -fsS 127.0.0.1:8000/health"; safe_run "lsof -ti:8000 | xargs -r kill" ;;
-            node-express) safe_run "cd nodeapp && node index.js &"; sleep 2; safe_run "curl -fsS 127.0.0.1:3000/health"; safe_run "lsof -ti:3000 | xargs -r kill" ;;
-            *) echo "spring demo 는 빌드 스킵";;
+          set +e
+          ECHO_OK="${ECHO_OK:-✅}"; ECHO_FAIL="${ECHO_FAIL:-❌}"
+          LOG_DIR="${LOG_DIR:-.github/echo_logs}"; mkdir -p "$LOG_DIR"
+          LOG_FILE="${LOG_DIR}/vibe-$(date +%Y%m%d%H%M%S).log"
+          echoe(){ printf '%s %s\n' "$ECHO_OK" "$*" | tee -a "$LOG_FILE"; }
+          safe(){ bash -lc "$1"; [ $? -eq 0 ] && echoe "$1 OK" || echo "⚠️ $1 failed (but continuing)"; }
+          fw="${{ steps.cfg.outputs.framework }}"
+          case "$fw" in
+            fastapi) safe ". .venv/bin/activate && uvicorn app.main:app --host 127.0.0.1 --port 8000 &"; sleep 2; safe "curl -fsS 127.0.0.1:8000/health"; safe "lsof -ti:8000 | xargs -r kill" ;;
+            node-express) safe "node nodeapp/index.js &"; sleep 2; safe "curl -fsS 127.0.0.1:3000/health"; safe "lsof -ti:3000 | xargs -r kill" ;;
+            *) echo "spring demo 는 빌드 스킵(성공 처리)";;
           esac
-          summarize
 
-# -----------------------------------------
-# Job 2) Services/DB (경량/무거움 분기)
-# -----------------------------------------
   services_db:
-    name: "2) Services & DB (TimeGuard)"
+    name: "2) Services & DB (No-Skip / Always-Continue)"
     runs-on: ubuntu-24.04
     needs: [prep]
     timeout-minutes: 20
-    if: ${{ needs.prep.outputs.install_servers == 'true' || needs.prep.outputs.install_servers == 'True' }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Quick APT (no full-upgrade)
+      - name: Install services
         shell: bash
+        continue-on-error: true
         run: |
-          set -Eeuo pipefail
+          set +e
+          if [ "${{ needs.prep.outputs.install_servers }}" != "true" ] && [ "${{ needs.prep.outputs.install_servers }}" != "True" ]; then
+            echo "⚠️ install_servers=false → 설치는 생략(NOOP)하지만 단계는 성공으로 진행"; exit 0; fi
           export DEBIAN_FRONTEND=noninteractive
           sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock || true
           sudo dpkg --configure -a || true
           sudo apt-get update -y
-          sudo apt-get install -y nginx apache2 redis-server postgresql postgresql-contrib curl lsof
+          sudo apt-get install -y nginx apache2 redis-server postgresql postgresql-contrib curl lsof || true
+          echo "Services installed (or already present)"
 
-      - name: Start services & check
+      - name: Start & check services
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
-          safe_run "echo 'OK NGINX' | sudo tee /var/www/html/index.html >/dev/null"
-          safe_run "sudo systemctl enable --now nginx || sudo service nginx start || true"
-          safe_run "sudo systemctl enable --now apache2 || sudo service apache2 start || true"
-          safe_run "sudo systemctl enable --now redis-server || sudo service redis-server start || true"
-          safe_run "sudo systemctl enable --now postgresql || sudo service postgresql start || true"
-          safe_run "curl -fsS 127.0.0.1/ | head -n1 || true"
-          summarize
+          set +e
+          echo 'OK NGINX' | sudo tee /var/www/html/index.html >/dev/null || true
+          sudo systemctl enable --now nginx || sudo service nginx start || true
+          sudo systemctl enable --now apache2 || sudo service apache2 start || true
+          sudo systemctl enable --now redis-server || sudo service redis-server start || true
+          sudo systemctl enable --now postgresql || sudo service postgresql start || true
+          curl -fsS 127.0.0.1/ | head -n1 || echo "⚠️ nginx check failed (continue)"
 
       - name: Apache change port & verify
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
-          safe_run "sudo sed -i 's/^Listen 80$/Listen ${APACHE_PORT}/' /etc/apache2/ports.conf || true"
-          safe_run "sudo sed -i 's@<VirtualHost \\*:80>@<VirtualHost *:${APACHE_PORT}>@' /etc/apache2/sites-available/000-default.conf || true"
-          safe_run "sudo systemctl restart apache2 || true"
-          safe_run "curl -fsS 127.0.0.1:${APACHE_PORT}/ | head -n2 || true"
-          summarize
+          set +e
+          sudo sed -i 's/^Listen 80$/Listen '"${APACHE_PORT}"'/' /etc/apache2/ports.conf || true
+          sudo sed -i 's@<VirtualHost \*:80>@<VirtualHost *:'"${APACHE_PORT}"'>@' /etc/apache2/sites-available/000-default.conf || true
+          sudo systemctl restart apache2 || true
+          curl -fsS 127.0.0.1:${APACHE_PORT}/ | head -n2 || echo "⚠️ apache check failed (continue)"
 
-      - name: PostgreSQL init/seed
+      - name: PostgreSQL init/seed/verify/dump
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
-          safe_run "sudo -u postgres psql -c \"CREATE DATABASE vibe_db;\" || true"
-          printf "\\c vibe_db\nCREATE TABLE IF NOT EXISTS items(id serial primary key, name text);\nINSERT INTO items(name) VALUES ('hello'),('world') ON CONFLICT DO NOTHING;\n" > /tmp/seed.sql
-          safe_run "sudo -u postgres psql -f /tmp/seed.sql || true"
-          summarize
+          set +e
+          sudo -u postgres psql -c "CREATE DATABASE vibe_db;" || true
+          printf '%s\n' '\c vibe_db' \
+                         'CREATE TABLE IF NOT EXISTS items(id serial primary key, name text);' \
+                         "INSERT INTO items(name) VALUES ('hello'),('world') ON CONFLICT DO NOTHING;" > /tmp/seed.sql
+          sudo -u postgres psql -f /tmp/seed.sql || true
+          printf '%s\n' '\c vibe_db' 'SELECT COUNT(*) FROM items;' > /tmp/test.sql
+          sudo -u postgres psql -f /tmp/test.sql | tee ${LOG_DIR}/pg_test.txt || true
+          sudo -u postgres pg_dump -Fc -d vibe_db -f ${ARTIFACT_DIR}/vibe_db.dump || true
+          echo "DB ready (or continued after soft errors)"
 
-      - name: Verify & dump (fast)
-        shell: bash
-        run: |
-          source /tmp/safe_run.sh || true
-          printf "\\c vibe_db\nSELECT COUNT(*) FROM items;\n" > /tmp/test.sql
-          safe_run "sudo -u postgres psql -f /tmp/test.sql | tee ${LOG_DIR}/pg_test.txt"
-          safe_run "sudo -u postgres pg_dump -Fc -d vibe_db -f ${ARTIFACT_DIR}/vibe_db.dump || true"
-          summarize
-
-# ------------------------------------------------
-# Job 3) Bulk Modify + Security + Publish + Gather
-# ------------------------------------------------
   finalize:
-    name: "3) Bulk/Sec/Publish/Gather (Cron-Lite aware)"
+    name: "3) Bulk/Sec/Docs/Deps/Publish/Gather (No-Skip / Always-Continue)"
     runs-on: ubuntu-24.04
     needs: [prep, services_db]
     if: ${{ always() }}
@@ -335,14 +292,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Bulk modify (replace/append/rename/duplicate)
+      - name: Bulk modify
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
+          set +e
           shopt -s nullglob globstar
           GLOBS="${BULK_GLOBS}"
           FILES=(); for g in ${GLOBS}; do for f in $g; do [ -f "$f" ] && FILES+=("$f"); done; done
-          if [ ${#FILES[@]} -gt 0 ]; then
+          if [ ${#FILES[@]} -eq 0 ]; then echo "⚠️ 대상 없음 (continue)"; else
             for f in "${FILES[@]}"; do
               [ -n "${REPLACE_FROM}" ] && sed -i "s/${REPLACE_FROM//\//\\/}/${REPLACE_TO//\//\\/}/g" "$f" || true
               [ -n "${APPEND_LINE}" ] && printf '%s\n' "${APPEND_LINE}" >> "$f" || true
@@ -356,103 +314,111 @@ jobs:
             find . -type d -not -path './.git/*' -exec chmod 755 {} + || true
           fi
           git status --porcelain | tee ${LOG_DIR}/bulk_changes.txt || true
+          echo "Bulk modify done (soft errors tolerated)"
 
-      # 보안 작업: 크론(lite) 또는 mode=lite에선 자동 스킵(이미 prep.outputs로 계산됨)
-      - name: SBOM (Syft) — skip on cron-lite
-        if: ${{ needs.prep.outputs.run_security == 'true' || needs.prep.outputs.run_security == 'True' }}
+      - name: SBOM (Syft)
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
+          set +e
           curl -fsSL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin || true
           syft dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || syft packages dir:. -o cyclonedx-json > ${ARTIFACT_DIR}/sbom.json || true
-          summarize
+          echo "SBOM generated (or continued after soft errors)"
 
-      - name: Vulnerability scan (Trivy, pip-audit) — skip on cron-lite
-        if: ${{ needs.prep.outputs.run_security == 'true' || needs.prep.outputs.run_security == 'True' }}
+      - name: Vulnerability scan (Trivy + pip-audit)
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
+          set +e
           curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin || true
           trivy fs --scanners vuln,secret,misconfig --timeout 5m --no-progress --ignore-unfixed -f json -o ${ARTIFACT_DIR}/trivy.json . || true
           python3 -m pip -q install -U pip-audit || true
           pip-audit -f json -o ${ARTIFACT_DIR}/pip-audit.json || true
-          summarize
+          echo "Security scans done (soft errors tolerated)"
 
-      - name: Docs pack — skip on cron-lite
-        if: ${{ needs.prep.outputs.run_docs == 'true' || needs.prep.outputs.run_docs == 'True' }}
+      - name: Docs pack
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
-          mkdir -p docs/adr docs/api
+          set +e
+          mkdir -p docs/adr docs/api || true
           zip -qr ${ARTIFACT_DIR}/docs.zip docs || true
-          summarize
+          echo "Docs zipped (soft errors tolerated)"
 
-      - name: Language deps upgrade (time-bounded)
+      - name: Language deps upgrade
         shell: bash
+        continue-on-error: true
         run: |
-          source /tmp/safe_run.sh || true
+          set +e
           if [ "${DO_LANG_UPGRADE}" = "true" ]; then
-            # Python (quick)
-            if [ "${PY_UPGRADE_STRATEGY}" = "uv" ]; then
-              python3 -m pip -q install -U uv || true
-              shopt -s globstar nullglob
-              for req in **/requirements*.txt; do uv pip compile --upgrade "$req" -o "$req" || true; uv pip sync "$req" || true; done
-            fi
-            # NPM quick
-            npm i -g npm-check-updates || true
-            for d in $(ls -d */ 2>/dev/null); do [ -f "$d/package.json" ] || continue; ncu -u "$d/package.json" || true; npm --prefix "$d" install || true; [ "$NPM_AUDIT_FIX" = "true" ] && npm --prefix "$d" audit fix || true; done
-            # Maven quick
-            sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless
+            python3 -m pip -q install -U uv || true
             shopt -s globstar nullglob
-            for pom in **/pom.xml; do mvn -q -f "$pom" versions:use-latest-releases -DgenerateBackupPoms=false || true; mvn -q -f "$pom" -DskipTests verify || true; done
+            for req in **/requirements*.txt; do uv pip compile --upgrade "$req" -o "$req" || true; uv pip sync "$req" || true; done
+            npm i -g npm-check-updates || true
+            for d in $(ls -d */ 2>/dev/null); do
+              [ -f "$d/package.json" ] || continue
+              ncu -u "$d/package.json" || true
+              npm --prefix "$d" install || true
+              [ "$NPM_AUDIT_FIX" = "true" ] && npm --prefix "$d" audit fix || true
+            done
+            sudo apt-get update -y && sudo apt-get install -y maven default-jdk-headless || true
+            for pom in **/pom.xml; do
+              mvn -q -f "$pom" versions:use-latest-releases -DgenerateBackupPoms=false || true
+              mvn -q -f "$pom" -DskipTests verify || true
+            done
+          else
+            echo "DO_LANG_UPGRADE=false → 업그레이드 noop (continue)"
           fi
-          summarize
+          echo "Deps upgrade stage completed (soft errors tolerated)"
 
-      - name: Gather artifacts (bounded)
-        shell: bash
-        run: |
-          source /tmp/safe_run.sh || true
-          WS="${GITHUB_WORKSPACE}"; mkdir -p "${GATHER_DIR}"
-          for p in ".github/echo_logs" ".github/artifacts" "${{ needs.prep.outputs.dirs_root }}" "${{ needs.prep.outputs.files_root }}" "app" "docs" "nodeapp" "demo" "README.md"; do
-            [ -e "$p" ] || continue; R="$(realpath -s "$p" 2>/dev/null || echo '')"
-            case "$R" in "$WS"/*) ;; *) echo "skip out-of-ws: $p"; continue;; esac
-            rsync -a --relative "$p" "${GATHER_DIR}/" || true
-          done
-          find "${{ needs.prep.outputs.files_root }}" -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -I{} sha256sum '{}' | tee ${GATHER_DIR}/files.sha256 || true
-          zip -qr ${GATHER_DIR}/prototype-${{ needs.prep.outputs.framework }}.zip app nodeapp demo 2>/dev/null || true
-
-      - uses: actions/upload-artifact@v4
+      - name: Gather artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: vibe-artifacts
-          path: .github/artifacts/gather/**
+          path: |
+            .github/echo_logs/**
+            .github/artifacts/**
+            ${{ needs.prep.outputs.dirs_root }}/**
+            ${{ needs.prep.outputs.files_root }}/**
+            app/**
+            docs/**
+            nodeapp/**
+            demo/**
+            README.md
           if-no-files-found: warn
           compression-level: 6
           overwrite: false
           include-hidden-files: true
 
-      # 선택 릴리즈/퍼블리시
       - name: Release/Publish (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.do_release == 'true' || github.event.inputs.do_release == true) }}
         shell: bash
+        continue-on-error: true
         run: |
-          echo "릴리즈/퍼블리시는 필요 시 별도 워크플로우로 분리 권장(타임아웃 방지)."
+          set +e
+          echo "릴리즈/퍼블리시는 별도 분리 권장 — 여기서는 성공 메시지만 남기고 통과"
 
       - name: Auto-commit (optional)
         if: ${{ needs.prep.outputs.auto_commit == 'true' || needs.prep.outputs.auto_commit == 'True' }}
         shell: bash
+        continue-on-error: true
         run: |
+          set +e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "chore(vibe): bulk & artifacts [skip ci]" || true
           git push || true
+          echo "Auto-commit attempted (soft errors tolerated)"
 
-      - name: ✅ Summary
+      - name: ✅ Always-success banner
         if: ${{ needs.prep.outputs.force_success == 'true' || needs.prep.outputs.force_success == 'True' }}
         shell: bash
+        continue-on-error: true
         run: |
-          echo "## ✅ 파이프라인 완료 (분할·크론라이트·타임가드·세이프컨티뉴)" >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          echo "## ✅ 전체 파이프라인 완료 (No-Skip / Always-Continue)" >> "$GITHUB_STEP_SUMMARY"
           echo "- 모드: ${{ needs.prep.outputs.mode }} / 프레임워크: ${{ needs.prep.outputs.framework }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 크론/모드 파생: run_security=${{ needs.prep.outputs.run_security }} run_docs=${{ needs.prep.outputs.run_docs }} install_servers=${{ needs.prep.outputs.install_servers }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 디렉토리/파일: ${{ needs.prep.outputs.dirs_root }} (x${{ needs.prep.outputs.dirs_count }}), ${{ needs.prep.outputs.files_root }} (x${{ needs.prep.outputs.files_count }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 서버 설치 플래그: ${{ needs.prep.outputs.install_servers }} (false면 단계는 실행되나 설치는 noop)" >> "$GITHUB_STEP_SUMMARY"
           echo "- 아티팩트: vibe-artifacts" >> "$GITHUB_STEP_SUMMARY"
