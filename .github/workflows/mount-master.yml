@@ -86,7 +86,6 @@ jobs:
           ERR(){ echo "❌ [$(TS)] $*" >&2; }
           TRY(){ bash -lc "$*" && OK "ok: $*" || { RC=$?; ERR "failed($RC): $*"; return 0; }; }
           SAFE(){ ( set +e; eval "$*"; RC=$?; if [ $RC -ne 0 ]; then ERR "failed($RC): $*"; fi; exit 0 ); }
-          # Ensure docker compose command availability -> sets $COMPOSE_CMD
           ensure_compose(){
             if docker compose version >/dev/null 2>&1; then COMPOSE_CMD="docker compose"; OK "compose: docker compose"; return 0; fi
             if command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="docker-compose"; OK "compose: docker-compose"; return 0; fi
@@ -283,7 +282,7 @@ jobs:
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           ensure_compose || true
           if [ -z "${COMPOSE_CMD:-}" ]; then
-            ERR "compose unavailable; skipping compose test" | tee -a "$LOG_DIR/compose.log"
+            echo "compose unavailable; skipping compose test" | tee -a "$LOG_DIR/compose.log"
           else
             SAFE "$COMPOSE_CMD up -d"
             sleep 2
@@ -291,7 +290,7 @@ jobs:
             SAFE "$COMPOSE_CMD exec web ls -al /usr/share/nginx/html | tee -a \"$LOG_DIR/compose.log\""
             $COMPOSE_CMD logs web | tail -n +1 | tee -a "$LOG_DIR/compose.log" || true
             SAFE "$COMPOSE_CMD down -v"
-            OK "compose phase completed" | tee -a "$LOG_DIR/compose.log"
+            echo "compose phase completed" | tee -a "$LOG_DIR/compose.log"
           fi
 
       - name: Upload compose logs
@@ -400,20 +399,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Symlink directory (mklink /D)
+      - name: Symlink/Junction with robust fallback (Windows)
         shell: powershell
         continue-on-error: true
         run: |
+          # 기본 경로 준비
           $LogDir = "${{ needs.prepare.outputs.logs_dir }}".Replace('/', '\')
           $DataDir = "${{ needs.prepare.outputs.data_dir }}".Replace('/', '\')
           New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
           New-Item -ItemType Directory -Force -Path "$DataDir" | Out-Null
           Set-Content -Path (Join-Path $DataDir "host_hello_windows.txt") -Value "hi from windows host"
-          $Target = "$DataDir"
-          $Link   = "$DataDir.link"
+
+          # 링크 경로(동일 상위 폴더에 .link 생성)
+          $Parent = Split-Path -Parent $DataDir
+          $Name   = (Split-Path -Leaf $DataDir) + ".link"
+          $Link   = Join-Path $Parent $Name
+
           if (Test-Path $Link) { Remove-Item $Link -Recurse -Force }
-          cmd /c mklink /D "$Link" "$Target" | Out-Null
-          Get-ChildItem $Link | Out-String | Tee-Object -FilePath (Join-Path $LogDir "windows-link.log")
+
+          # 1) SymbolicLink 시도 (실패 시 예외 발생 가능)
+          $linkCreated = $false
+          try {
+            New-Item -ItemType SymbolicLink -Path $Link -Target $DataDir -Force -ErrorAction Stop | Out-Null
+            $linkCreated = $true
+          } catch {
+            # 2) Junction(/J) 폴백 (관리자 권한 불필요)
+            try {
+              cmd /c mklink /J "$Link" "$DataDir" | Out-Null
+              if (Test-Path $Link) { $linkCreated = $true }
+            } catch {
+              # 3) 최후 폴백: 복사본 생성(링크 불가 환경)
+              $CopyTarget = "$Link.copy"
+              if (Test-Path $CopyTarget) { Remove-Item $CopyTarget -Recurse -Force }
+              Copy-Item -Path $DataDir -Destination $CopyTarget -Recurse -Force
+              if (Test-Path $CopyTarget) { $linkCreated = $true; $Link = $CopyTarget }
+            }
+          }
+
+          # 안전한 출력(존재할 때만)
+          $LogFile = Join-Path $LogDir "windows-link.log"
+          if (Test-Path $Link) {
+            Get-ChildItem $Link | Out-String | Tee-Object -FilePath $LogFile
+          } else {
+            "link not created (all methods failed): $Link" | Tee-Object -FilePath $LogFile
+          }
 
       - name: Upload windows logs
         if: always()
