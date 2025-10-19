@@ -1,4 +1,4 @@
-name: "🎧 Vibe Coding Pilot — Split Jobs + No-Skip + Always-Continue + Failure Report"
+name: "🎧 Vibe Coding Pilot — Split Jobs + No-Skip + Always-Continue + Storage + Failure Report"
 
 on:
   workflow_dispatch:
@@ -33,6 +33,16 @@ on:
       do_release:
         type: boolean
         default: false
+      storage_enabled:
+        description: "스토리지(루프백 볼륨) 활성화"
+        type: boolean
+        default: true
+      storage_size_gb:
+        description: "스토리지 크기(GB) — 러너 여유공간 내에서만 생성"
+        default: "4"
+      storage_label:
+        description: "스토리지 레이블(선택)"
+        default: "VIBE_STORE"
   schedule:
     - cron: "*/5 * * * *"
 
@@ -86,6 +96,9 @@ env:
   DO_DB_MIGRATE: "false"
   DB_MIGRATOR: "flyway"
 
+  # Storage (공통 기본값 — 입력으로 오버라이드됨)
+  STORAGE_MOUNT: "/mnt/vibe_store"
+
 jobs:
   prep:
     name: "1) Prep & Scaffold (No heredoc / No-Skip / Always-Continue)"
@@ -101,6 +114,9 @@ jobs:
       force_success: ${{ steps.cfg.outputs.force_success }}
       files_count: ${{ steps.cfg.outputs.files_count }}
       dirs_count: ${{ steps.cfg.outputs.dirs_count }}
+      storage_enabled: ${{ steps.cfg.outputs.storage_enabled }}
+      storage_size_gb: ${{ steps.cfg.outputs.storage_size_gb }}
+      storage_label: ${{ steps.cfg.outputs.storage_label }}
     steps:
       - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
@@ -116,7 +132,6 @@ jobs:
           chmod -R u+rwX,go+rX "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
           : > "${FAIL_LOG_FILE}"
           echo 0 > "${FAIL_COUNT_FILE}"
-          echo "permissions normalized for workspace and artifact dirs"
 
       - name: Resolve inputs (no-skip policy)
         id: cfg
@@ -132,6 +147,9 @@ jobs:
           install_servers="${{ github.event.inputs.install_servers || 'true' }}"
           auto_commit="${{ github.event.inputs.auto_commit || 'false' }}"
           force_success="${{ github.event.inputs.force_success_message || 'true' }}"
+          storage_enabled="${{ github.event.inputs.storage_enabled || 'true' }}"
+          storage_size_gb="${{ github.event.inputs.storage_size_gb || '4' }}"
+          storage_label="${{ github.event.inputs.storage_label || 'VIBE_STORE' }}"
           {
             echo "mode=$mode"
             echo "framework=$framework"
@@ -142,6 +160,9 @@ jobs:
             echo "install_servers=$install_servers"
             echo "auto_commit=$auto_commit"
             echo "force_success=$force_success"
+            echo "storage_enabled=$storage_enabled"
+            echo "storage_size_gb=$storage_size_gb"
+            echo "storage_label=$storage_label"
           } >> "$GITHUB_OUTPUT"
 
       - name: Setup toolchains (pin)
@@ -162,6 +183,12 @@ jobs:
             echo '{"step":"utils","level":"error","msg":"apt install failed"}' >> "${FAIL_LOG_FILE}"
             n=$(cat "${FAIL_COUNT_FILE}"); echo $((n+1)) > "${FAIL_COUNT_FILE}"
           }
+
+      - name: Ensure cache roots exist (pre-restore)
+        shell: bash
+        run: |
+          set -e
+          mkdir -p ~/.cache/pip ~/.cache/uv ~/.npm ~/.m2/repository
 
       - name: Directories & Files
         shell: bash
@@ -208,8 +235,7 @@ jobs:
           fi
           ok "Scaffold finished"
 
-      # ====== CACHES (pip / npm / maven) ======
-      - name: Cache pip (requirements/pyproject 기반)
+      - name: Cache pip
         id: cache-pip
         uses: actions/cache@v4
         continue-on-error: true
@@ -228,14 +254,12 @@ jobs:
         run: |
           [ "${{ steps.cache-pip.outputs.cache-hit }}" = "true" ] && echo "✅ pip cache hit" || echo "⚠️ pip cache miss (정상)"
 
-      - name: Cache npm (package-lock / package.json 기반)
+      - name: Cache npm
         id: cache-npm
         uses: actions/cache@v4
         continue-on-error: true
         with:
-          path: |
-            ~/.npm
-            **/node_modules
+          path: ~/.npm
           key: npm-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/package.json') }}
           restore-keys: |
             npm-${{ runner.os }}-
@@ -247,13 +271,12 @@ jobs:
         run: |
           [ "${{ steps.cache-npm.outputs.cache-hit }}" = "true" ] && echo "✅ npm cache hit" || echo "⚠️ npm cache miss (정상)"
 
-      - name: Cache Maven (~/.m2/repository)
+      - name: Cache Maven
         id: cache-mvn
         uses: actions/cache@v4
         continue-on-error: true
         with:
-          path: |
-            ~/.m2/repository
+          path: ~/.m2/repository
           key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
           restore-keys: |
             maven-${{ runner.os }}-
@@ -277,8 +300,16 @@ jobs:
             *) echo "spring demo 는 빌드 스킵(성공 처리)";;
           esac
 
+      - name: Ensure cache roots exist (pre-save keepers)
+        if: always()
+        shell: bash
+        run: |
+          set -e
+          mkdir -p ~/.cache/pip ~/.cache/uv ~/.npm ~/.m2/repository
+          touch ~/.cache/pip/.keep ~/.cache/uv/.keep ~/.npm/.keep ~/.m2/repository/.keep
+
   services_db:
-    name: "2) Services & DB (No-Skip / Always-Continue)"
+    name: "2) Services & DB + Storage (No-Skip / Always-Continue)"
     runs-on: ubuntu-24.04
     needs: [prep]
     timeout-minutes: 20
@@ -295,13 +326,62 @@ jobs:
           mkdir -p "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
           chmod -R u+rwX,go+rX "${LOG_DIR}" "${ARTIFACT_DIR}" "${GATHER_DIR}" || true
 
+      # ---------- Storage Provision (loopback ext4) ----------
+      - name: Provision storage volume (loopback)
+        shell: bash
+        continue-on-error: true
+        env:
+          STORAGE_ENABLED: ${{ needs.prep.outputs.storage_enabled }}
+          STORAGE_SIZE_GB: ${{ needs.prep.outputs.storage_size_gb }}
+          STORAGE_LABEL: ${{ needs.prep.outputs.storage_label }}
+        run: |
+          set +e
+          if [ "${STORAGE_ENABLED}" != "true" ] && [ "${STORAGE_ENABLED}" != "True" ]; then
+            echo "⚠️ storage_enabled=false → 스토리지 프로비저닝은 noop (단계는 성공)"; echo "STORAGE_MODE=disabled" >> $GITHUB_ENV; exit 0; fi
+
+          MNT="${STORAGE_MOUNT:-/mnt/vibe_store}"
+          IMG="${RUNNER_TEMP}/vibe_store.img"
+          SIZE_GB="${STORAGE_SIZE_GB:-4}"
+
+          echo "준비: ${SIZE_GB}G loopback at ${IMG}, mount ${MNT}"
+          sudo mkdir -p "$MNT" || true
+
+          # 여유 공간 확인 (대략적)
+          AVAIL_GB=$(df -P -BG "$RUNNER_TEMP" | awk 'NR==2{gsub(/G/,"",$4);print $4}')
+          if [ -n "$AVAIL_GB" ] && [ "$AVAIL_GB" -le "$((SIZE_GB+1))" ]; then
+            echo "⚠️ 여유공간 부족(${AVAIL_GB}G<=${SIZE_GB}G+1). 폴더 기반 fallback."
+            sudo mkdir -p "$MNT"; sudo chown "$USER":"$USER" "$MNT"
+            echo "STORAGE_MODE=fallback" >> $GITHUB_ENV
+            echo "STORAGE_MOUNT=$MNT" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          truncate -s ${SIZE_GB}G "$IMG" || { echo "⚠️ truncate 실패 → fallback"; sudo mkdir -p "$MNT"; sudo chown "$USER":"$USER" "$MNT"; echo "STORAGE_MODE=fallback" >> $GITHUB_ENV; echo "STORAGE_MOUNT=$MNT" >> $GITHUB_ENV; exit 0; }
+
+          LOOP=$(sudo losetup -f --show "$IMG") || true
+          if [ -z "$LOOP" ]; then
+            echo "⚠️ losetup 실패 → fallback 디렉터리 사용"
+            sudo mkdir -p "$MNT"; sudo chown "$USER":"$USER" "$MNT"
+            echo "STORAGE_MODE=fallback" >> $GITHUB_ENV
+            echo "STORAGE_MOUNT=$MNT" >> $GITHUB_ENV
+            exit 0
+          fi
+          sudo mkfs.ext4 -F -L "${STORAGE_LABEL:-VIBE_STORE}" "$LOOP" || true
+          sudo mount "$LOOP" "$MNT" || { echo "⚠️ mount 실패 → fallback"; sudo losetup -d "$LOOP" || true; sudo mkdir -p "$MNT"; sudo chown "$USER":"$USER" "$MNT"; echo "STORAGE_MODE=fallback" >> $GITHUB_ENV; echo "STORAGE_MOUNT=$MNT" >> $GITHUB_ENV; exit 0; }
+
+          sudo chown "$USER":"$USER" "$MNT"
+          echo "STORAGE_MODE=loopback" >> $GITHUB_ENV
+          echo "STORAGE_MOUNT=$MNT" >> $GITHUB_ENV
+          df -h "$MNT" || true
+          echo "스토리지 준비 완료: $MNT"
+
       - name: Install services
         shell: bash
         continue-on-error: true
         run: |
           set +e
           if [ "${{ needs.prep.outputs.install_servers }}" != "true" ] && [ "${{ needs.prep.outputs.install_servers }}" != "True" ]; then
-            echo "⚠️ install_servers=false → 설치는 생략(NOOP)하지만 단계는 성공으로 진행"; exit 0; fi
+            echo "⚠️ install_servers=false → 설치 noop (단계 성공)"; exit 0; fi
           export DEBIAN_FRONTEND=noninteractive
           sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock || true
           sudo dpkg --configure -a || true
@@ -355,8 +435,46 @@ jobs:
           sudo chown "$USER":"$USER" "${ARTIFACT_DIR}/vibe_db.dump" || true
           echo "DB ready and dump placed at ${ARTIFACT_DIR}/vibe_db.dump (soft errors tolerated)"
 
+      # ---------- 서비스/시스템 정보 스토리지 적재 ----------
+      - name: Persist service info to storage
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          MNT="${STORAGE_MOUNT:-/mnt/vibe_store}"
+          mkdir -p "$MNT/services" "$MNT/system" "$MNT/artifacts" || true
+
+          # Nginx
+          { nginx -v 2>&1 || true; sudo nginx -t 2>&1 || true; systemctl status nginx --no-pager 2>&1 | head -n 80 || true; } > "$MNT/services/nginx.txt"
+          # Apache
+          { apachectl -v 2>&1 || true; apachectl -S 2>&1 || true; systemctl status apache2 --no-pager 2>&1 | head -n 80 || true; echo "Port=${APACHE_PORT}"; } > "$MNT/services/apache.txt"
+          # Redis
+          { redis-cli ping 2>&1 || true; redis-cli info 2>/dev/null | head -n 120 || true; systemctl status redis-server --no-pager 2>&1 | head -n 80 || true; } > "$MNT/services/redis.txt"
+          # Postgres
+          { psql --version 2>&1 || true; sudo -u postgres psql -c '\l' 2>&1 || true; sudo -u postgres psql -d vibe_db -c '\dt' 2>&1 || true; } > "$MNT/services/postgres.txt"
+
+          # 시스템/디스크/네트워크 개요
+          { uname -a; df -h; lsblk; ip addr || true; } > "$MNT/system/host.txt"
+
+          # 현재까지 생성된 아티팩트 일부를 스토리지에 복제
+          cp -f ${ARTIFACT_DIR}/vibe_db.dump "$MNT/artifacts/" 2>/dev/null || true
+          cp -f ${LOG_DIR}/pg_test.txt "$MNT/artifacts/" 2>/dev/null || true
+
+          echo "서비스/시스템 정보가 ${MNT} 에 적재되었습니다."
+
+      - name: Archive storage snapshot (tgz) & upload
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: vibe-storage-snapshot
+          path: ${{ env.STORAGE_MOUNT }}/**
+          if-no-files-found: warn
+          compression-level: 6
+          overwrite: false
+          include-hidden-files: true
+
   finalize:
-    name: "3) Bulk/Sec/Docs/Deps/Publish/Gather + Failure Report"
+    name: "3) Bulk/Sec/Docs/Deps/Publish/Gather + Failure Report + Storage Pack"
     runs-on: ubuntu-24.04
     needs: [prep, services_db]
     if: ${{ always() }}
@@ -397,7 +515,6 @@ jobs:
           fi
           git status --porcelain | tee ${LOG_DIR}/bulk_changes.txt || true
 
-      # -------- SBOM (Syft) 개선: 메타데이터 주입 & 경고 제거 --------
       - name: SBOM (Syft) — metadata enforced
         shell: bash
         continue-on-error: true
@@ -425,14 +542,12 @@ jobs:
           fi
           echo "SBOM generated at ${ARTIFACT_DIR}/sbom.json (metadata injected; soft errors tolerated)"
 
-      # -------- Trivy 개선: 캐시 고정, 스캐너 구성, 요약 리포트 --------
       - name: Vulnerability scan (Trivy + pip-audit) — cached & summarized
         shell: bash
         continue-on-error: true
         env:
           TRIVY_CACHE_DIR: ${{ runner.temp }}/trivy-cache
           TRIVY_TIMEOUT: "5m"
-          # 필요 시 리포지토리/환경 변수로 오버라이드 가능 (예: 'vuln,misconfig')
           TRIVY_SCANNERS: ${{ env.TRIVY_SCANNERS }}
         run: |
           set +e
@@ -465,14 +580,8 @@ jobs:
               echo "- Vulnerabilities: **${TOTAL}**"
               echo "- Targets scanned: **${PKGS}**"
             } >> "${FAIL_MD}"
-            echo "Found ${TOTAL} vulns across ${PKGS} targets (Trivy)."
           fi
 
-          if [ "${TRIVY_SCANNERS}" = "vuln,secret,misconfig" ]; then
-            echo "Tip: 느릴 경우 env.TRIVY_SCANNERS='vuln,misconfig' 로 비밀키 스캔 비활성화 가능."
-          fi
-
-      # -------- Docs pack 안전화 & 크기 출력 --------
       - name: Docs pack — safe & verbose
         shell: bash
         continue-on-error: true
@@ -512,7 +621,7 @@ jobs:
             echo '{"step":"deps","level":"info","msg":"DO_LANG_UPGRADE=false (noop)"}' >> "${FAIL_LOG_FILE}"
           fi
 
-      - name: Gather artifacts
+      - name: Gather artifacts (workspace snapshot)
         uses: actions/upload-artifact@v4
         with:
           name: vibe-artifacts
@@ -530,6 +639,27 @@ jobs:
           compression-level: 6
           overwrite: false
           include-hidden-files: true
+
+      # 저장소 적재본(최종 아티팩트까지) 추가 패킹
+      - name: Create late storage-pack (no mount, tar workspace artifacts)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p "${ARTIFACT_DIR}" || true
+          tar -czf "${ARTIFACT_DIR}/storage-pack-final.tgz" \
+            ".github/echo_logs" ".github/artifacts" "docs" "app" "nodeapp" "demo" "README.md" 2>/dev/null || true
+          echo "Late storage pack created at ${ARTIFACT_DIR}/storage-pack-final.tgz"
+
+      - name: Upload storage-pack-final
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: vibe-storage-pack-final
+          path: .github/artifacts/storage-pack-final.tgz
+          if-no-files-found: warn
+          compression-level: 0
+          overwrite: true
 
       - name: Release/Publish (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.do_release == 'true' || github.event.inputs.do_release == true) }}
@@ -604,9 +734,11 @@ jobs:
         run: |
           set +e
           FAILS=$(cat "${FAIL_COUNT_FILE}" 2>/dev/null || echo 0)
-          echo "## ✅ 전체 파이프라인 완료 (No-Skip / Always-Continue)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ✅ 전체 파이프라인 완료 (No-Skip / Always-Continue / Storage)" >> "$GITHUB_STEP_SUMMARY"
           echo "- 모드: ${{ needs.prep.outputs.mode }} / 프레임워크: ${{ needs.prep.outputs.framework }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- 디렉토리/파일: ${{ needs.prep.outputs.dirs_root }} (x${{ needs.prep.outputs.dirs_count }}), ${{ needs.prep.outputs.files_root }} (x${{ needs.prep.outputs.files_count }})" >> "$GITHUB_STEP_SUMMARY"
           echo "- 서버 설치 플래그: ${{ needs.prep.outputs.install_servers }} (false면 설치 noop 처리)" >> "$GITHUB_STEP_SUMMARY"
           echo "- Soft failures: ${FAILS}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 스토리지 스냅샷: vibe-storage-snapshot (mounted ${STORAGE_MOUNT:-/mnt/vibe_store})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 스토리지 최종팩: vibe-storage-pack-final (.github/artifacts/storage-pack-final.tgz)" >> "$GITHUB_STEP_SUMMARY"
           echo "- 보고서: .github/artifacts/failure_report.md (vibe-failure-report 아티팩트)" >> "$GITHUB_STEP_SUMMARY"
