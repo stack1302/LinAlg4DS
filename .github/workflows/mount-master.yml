@@ -43,7 +43,6 @@ concurrency:
 
 env:
   TZ: Asia/Seoul
-  FORCE_SUCCESS: "true"
 
 jobs:
   prepare:
@@ -71,7 +70,7 @@ jobs:
           echo "do_k8s=${{ inputs.do_k8s }}"           >> $GITHUB_OUTPUT
           echo "mode=${{ inputs.mode }}"               >> $GITHUB_OUTPUT
 
-      - name: Bootstrap (dirs + helper)
+      - name: Ensure base dirs and seed file
         shell: bash
         continue-on-error: true
         run: |
@@ -79,39 +78,6 @@ jobs:
           LOG_DIR="${{ steps.out.outputs.logs_dir }}"
           DATA_DIR="${{ steps.out.outputs.data_dir }}"
           mkdir -p "$LOG_DIR" "$DATA_DIR"
-          cat > /tmp/echo_helpers.sh <<'SH'
-          #!/usr/bin/env bash
-          set -Eeuo pipefail
-          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
-          OK(){ echo "✅ [$(TS)] $*"; }
-          WARN(){ echo "⚠️  [$(TS)] $*" >&2; }
-          ERR(){ echo "❌ [$(TS)] $*" >&2; }
-          TRY(){ bash -lc "$*" && OK "ok: $*" || { RC=$?; ERR "failed($RC): $*"; return 0; }; }
-          SAFE(){ ( set +e; eval "$*"; RC=$?; if [ $RC -ne 0 ]; then ERR "failed($RC): $*"; fi; exit 0 ); }
-          ensure_compose(){
-            if docker compose version >/dev/null 2>&1; then COMPOSE_CMD="docker compose"; OK "compose: docker compose"; return 0; fi
-            if command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="docker-compose"; OK "compose: docker-compose"; return 0; fi
-            WARN "compose not found -> installing docker-compose-plugin"
-            sudo apt-get update -y || true
-            sudo apt-get install -y docker-compose-plugin || true
-            if docker compose version >/dev/null 2>&1; then COMPOSE_CMD="docker compose"; OK "compose installed: docker compose"; return 0; fi
-            if command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="docker-compose"; OK "compose found: docker-compose"; return 0; fi
-            ERR "compose still not available"; COMPOSE_CMD=""
-          }
-          ensure_podman(){
-            if command -v podman >/dev/null 2>&1; then OK "podman present"; return 0; fi
-            WARN "podman not found -> installing"
-            sudo apt-get update -y || true
-            sudo apt-get install -y podman || true
-            if command -v podman >/dev/null 2>&1; then OK "podman installed"; return 0; fi
-            ERR "podman install failed"
-          }
-          ensure_net_tools(){
-            sudo apt-get update -y || true
-            sudo apt-get install -y nfs-common cifs-utils || true
-          }
-          SH
-          chmod +x /tmp/echo_helpers.sh
           echo "hello, mount master" > "${DATA_DIR}/host_hello.txt"
 
       - name: Upload initial artifacts
@@ -129,33 +95,47 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Bootstrap (helper + dirs per job)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
-          DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
-          mkdir -p "$LOG_DIR" "$DATA_DIR"
-          cat /tmp/echo_helpers.sh >/dev/null 2>&1 || exit 0
-      - name: Bind mount test (Linux)
+      - name: Local bind mount with robust fallbacks
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh || true
-          set -Eeuo pipefail
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ [$(TS)] $*"; }
+          ERR(){ echo "❌ [$(TS)] $*" >&2; }
+          SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
-          BIND_SRC="${GITHUB_WORKSPACE}/${DATA_DIR}"
-          BIND_DST="${GITHUB_WORKSPACE}/${DATA_DIR}.mounted"
-          mkdir -p "$BIND_SRC" "$BIND_DST"
-          echo "bind source: $BIND_SRC" | tee -a "$LOG_DIR/bind.log"
-          echo "bind target: $BIND_DST" | tee -a "$LOG_DIR/bind.log"
-          SAFE "sudo mount --bind \"$BIND_SRC\" \"$BIND_DST\""
-          SAFE "bash -lc 'echo \"from_bind_mount=$(date)\" > \"$BIND_DST/file_from_bind.txt\"'"
-          ls -al "$BIND_SRC" "$BIND_DST" | tee -a "$LOG_DIR/bind.log" || true
-          SAFE "sudo umount \"$BIND_DST\""
-          rmdir "$BIND_DST" 2>/dev/null || true
-          OK "linux bind mount phase completed" | tee -a "$LOG_DIR/bind.log"
+          mkdir -p "$LOG_DIR" "$DATA_DIR"
+
+          SRC="${GITHUB_WORKSPACE}/${DATA_DIR}"
+          DST="${GITHUB_WORKSPACE}/${DATA_DIR}.mounted"
+          mkdir -p "$SRC" "$DST"
+
+          # 1) bind mount 시도
+          SAFE "sudo mount --bind \"$SRC\" \"$DST\""
+          if mountpoint -q "$DST"; then
+            echo "from_bind_mount=$(date)" > "$DST/file_from_bind.txt" || true
+            ls -al "$SRC" "$DST" | tee -a "$LOG_DIR/bind.log" || true
+            SAFE "sudo umount \"$DST\""
+            rmdir "$DST" || true
+            OK "bind mount succeeded" | tee -a "$LOG_DIR/bind.log"
+          else
+            # 2) 폴백: symlink → 3) 최종 폴백: copy
+            ln -s "$SRC" "$DST" 2>/dev/null || true
+            if [ -L "$DST" ]; then
+              echo "from_symlink=$(date)" > "$SRC/file_from_symlink.txt" || true
+              ls -al "$SRC" "$DST" | tee -a "$LOG_DIR/bind.log" || true
+              rm -f "$DST" || true
+              OK "bind fallback: symlink" | tee -a "$LOG_DIR/bind.log"
+            else
+              rm -rf "$DST" && mkdir -p "$DST"
+              cp -a "$SRC/." "$DST/" 2>/dev/null || true
+              ls -al "$SRC" "$DST" | tee -a "$LOG_DIR/bind.log" || true
+              OK "bind fallback: copy (simulation)" | tee -a "$LOG_DIR/bind.log"
+            fi
+          fi
+
       - name: Upload bind logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -169,35 +149,39 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Bootstrap (helper + dirs per job)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
-          DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
-          mkdir -p "$LOG_DIR" "$DATA_DIR"
-          cat /tmp/echo_helpers.sh >/dev/null 2>&1 || exit 0
-      - name: Docker info (for logs)
-        continue-on-error: true
-        run: docker info || true
-      - name: Run container with mount (rw/ro + SELinux label demo)
+
+      - name: Run Docker with mount (auto-install & SELinux labels guarded)
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh || true
-          set -Eeuo pipefail
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ [$(TS)] $*"; }
+          ERR(){ echo "❌ [$(TS)] $*" >&2; }
+          SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
+
+          ensure_docker(){
+            if command -v docker >/dev/null 2>&1; then return 0; fi
+            echo "install docker..." >&2
+            sudo apt-get update -y || true
+            sudo apt-get install -y docker.io || true
+          }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
           IMG="${{ needs.prepare.outputs.docker_image }}"
-          MNT_MODE="rw"
-          if [ "${{ needs.prepare.outputs.read_only }}" == "true" ]; then MNT_MODE="ro"; fi
+          MNT_MODE="rw"; [ "${{ needs.prepare.outputs.read_only }}" = "true" ] && MNT_MODE="ro"
+          mkdir -p "$LOG_DIR" "$DATA_DIR"
+
+          ensure_docker || true
+          docker info >/dev/null 2>&1 || { ERR "docker unavailable; skip container test"; exit 0; }
+
           echo "image=$IMG, mount_mode=$MNT_MODE" | tee -a "$LOG_DIR/docker.log"
-          # 일반 바인드
           SAFE "docker run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:${MNT_MODE}\" \"$IMG\" bash -lc 'ls -al /app/data; echo \"from_container=$(date)\" >> /app/data/container_hello.txt || true; ls -al /app/data'"
-          # SELinux 라벨(:z) 데모 — RHEL류에서만 의미, Ubuntu에서는 no-op/ignored
+          # :z 라벨은 SELinux 호스트에서만 의미 있으므로 실패해도 통과
           SAFE "docker run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:${MNT_MODE},z\" \"$IMG\" bash -lc 'ls -al /app/data | head -n 5'"
           ls -al "${GITHUB_WORKSPACE}/${DATA_DIR}" | tee -a "$LOG_DIR/docker.log" || true
-          OK "docker bind mount phase completed ($MNT_MODE)" | tee -a "$LOG_DIR/docker.log"
+          OK "docker phase done ($MNT_MODE)" | tee -a "$LOG_DIR/docker.log"
+
       - name: Upload docker logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -207,27 +191,45 @@ jobs:
 
   compose-mount:
     needs: [prepare]
-    if: ${{ needs.prepare.outputs.do_compose == 'true' }}
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Bootstrap (helper + dirs per job + compose ensure)
+
+      - name: Compose up/test/down with auto compose detection
         shell: bash
         continue-on-error: true
         run: |
-          set -Eeuo pipefail
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ [$(TS)] $*"; }
+          ERR(){ echo "❌ [$(TS)] $*" >&2; }
+          SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
+          ensure_docker(){
+            if command -v docker >/dev/null 2>&1; then return 0; fi
+            sudo apt-get update -y || true
+            sudo apt-get install -y docker.io || true
+          }
+          ensure_compose(){
+            if docker compose version >/dev/null 2>&1; then echo "docker compose"; return 0; fi
+            if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; return 0; fi
+            sudo apt-get update -y || true
+            sudo apt-get install -y docker-compose-plugin || true
+            if docker compose version >/dev/null 2>&1; then echo "docker compose"; return 0; fi
+            if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; return 0; fi
+            echo ""
+          }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
+          DO_COMPOSE="${{ needs.prepare.outputs.do_compose }}"
           mkdir -p "$LOG_DIR" "$DATA_DIR/site"
-          cat /tmp/echo_helpers.sh >/dev/null 2>&1 || exit 0
           echo "<h1>hello compose</h1>" > "$DATA_DIR/site/index.html"
-      - name: Write compose.yml (dynamic path)
-        shell: bash
-        continue-on-error: true
-        run: |
-          set -Eeuo pipefail
-          DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
+
+          [ "$DO_COMPOSE" = "true" ] || { echo "compose disabled -> skip" | tee -a "$LOG_DIR/compose.log"; exit 0; }
+
+          ensure_docker || true
+          docker info >/dev/null 2>&1 || { ERR "docker unavailable; skip compose test"; exit 0; }
+
           cat > compose.yml <<YML
           services:
             web:
@@ -240,16 +242,10 @@ jobs:
           volumes:
             logs: {}
           YML
-      - name: Compose up / test / down (with ensure)
-        shell: bash
-        continue-on-error: true
-        run: |
-          source /tmp/echo_helpers.sh || true
-          set -Eeuo pipefail
-          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
-          ensure_compose || true
-          if [ -z "${COMPOSE_CMD:-}" ]; then
-            echo "compose unavailable; skipping compose test" | tee -a "$LOG_DIR/compose.log"
+
+          COMPOSE_CMD=$(ensure_compose)
+          if [ -z "$COMPOSE_CMD" ]; then
+            ERR "compose unavailable; skipping"
           else
             SAFE "$COMPOSE_CMD up -d"
             sleep 2
@@ -257,8 +253,9 @@ jobs:
             SAFE "$COMPOSE_CMD exec web ls -al /usr/share/nginx/html | tee -a \"$LOG_DIR/compose.log\""
             $COMPOSE_CMD logs web | tail -n +1 | tee -a "$LOG_DIR/compose.log" || true
             SAFE "$COMPOSE_CMD down -v"
-            echo "compose phase completed" | tee -a "$LOG_DIR/compose.log"
+            OK "compose phase done" | tee -a "$LOG_DIR/compose.log"
           fi
+
       - name: Upload compose logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -266,36 +263,38 @@ jobs:
           name: compose-logs
           path: ${{ needs.prepare.outputs.logs_dir }}
 
-  # ▶ 추가1: Podman 바인드 마운트 (mode=full에서만 시도)
   podman-run-mount:
     needs: [prepare]
-    if: ${{ needs.prepare.outputs.mode == 'full' }}
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Bootstrap (helper + dirs + podman ensure)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
-          DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
-          mkdir -p "$LOG_DIR" "$DATA_DIR"
-          source /tmp/echo_helpers.sh || true
-          ensure_podman || true
-      - name: Podman run with mount (:z SELinux demo)
+      - name: Podman mount demo (skips in demo mode)
         shell: bash
         continue-on-error: true
         run: |
-          source /tmp/echo_helpers.sh || true
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ [$(TS)] $*"; }
+          ERR(){ echo "❌ [$(TS)] $*" >&2; }
+          SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
+          ensure_podman(){
+            if command -v podman >/dev/null 2>&1; then return 0; fi
+            sudo apt-get update -y || true
+            sudo apt-get install -y podman || true
+          }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
-          if ! command -v podman >/dev/null 2>&1; then
-            echo "podman unavailable; skip" | tee -a "$LOG_DIR/podman.log"
-          else
-            SAFE "podman run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:rw,z\" docker.io/library/fedora:40 bash -lc 'ls -al /app/data | head -n 5'"
-            echo "podman phase completed" | tee -a "$LOG_DIR/podman.log"
-          fi
+          MODE="${{ needs.prepare.outputs.mode }}"
+          mkdir -p "$LOG_DIR" "$DATA_DIR"
+
+          [ "$MODE" = "full" ] || { echo "mode=demo -> skip podman" | tee -a "$LOG_DIR/podman.log"; exit 0; }
+          ensure_podman || true
+          command -v podman >/dev/null 2>&1 || { ERR "podman unavailable; skip"; exit 0; }
+
+          SAFE "podman run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:rw,z\" docker.io/library/fedora:40 bash -lc 'ls -al /app/data | head -n 5'"
+          OK "podman phase done" | tee -a "$LOG_DIR/podman.log"
+
       - name: Upload podman logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -303,59 +302,57 @@ jobs:
           name: podman-logs
           path: ${{ needs.prepare.outputs.logs_dir }}
 
-  # ▶ 추가2: NFS/SMB 네트워크 마운트 (mode=full에서만 시도, 변수 없으면 자동 SKIP)
   linux-network-mounts:
     needs: [prepare]
-    if: ${{ needs.prepare.outputs.mode == 'full' }}
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Bootstrap (helper + dirs + net tools)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
-          NET_DIR="${GITHUB_WORKSPACE}/.github/echo_net"
-          mkdir -p "$LOG_DIR" "$NET_DIR/nfs" "$NET_DIR/smb"
-          source /tmp/echo_helpers.sh || true
-          ensure_net_tools || true
-      - name: NFS mount (conditional)
+      - name: NFS/SMB mount demo (skips if demo or vars missing)
         shell: bash
         continue-on-error: true
         env:
           NFS_SERVER: ${{ vars.NFS_SERVER || secrets.NFS_SERVER }}
           NFS_EXPORT: ${{ vars.NFS_EXPORT || secrets.NFS_EXPORT }}
-        run: |
-          source /tmp/echo_helpers.sh || true
-          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
-          NET_DIR="${GITHUB_WORKSPACE}/.github/echo_net"
-          if [ -z "${NFS_SERVER:-}" ] || [ -z "${NFS_EXPORT:-}" ]; then
-            echo "NFS vars not set -> SKIP" | tee -a "$LOG_DIR/net.log"
-            exit 0
-          fi
-          SAFE "sudo mount -t nfs ${NFS_SERVER}:${NFS_EXPORT} ${NET_DIR}/nfs"
-          ls -al "${NET_DIR}/nfs" | head -n 5 | tee -a "$LOG_DIR/net.log" || true
-          SAFE "sudo umount ${NET_DIR}/nfs"
-      - name: SMB/CIFS mount (conditional)
-        shell: bash
-        continue-on-error: true
-        env:
           SMB_HOST:  ${{ vars.SMB_HOST  || secrets.SMB_HOST  }}
           SMB_SHARE: ${{ vars.SMB_SHARE || secrets.SMB_SHARE }}
           SMB_USER:  ${{ vars.SMB_USER  || secrets.SMB_USER  }}
           SMB_PASS:  ${{ vars.SMB_PASS  || secrets.SMB_PASS  }}
         run: |
-          source /tmp/echo_helpers.sh || true
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ [$(TS)] $*"; }
+          ERR(){ echo "❌ [$(TS)] $*" >&2; }
+          SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
+
+          ensure_net_tools(){
+            sudo apt-get update -y || true
+            sudo apt-get install -y nfs-common cifs-utils || true
+          }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
+          MODE="${{ needs.prepare.outputs.mode }}"
           NET_DIR="${GITHUB_WORKSPACE}/.github/echo_net"
-          if [ -z "${SMB_HOST:-}" ] || [ -z "${SMB_SHARE:-}" ] || [ -z "${SMB_USER:-}" ] || [ -z "${SMB_PASS:-}" ]; then
-            echo "SMB vars not set -> SKIP" | tee -a "$LOG_DIR/net.log"
-            exit 0
+          mkdir -p "$LOG_DIR" "$NET_DIR/nfs" "$NET_DIR/smb"
+
+          [ "$MODE" = "full" ] || { echo "mode=demo -> skip network mounts" | tee -a "$LOG_DIR/net.log"; exit 0; }
+          ensure_net_tools || true
+
+          if [ -n "${NFS_SERVER:-}" ] && [ -n "${NFS_EXPORT:-}" ]; then
+            SAFE "sudo mount -t nfs ${NFS_SERVER}:${NFS_EXPORT} ${NET_DIR}/nfs"
+            ls -al "${NET_DIR}/nfs" | head -n 5 | tee -a "$LOG_DIR/net.log" || true
+            SAFE "sudo umount ${NET_DIR}/nfs"
+          else
+            echo "NFS vars not set -> SKIP" | tee -a "$LOG_DIR/net.log"
           fi
-          SAFE "sudo mount -t cifs //${SMB_HOST}/${SMB_SHARE} ${NET_DIR}/smb -o username=${SMB_USER},password=${SMB_PASS},iocharset=utf8,file_mode=0644,dir_mode=0755"
-          ls -al "${NET_DIR}/smb" | head -n 5 | tee -a "$LOG_DIR/net.log" || true
-          SAFE "sudo umount ${NET_DIR}/smb"
+
+          if [ -n "${SMB_HOST:-}" ] && [ -n "${SMB_SHARE:-}" ] && [ -n "${SMB_USER:-}" ] && [ -n "${SMB_PASS:-}" ]; then
+            SAFE "sudo mount -t cifs //${SMB_HOST}/${SMB_SHARE} ${NET_DIR}/smb -o username=${SMB_USER},password=${SMB_PASS},iocharset=utf8,file_mode=0644,dir_mode=0755"
+            ls -al "${NET_DIR}/smb" | head -n 5 | tee -a "$LOG_DIR/net.log" || true
+            SAFE "sudo umount ${NET_DIR}/smb"
+          else
+            echo "SMB vars not set -> SKIP" | tee -a "$LOG_DIR/net.log"
+          fi
+
       - name: Upload network mount logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -365,22 +362,19 @@ jobs:
 
   k8s-manifests:
     needs: [prepare]
-    if: ${{ needs.prepare.outputs.do_k8s == 'true' }}
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Bootstrap (helper + dirs per job)
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p "${{ needs.prepare.outputs.logs_dir }}" "${{ needs.prepare.outputs.data_dir }}"
-          cat /tmp/echo_helpers.sh >/dev/null 2>&1 || exit 0
-      - name: Generate K8s manifests
+      - name: Generate K8s manifests (guarded)
         shell: bash
         continue-on-error: true
         run: |
-          set -Eeuo pipefail
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ [$(TS)] $*"; }
+          ERR(){ echo "❌ [$(TS)] $*" >&2; }
+          DO_K8S="${{ needs.prepare.outputs.do_k8s }}"
+          [ "$DO_K8S" = "true" ] || { echo "k8s disabled -> skip"; exit 0; }
           OUT=".github/k8s"
           mkdir -p "$OUT"
           cat > "$OUT/hostpath-pod.yaml" <<'YAML'
@@ -435,6 +429,8 @@ jobs:
                     persistentVolumeClaim:
                       claimName: app-pvc
           YAML
+          OK "k8s manifests generated"
+
       - name: Upload K8s manifests
         if: always()
         uses: actions/upload-artifact@v4
@@ -448,7 +444,7 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Symlink/Junction with robust fallback (Windows)
+      - name: Symlink/Junction with multi-fallback (guarded listing)
         shell: powershell
         continue-on-error: true
         run: |
@@ -457,10 +453,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
           New-Item -ItemType Directory -Force -Path "$DataDir" | Out-Null
           Set-Content -Path (Join-Path $DataDir "host_hello_windows.txt") -Value "hi from windows host"
+
           $Parent = Split-Path -Parent $DataDir
           $Name   = (Split-Path -Leaf $DataDir) + ".link"
           $Link   = Join-Path $Parent $Name
           if (Test-Path $Link) { Remove-Item $Link -Recurse -Force }
+
           $linkCreated = $false
           try {
             New-Item -ItemType SymbolicLink -Path $Link -Target $DataDir -Force -ErrorAction Stop | Out-Null
@@ -476,18 +474,12 @@ jobs:
               if (Test-Path $CopyTarget) { $linkCreated = $true; $Link = $CopyTarget }
             }
           }
+
           $LogFile = Join-Path $LogDir "windows-link.log"
           if (Test-Path $Link) {
             Get-ChildItem $Link | Out-String | Tee-Object -FilePath $LogFile
           } else {
             "link not created (all methods failed): $Link" | Tee-Object -FilePath $LogFile
-          }
-      - name: Upload windows logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-link-logs
-          path: ${{ needs.prepare.outputs.logs_dir }}
 
   finalize:
     needs:
@@ -495,16 +487,15 @@ jobs:
       - linux-bind-mount
       - docker-run-mount
       - compose-mount
-      - k8s-manifests
-      - windows-link
       - podman-run-mount
       - linux-network-mounts
+      - k8s-manifests
+      - windows-link
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
-      - name: Force success (log summary)
+      - name: Force success (summary)
         if: always()
         shell: bash
         run: |
-          echo "✅ Mount Master completed (forced success)."
-          echo "Some steps may have logged errors, but workflow is marked successful by design."
+          echo "✅ Mount Master completed. Errors may be logged above, but workflow stayed green by design."
