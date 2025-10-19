@@ -12,12 +12,6 @@ on:
         type: choice
         default: "fastapi"
         options: ["fastapi", "springboot", "node-express"]
-      run_security:
-        type: boolean
-        default: true
-      run_docs:
-        type: boolean
-        default: true
       dirs_root:
         default: ".github/echo_dirs"
       dirs_count:
@@ -134,8 +128,14 @@ jobs:
             force_success=true
           else
             mode="${{ github.event.inputs.mode || 'full' }}"
-            run_security="${{ github.event.inputs.run_security || 'true' }}"
-            run_docs="${{ github.event.inputs.run_docs || 'true' }}"
+            # run_security / run_docs는 mode에서 파생
+            if [ "$mode" = "lite" ]; then
+              run_security=false
+              run_docs=false
+            else
+              run_security=true
+              run_docs=true
+            fi
             install_servers="${{ github.event.inputs.install_servers || 'true' }}"
             framework="${{ github.event.inputs.framework || 'fastapi' }}"
             dirs_root="${{ github.event.inputs.dirs_root || '.github/echo_dirs' }}"
@@ -189,7 +189,7 @@ jobs:
           summarize(){ n=$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0); echoe "단계 완료 (실패 ${n}건 기록, 계속 진행)."; }
           SH
           chmod +x /tmp/safe_run.sh
-          # TimeGuard: 단계 시작시각 기록 + 남은 시간 계산
+          # TimeGuard
           cat > /tmp/time_guard.sh <<'TG'
           #!/usr/bin/env bash
           set -Eeuo pipefail
@@ -199,16 +199,11 @@ jobs:
           NOW=$(date +%s)
           ELAPSED=$(( (NOW-START)/60 ))
           BUDGET_MIN=${1:-15}
-          if [ "$ELAPSED" -ge "$BUDGET_MIN" ]; then
-            echo "skip"
-          else
-            echo "ok"
-          fi
+          if [ "$ELAPSED" -ge "$BUDGET_MIN" ]; then echo "skip"; else echo "ok"; fi
           TG
           chmod +x /tmp/time_guard.sh
           echo "ok=1" >> "$GITHUB_OUTPUT"
 
-      # 디렉토리/파일(경량화 가능)
       - name: Directories & Files
         shell: bash
         run: |
@@ -362,7 +357,7 @@ jobs:
           fi
           git status --porcelain | tee ${LOG_DIR}/bulk_changes.txt || true
 
-      # 보안 작업: 크론(lite)에서는 스킵
+      # 보안 작업: 크론(lite) 또는 mode=lite에선 자동 스킵(이미 prep.outputs로 계산됨)
       - name: SBOM (Syft) — skip on cron-lite
         if: ${{ needs.prep.outputs.run_security == 'true' || needs.prep.outputs.run_security == 'True' }}
         shell: bash
@@ -396,8 +391,8 @@ jobs:
         shell: bash
         run: |
           source /tmp/safe_run.sh || true
-          # Python (quick)
           if [ "${DO_LANG_UPGRADE}" = "true" ]; then
+            # Python (quick)
             if [ "${PY_UPGRADE_STRATEGY}" = "uv" ]; then
               python3 -m pip -q install -U uv || true
               shopt -s globstar nullglob
@@ -435,7 +430,7 @@ jobs:
           overwrite: false
           include-hidden-files: true
 
-      # 선택 릴리즈/퍼블리시: 수동(full)만 쓰도록 권장
+      # 선택 릴리즈/퍼블리시
       - name: Release/Publish (optional)
         if: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.do_release == 'true' || github.event.inputs.do_release == true) }}
         shell: bash
@@ -458,8 +453,6 @@ jobs:
         run: |
           echo "## ✅ 파이프라인 완료 (분할·크론라이트·타임가드·세이프컨티뉴)" >> "$GITHUB_STEP_SUMMARY"
           echo "- 모드: ${{ needs.prep.outputs.mode }} / 프레임워크: ${{ needs.prep.outputs.framework }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 크론: run_security=${{ needs.prep.outputs.run_security }} run_docs=${{ needs.prep.outputs.run_docs }} install_servers=${{ needs.prep.outputs.install_servers }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- 디렉토리/파일: ${{
-            needs.prep.outputs.dirs_root }} (x${{ needs.prep.outputs.dirs_count }}), ${{
-            needs.prep.outputs.files_root }} (x${{ needs.prep.outputs.files_count }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 크론/모드 파생: run_security=${{ needs.prep.outputs.run_security }} run_docs=${{ needs.prep.outputs.run_docs }} install_servers=${{ needs.prep.outputs.install_servers }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 디렉토리/파일: ${{ needs.prep.outputs.dirs_root }} (x${{ needs.prep.outputs.dirs_count }}), ${{ needs.prep.outputs.files_root }} (x${{ needs.prep.outputs.files_count }})" >> "$GITHUB_STEP_SUMMARY"
           echo "- 아티팩트: vibe-artifacts" >> "$GITHUB_STEP_SUMMARY"
