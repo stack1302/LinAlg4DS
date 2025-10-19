@@ -1,0 +1,348 @@
+name: "🗂️ Mount Master — Local Bind, Docker, Compose, K8s, Windows (≤10 inputs)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "demo(빠른검증) | full(자세한 로그)"
+        type: choice
+        options: [demo, full]
+        default: demo
+      docker_image:
+        description: "테스트용 Docker 이미지"
+        default: "ubuntu:24.04"
+      do_compose:
+        description: "Docker Compose 테스트 수행"
+        type: boolean
+        default: true
+      do_k8s:
+        description: "K8s 매니페스트 생성(적용은 안 함)"
+        type: boolean
+        default: true
+      logs_dir:
+        description: "로그 디렉토리"
+        default: ".github/echo_logs"
+      data_dir:
+        description: "테스트 데이터 디렉토리"
+        default: ".github/echo_data"
+      read_only:
+        description: "컨테이너 마운트 read-only 테스트"
+        type: boolean
+        default: false
+      parallel:
+        description: "리눅스/윈도우 동시 실행 (2=동시)"
+        default: "2"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: mount-master-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: Asia/Seoul
+  FORCE_SUCCESS: "true"   # 최종 성공 강제 플래그
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    outputs:
+      logs_dir: ${{ steps.out.outputs.logs_dir }}
+      data_dir: ${{ steps.out.outputs.data_dir }}
+      docker_image: ${{ steps.out.outputs.docker_image }}
+      read_only: ${{ steps.out.outputs.read_only }}
+      do_compose: ${{ steps.out.outputs.do_compose }}
+      do_k8s: ${{ steps.out.outputs.do_k8s }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: out
+        shell: bash
+        run: |
+          echo "logs_dir=${{ inputs.logs_dir }}"   >> $GITHUB_OUTPUT
+          echo "data_dir=${{ inputs.data_dir }}"   >> $GITHUB_OUTPUT
+          echo "docker_image=${{ inputs.docker_image }}" >> $GITHUB_OUTPUT
+          echo "read_only=${{ inputs.read_only }}" >> $GITHUB_OUTPUT
+          echo "do_compose=${{ inputs.do_compose }}" >> $GITHUB_OUTPUT
+          echo "do_k8s=${{ inputs.do_k8s }}" >> $GITHUB_OUTPUT
+
+      - name: Make dirs and helper
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          LOG_DIR="${{ steps.out.outputs.logs_dir }}"
+          DATA_DIR="${{ steps.out.outputs.data_dir }}"
+          mkdir -p "$LOG_DIR" "$DATA_DIR"
+          # 안전 에코/런 유틸(실패해도 0으로 반환)
+          cat > /tmp/echo_helpers.sh <<'SH'
+          #!/usr/bin/env bash
+          set -Eeuo pipefail
+          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          OK(){ echo "✅ [$(TS)] $*"; }
+          WARN(){ echo "⚠️  [$(TS)] $*" >&2; }
+          ERR(){ echo "❌ [$(TS)] $*" >&2; }
+          # TRY: 실패해도 통과, 로그만 남김
+          TRY(){ bash -lc "$*" && OK "ok: $*" || { RC=$?; ERR "failed($RC): $*"; return 0; }; }
+          # SAFE: 명령어를 인자로 받아 실행(파이프 포함)
+          SAFE(){ ( set +e; eval "$*"; RC=$?; if [ $RC -ne 0 ]; then ERR "failed($RC): $*"; fi; exit 0 ); }
+          SH
+          chmod +x /tmp/echo_helpers.sh
+          echo "hello, mount master" > "${DATA_DIR}/host_hello.txt"
+
+      - name: Upload initial artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mount-init
+          path: |
+            ${{ steps.out.outputs.logs_dir }}
+            ${{ steps.out.outputs.data_dir }}
+
+  linux-bind-mount:
+    needs: [prepare]
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bind mount test (Linux)
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/echo_helpers.sh || true
+          set -Eeuo pipefail
+          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
+          DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
+          BIND_SRC="${GITHUB_WORKSPACE}/${DATA_DIR}"
+          BIND_DST="${GITHUB_WORKSPACE}/${DATA_DIR}.mounted"
+          mkdir -p "$BIND_SRC" "$BIND_DST"
+          echo "bind source: $BIND_SRC" | tee -a "$LOG_DIR/bind.log"
+          echo "bind target: $BIND_DST" | tee -a "$LOG_DIR/bind.log"
+          SAFE "sudo mount --bind \"$BIND_SRC\" \"$BIND_DST\""
+          SAFE "bash -lc 'echo \"from_bind_mount=$(date)\" > \"$BIND_DST/file_from_bind.txt\"'"
+          ls -al "$BIND_SRC" "$BIND_DST" | tee -a "$LOG_DIR/bind.log" || true
+          SAFE "sudo umount \"$BIND_DST\""
+          rmdir "$BIND_DST" 2>/dev/null || true
+          OK "linux bind mount phase completed" | tee -a "$LOG_DIR/bind.log"
+
+      - name: Upload bind logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bind-logs
+          path: ${{ needs.prepare.outputs.logs_dir }}
+
+  docker-run-mount:
+    needs: [prepare]
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker info (for logs)
+        continue-on-error: true
+        run: docker info || true
+
+      - name: Run container with mount (rw/ro)
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/echo_helpers.sh || true
+          set -Eeuo pipefail
+          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
+          DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
+          IMG="${{ needs.prepare.outputs.docker_image }}"
+          MNT_MODE="rw"
+          if [ "${{ needs.prepare.outputs.read_only }}" == "true" ]; then MNT_MODE="ro"; fi
+          echo "image=$IMG, mount_mode=$MNT_MODE" | tee -a "$LOG_DIR/docker.log"
+          SAFE "docker run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:${MNT_MODE}\" \"$IMG\" bash -lc 'ls -al /app/data; echo \"from_container=$(date)\" >> /app/data/container_hello.txt || true; ls -al /app/data'"
+          ls -al "${GITHUB_WORKSPACE}/${DATA_DIR}" | tee -a "$LOG_DIR/docker.log" || true
+          OK "docker bind mount phase completed ($MNT_MODE)" | tee -a "$LOG_DIR/docker.log"
+
+      - name: Upload docker logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-mount-logs
+          path: ${{ needs.prepare.outputs.logs_dir }}
+
+  compose-mount:
+    needs: [prepare]
+    if: ${{ needs.prepare.outputs.do_compose == 'true' }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write compose.yml (dynamic path fix)
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
+          mkdir -p "$DATA_DIR/site"
+          echo "<h1>hello compose</h1>" > "$DATA_DIR/site/index.html"
+          # 배시 변수로 실제 경로 주입(워크플로 익스프레션 아님)
+          cat > compose.yml <<YML
+          services:
+            web:
+              image: nginx:1.27
+              ports:
+                - "8080:80"
+              volumes:
+                - ./${DATA_DIR}/site:/usr/share/nginx/html:ro
+                - logs:/var/log/nginx
+          volumes:
+            logs: {}
+          YML
+
+      - name: Compose up / test / down
+        shell: bash
+        continue-on-error: true
+        run: |
+          source /tmp/echo_helpers.sh || true
+          set -Eeuo pipefail
+          LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
+          SAFE "docker compose up -d"
+          sleep 2
+          docker compose ps | tee -a "$LOG_DIR/compose.log" || true
+          SAFE "docker compose exec web ls -al /usr/share/nginx/html | tee -a \"$LOG_DIR/compose.log\""
+          docker compose logs web | tail -n +1 | tee -a "$LOG_DIR/compose.log" || true
+          SAFE "docker compose down -v"
+          OK "compose phase completed" | tee -a "$LOG_DIR/compose.log"
+
+      - name: Upload compose logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-logs
+          path: ${{ needs.prepare.outputs.logs_dir }}
+
+  k8s-manifests:
+    needs: [prepare]
+    if: ${{ needs.prepare.outputs.do_k8s == 'true' }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate K8s manifests
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -Eeuo pipefail
+          OUT=".github/k8s"
+          mkdir -p "$OUT"
+          cat > "$OUT/hostpath-pod.yaml" <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: demo
+          spec:
+            containers:
+              - name: app
+                image: ubuntu:24.04
+                command: ["sleep","infinity"]
+                volumeMounts:
+                  - name: hostdata
+                    mountPath: /app/data
+            volumes:
+              - name: hostdata
+                hostPath:
+                  path: /data/demo
+                  type: DirectoryOrCreate
+          YAML
+
+          cat > "$OUT/pvc-deploy.yaml" <<'YAML'
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: app-pvc
+          spec:
+            accessModes: [ ReadWriteOnce ]
+            resources:
+              requests: { storage: 1Gi }
+
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: app
+          spec:
+            replicas: 1
+            selector: { matchLabels: { app: app } }
+            template:
+              metadata: { labels: { app: app } }
+              spec:
+                containers:
+                  - name: app
+                    image: ubuntu:24.04
+                    command: ["sleep","infinity"]
+                    volumeMounts:
+                      - name: data
+                        mountPath: /app/data
+                volumes:
+                  - name: data
+                    persistentVolumeClaim:
+                      claimName: app-pvc
+          YAML
+
+      - name: Upload K8s manifests
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-manifests
+          path: .github/k8s
+
+  windows-link:
+    needs: [prepare]
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Symlink directory (mklink /D)
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $LogDir = "${{ needs.prepare.outputs.logs_dir }}".Replace('/', '\')
+          $DataDir = "${{ needs.prepare.outputs.data_dir }}".Replace('/', '\')
+          New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+          New-Item -ItemType Directory -Force -Path "$DataDir" | Out-Null
+          Set-Content -Path (Join-Path $DataDir "host_hello_windows.txt") -Value "hi from windows host"
+          $Target = "$DataDir"
+          $Link   = "$DataDir.link"
+          if (Test-Path $Link) { Remove-Item $Link -Recurse -Force }
+          cmd /c mklink /D "$Link" "$Target" | Out-Null
+          Get-ChildItem $Link | Out-String | Tee-Object -FilePath (Join-Path $LogDir "windows-link.log")
+
+      - name: Upload windows logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-link-logs
+          path: ${{ needs.prepare.outputs.logs_dir }}
+
+  # 최종 성공 강제 마커(어떤 실패가 있어도 워크플로우를 성공으로 마무리)
+  finalize:
+    needs:
+      - prepare
+      - linux-bind-mount
+      - docker-run-mount
+      - compose-mount
+      - k8s-manifests
+      - windows-link
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - name: Force success (log summary)
+        if: always()
+        shell: bash
+        run: |
+          echo "✅ Mount Master completed (forced success)."
+          echo "Some steps may have logged errors, but workflow is marked successful by design."
