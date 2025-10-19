@@ -32,9 +32,13 @@ on:
       parallel:
         description: "리눅스/윈도우 동시 실행 (2=동시)"
         default: "2"
+      do_release:
+        description: "서비스별 릴리즈 생성/업로드"
+        type: boolean
+        default: true
 
 permissions:
-  contents: read
+  contents: write          # 릴리즈 업로드에 필요
   id-token: write
 
 concurrency:
@@ -56,19 +60,21 @@ jobs:
       do_compose: ${{ steps.out.outputs.do_compose }}
       do_k8s: ${{ steps.out.outputs.do_k8s }}
       mode: ${{ steps.out.outputs.mode }}
+      do_release: ${{ steps.out.outputs.do_release }}
     steps:
       - uses: actions/checkout@v4
 
       - id: out
         shell: bash
         run: |
-          echo "logs_dir=${{ inputs.logs_dir }}"       >> $GITHUB_OUTPUT
-          echo "data_dir=${{ inputs.data_dir }}"       >> $GITHUB_OUTPUT
+          echo "logs_dir=${{ inputs.logs_dir }}"         >> $GITHUB_OUTPUT
+          echo "data_dir=${{ inputs.data_dir }}"         >> $GITHUB_OUTPUT
           echo "docker_image=${{ inputs.docker_image }}" >> $GITHUB_OUTPUT
-          echo "read_only=${{ inputs.read_only }}"     >> $GITHUB_OUTPUT
-          echo "do_compose=${{ inputs.do_compose }}"   >> $GITHUB_OUTPUT
-          echo "do_k8s=${{ inputs.do_k8s }}"           >> $GITHUB_OUTPUT
-          echo "mode=${{ inputs.mode }}"               >> $GITHUB_OUTPUT
+          echo "read_only=${{ inputs.read_only }}"       >> $GITHUB_OUTPUT
+          echo "do_compose=${{ inputs.do_compose }}"     >> $GITHUB_OUTPUT
+          echo "do_k8s=${{ inputs.do_k8s }}"             >> $GITHUB_OUTPUT
+          echo "mode=${{ inputs.mode }}"                 >> $GITHUB_OUTPUT
+          echo "do_release=${{ inputs.do_release }}"     >> $GITHUB_OUTPUT
 
       - name: Ensure base dirs and seed file
         shell: bash
@@ -90,16 +96,15 @@ jobs:
             ${{ steps.out.outputs.data_dir }}
 
   linux-bind-mount:
-    needs: [prepare]
+    needs: prepare
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Local bind mount with robust fallbacks
         shell: bash
-        continue-on-error: true
         run: |
-          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          TS(){ date -u "+%Y%m%dT%H%M%SZ"; }
           OK(){ echo "✅ [$(TS)] $*"; }
           ERR(){ echo "❌ [$(TS)] $*" >&2; }
           SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
@@ -114,7 +119,7 @@ jobs:
 
           SAFE "sudo mount --bind \"$SRC\" \"$DST\""
           if mountpoint -q "$DST"; then
-            echo "from_bind_mount=$(date)" > "$DST/file_from_bind.txt" || true
+            echo "from_bind_mount=$(date -u)" > "$DST/file_from_bind.txt" || true
             ls -al "$SRC" "$DST" | tee -a "$LOG_DIR/bind.log" || true
             SAFE "sudo umount \"$DST\""
             rmdir "$DST" || true
@@ -122,7 +127,7 @@ jobs:
           else
             ln -s "$SRC" "$DST" 2>/dev/null || true
             if [ -L "$DST" ]; then
-              echo "from_symlink=$(date)" > "$SRC/file_from_symlink.txt" || true
+              echo "from_symlink=$(date -u)" > "$SRC/file_from_symlink.txt" || true
               ls -al "$SRC" "$DST" | tee -a "$LOG_DIR/bind.log" || true
               rm -f "$DST" || true
               OK "bind fallback: symlink" | tee -a "$LOG_DIR/bind.log"
@@ -134,71 +139,78 @@ jobs:
             fi
           fi
 
-      - name: Upload bind logs
+      - name: Package linux logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release/linux && cp -a "${{ needs.prepare.outputs.logs_dir }}/." .release/linux/ 2>/dev/null || true
+          cd .release && zip -r linux-bind.zip linux >/dev/null 2>&1 || true
+
+      - name: Upload artifact (linux)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-bind-logs
-          path: ${{ needs.prepare.outputs.logs_dir }}
+          name: release-linux
+          path: .release/linux-bind.zip
 
   docker-run-mount:
-    needs: [prepare]
+    needs: prepare
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: Run Docker with mount (auto-install & SELinux labels guarded)
+      - name: Run Docker with mount
         shell: bash
-        continue-on-error: true
         run: |
-          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          TS(){ date -u "+%Y%m%dT%H%M%SZ"; }
           OK(){ echo "✅ [$(TS)] $*"; }
           ERR(){ echo "❌ [$(TS)] $*" >&2; }
           SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
-          ensure_docker(){
-            if command -v docker >/dev/null 2>&1; then return 0; fi
-            sudo apt-get update -y || true
-            sudo apt-get install -y docker.io || true
-          }
+          ensure_docker(){ command -v docker >/dev/null 2>&1 && return 0 || { sudo apt-get update -y || true; sudo apt-get install -y docker.io || true; }; }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
           IMG="${{ needs.prepare.outputs.docker_image }}"
           MNT_MODE="rw"; [ "${{ needs.prepare.outputs.read_only }}" = "true" ] && MNT_MODE="ro"
           mkdir -p "$LOG_DIR" "$DATA_DIR"
+
           ensure_docker || true
           docker info >/dev/null 2>&1 || { ERR "docker unavailable; skip container test"; exit 0; }
+
           echo "image=$IMG, mount_mode=$MNT_MODE" | tee -a "$LOG_DIR/docker.log"
-          SAFE "docker run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:${MNT_MODE}\" \"$IMG\" bash -lc 'ls -al /app/data; echo \"from_container=$(date)\" >> /app/data/container_hello.txt || true; ls -al /app/data'"
+          SAFE "docker run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:${MNT_MODE}\" \"$IMG\" bash -lc 'ls -al /app/data; echo \"from_container=$(date -u)\" >> /app/data/container_hello.txt || true; ls -al /app/data'"
           SAFE "docker run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:${MNT_MODE},z\" \"$IMG\" bash -lc 'ls -al /app/data | head -n 5'"
           ls -al "${GITHUB_WORKSPACE}/${DATA_DIR}" | tee -a "$LOG_DIR/docker.log" || true
           OK "docker phase done ($MNT_MODE)" | tee -a "$LOG_DIR/docker.log"
 
-      - name: Upload docker logs
+      - name: Package docker logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release/docker && cp -a "${{ needs.prepare.outputs.logs_dir }}/." .release/docker/ 2>/dev/null || true
+          cd .release && zip -r docker-mount.zip docker >/dev/null 2>&1 || true
+
+      - name: Upload artifact (docker)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: docker-mount-logs
-          path: ${{ needs.prepare.outputs.logs_dir }}
+          name: release-docker
+          path: .release/docker-mount.zip
 
   compose-mount:
-    needs: [prepare]
+    needs: prepare
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Compose up/test/down with auto compose detection
         shell: bash
-        continue-on-error: true
         run: |
-          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          TS(){ date -u "+%Y%m%dT%H%M%SZ"; }
           OK(){ echo "✅ [$(TS)] $*"; }
           ERR(){ echo "❌ [$(TS)] $*" >&2; }
           SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
-          ensure_docker(){
-            if command -v docker >/dev/null 2>&1; then return 0; fi
-            sudo apt-get update -y || true
-            sudo apt-get install -y docker.io || true
-          }
+          ensure_docker(){ command -v docker >/dev/null 2>&1 && return 0 || { sudo apt-get update -y || true; sudo apt-get install -y docker.io || true; }; }
           ensure_compose(){
             if docker compose version >/dev/null 2>&1; then echo "docker compose"; return 0; fi
             if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; return 0; fi
@@ -208,14 +220,18 @@ jobs:
             if command -v docker-compose >/dev/null 2>&1; then echo "docker-compose"; return 0; fi
             echo ""
           }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
           DO_COMPOSE="${{ needs.prepare.outputs.do_compose }}"
           mkdir -p "$LOG_DIR" "$DATA_DIR/site"
           echo "<h1>hello compose</h1>" > "$DATA_DIR/site/index.html"
+
           [ "$DO_COMPOSE" = "true" ] || { echo "compose disabled -> skip" | tee -a "$LOG_DIR/compose.log"; exit 0; }
+
           ensure_docker || true
           docker info >/dev/null 2>&1 || { ERR "docker unavailable; skip compose test"; exit 0; }
+
           cat > compose.yml <<YML
           services:
             web:
@@ -228,6 +244,7 @@ jobs:
           volumes:
             logs: {}
           YML
+
           COMPOSE_CMD=$(ensure_compose)
           if [ -z "$COMPOSE_CMD" ]; then
             ERR "compose unavailable; skipping"
@@ -241,111 +258,124 @@ jobs:
             OK "compose phase done" | tee -a "$LOG_DIR/compose.log"
           fi
 
-      - name: Upload compose logs
+      - name: Package compose logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release/compose && cp -a "${{ needs.prepare.outputs.logs_dir }}/." .release/compose/ 2>/dev/null || true
+          cd .release && zip -r compose-logs.zip compose >/dev/null 2>&1 || true
+
+      - name: Upload artifact (compose)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: compose-logs
-          path: ${{ needs.prepare.outputs.logs_dir }}
+          name: release-compose
+          path: .release/compose-logs.zip
 
   podman-run-mount:
-    needs: [prepare]
+    needs: prepare
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Podman mount demo (skips in demo mode)
         shell: bash
-        continue-on-error: true
         run: |
-          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          TS(){ date -u "+%Y%m%dT%H%M%SZ"; }
           OK(){ echo "✅ [$(TS)] $*"; }
           ERR(){ echo "❌ [$(TS)] $*" >&2; }
           SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
-          ensure_podman(){
-            if command -v podman >/dev/null 2>&1; then return 0; fi
-            sudo apt-get update -y || true
-            sudo apt-get install -y podman || true
-          }
+          ensure_podman(){ command -v podman >/dev/null 2>&1 && return 0 || { sudo apt-get update -y || true; sudo apt-get install -y podman || true; }; }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           DATA_DIR="${{ needs.prepare.outputs.data_dir }}"
           MODE="${{ needs.prepare.outputs.mode }}"
           mkdir -p "$LOG_DIR" "$DATA_DIR"
+
           [ "$MODE" = "full" ] || { echo "mode=demo -> skip podman" | tee -a "$LOG_DIR/podman.log"; exit 0; }
           ensure_podman || true
           command -v podman >/dev/null 2>&1 || { ERR "podman unavailable; skip"; exit 0; }
+
           SAFE "podman run --rm -i -v \"${GITHUB_WORKSPACE}/${DATA_DIR}:/app/data:rw,z\" docker.io/library/fedora:40 bash -lc 'ls -al /app/data | head -n 5'"
           OK "podman phase done" | tee -a "$LOG_DIR/podman.log"
 
-      - name: Upload podman logs
+      - name: Package podman logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release/podman && cp -a "${{ needs.prepare.outputs.logs_dir }}/." .release/podman/ 2>/dev/null || true
+          cd .release && zip -r podman-logs.zip podman >/dev/null 2>&1 || true
+
+      - name: Upload artifact (podman)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: podman-logs
-          path: ${{ needs.prepare.outputs.logs_dir }}
+          name: release-podman
+          path: .release/podman-logs.zip
 
   linux-network-mounts:
-    needs: [prepare]
+    needs: prepare
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: NFS/SMB mount demo (skips if demo or vars missing)
         shell: bash
-        continue-on-error: true
-        env:
-          NFS_SERVER: ${{ vars.NFS_SERVER || secrets.NFS_SERVER }}
-          NFS_EXPORT: ${{ vars.NFS_EXPORT || secrets.NFS_EXPORT }}
-          SMB_HOST:  ${{ vars.SMB_HOST  || secrets.SMB_HOST  }}
-          SMB_SHARE: ${{ vars.SMB_SHARE || secrets.SMB_SHARE }}
-          SMB_USER:  ${{ vars.SMB_USER  || secrets.SMB_USER  }}
-          SMB_PASS:  ${{ vars.SMB_PASS  || secrets.SMB_PASS  }}
         run: |
-          TS(){ date "+%Y-%m-%d %H:%M:%S%z"; }
+          TS(){ date -u "+%Y%m%dT%H%M%SZ"; }
           OK(){ echo "✅ [$(TS)] $*"; }
           ERR(){ echo "❌ [$(TS)] $*" >&2; }
           SAFE(){ ( set +e; eval "$*"; rc=$?; if [ $rc -ne 0 ]; then ERR "failed($rc): $*"; fi; exit 0 ); }
-          ensure_net_tools(){
-            sudo apt-get update -y || true
-            sudo apt-get install -y nfs-common cifs-utils || true
-          }
+          ensure_net_tools(){ sudo apt-get update -y || true; sudo apt-get install -y nfs-common cifs-utils || true; }
+
           LOG_DIR="${{ needs.prepare.outputs.logs_dir }}"
           MODE="${{ needs.prepare.outputs.mode }}"
           NET_DIR="${GITHUB_WORKSPACE}/.github/echo_net"
           mkdir -p "$LOG_DIR" "$NET_DIR/nfs" "$NET_DIR/smb"
+
           [ "$MODE" = "full" ] || { echo "mode=demo -> skip network mounts" | tee -a "$LOG_DIR/net.log"; exit 0; }
           ensure_net_tools || true
-          if [ -n "${NFS_SERVER:-}" ] && [ -n "${NFS_EXPORT:-}" ]; then
-            SAFE "sudo mount -t nfs ${NFS_SERVER}:${NFS_EXPORT} ${NET_DIR}/nfs"
+
+          # NFS
+          if [ -n "${{ vars.NFS_SERVER || secrets.NFS_SERVER }}" ] && [ -n "${{ vars.NFS_EXPORT || secrets.NFS_EXPORT }}" ]; then
+            SAFE "sudo mount -t nfs ${{ vars.NFS_SERVER || secrets.NFS_SERVER }}:${{ vars.NFS_EXPORT || secrets.NFS_EXPORT }} ${NET_DIR}/nfs"
             ls -al "${NET_DIR}/nfs" | head -n 5 | tee -a "$LOG_DIR/net.log" || true
             SAFE "sudo umount ${NET_DIR}/nfs"
           else
             echo "NFS vars not set -> SKIP" | tee -a "$LOG_DIR/net.log"
           fi
-          if [ -n "${SMB_HOST:-}" ] && [ -n "${SMB_SHARE:-}" ] && [ -n "${SMB_USER:-}" ] && [ -n "${SMB_PASS:-}" ]; then
-            SAFE "sudo mount -t cifs //${SMB_HOST}/${SMB_SHARE} ${NET_DIR}/smb -o username=${SMB_USER},password=${SMB_PASS},iocharset=utf8,file_mode=0644,dir_mode=0755"
+
+          # SMB
+          if [ -n "${{ vars.SMB_HOST  || secrets.SMB_HOST  }}" ] && [ -n "${{ vars.SMB_SHARE || secrets.SMB_SHARE }}" ] && [ -n "${{ vars.SMB_USER  || secrets.SMB_USER  }}" ] && [ -n "${{ vars.SMB_PASS  || secrets.SMB_PASS  }}" ]; then
+            SAFE "sudo mount -t cifs //${{ vars.SMB_HOST  || secrets.SMB_HOST  }}/${{ vars.SMB_SHARE || secrets.SMB_SHARE }} ${NET_DIR}/smb -o username=${{ vars.SMB_USER || secrets.SMB_USER }},password=${{ vars.SMB_PASS || secrets.SMB_PASS }},iocharset=utf8,file_mode=0644,dir_mode=0755"
             ls -al "${NET_DIR}/smb" | head -n 5 | tee -a "$LOG_DIR/net.log" || true
             SAFE "sudo umount ${NET_DIR}/smb"
           else
             echo "SMB vars not set -> SKIP" | tee -a "$LOG_DIR/net.log"
           fi
 
-      - name: Upload network mount logs
+      - name: Package network logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release/network && cp -a "${{ needs.prepare.outputs.logs_dir }}/." .release/network/ 2>/dev/null || true
+          cd .release && zip -r network-logs.zip network >/dev/null 2>&1 || true
+
+      - name: Upload artifact (network)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: net-mount-logs
-          path: ${{ needs.prepare.outputs.logs_dir }}
+          name: release-network
+          path: .release/network-logs.zip
 
   k8s-manifests:
-    needs: [prepare]
+    needs: prepare
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Generate K8s manifests (guarded)
         shell: bash
-        continue-on-error: true
         run: |
           DO_K8S="${{ needs.prepare.outputs.do_k8s }}"
           [ "$DO_K8S" = "true" ] || { echo "k8s disabled -> skip"; exit 0; }
@@ -404,22 +434,28 @@ jobs:
                       claimName: app-pvc
           YAML
 
-      - name: Upload K8s manifests
+      - name: Package k8s manifests
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release/k8s && cp -a .github/k8s/. .release/k8s/ 2>/dev/null || true
+          cd .release && zip -r k8s-manifests.zip k8s >/dev/null 2>&1 || true
+
+      - name: Upload artifact (k8s)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: k8s-manifests
-          path: .github/k8s
+          name: release-k8s
+          path: .release/k8s-manifests.zip
 
   windows-link:
-    needs: [prepare]
+    needs: prepare
     runs-on: windows-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - name: Symlink/Junction with multi-fallback (fixed braces)
         shell: powershell
-        continue-on-error: true
         run: |
           $ErrorActionPreference = "Continue"
           $LogDir = "${{ needs.prepare.outputs.logs_dir }}".Replace('/', '\')
@@ -457,14 +493,22 @@ jobs:
             "link not created (all methods failed): $Link" | Tee-Object -FilePath $LogFile | Out-Null
           }
 
-      - name: Upload windows logs
+      - name: Package windows logs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p .release/windows && cp -a "${{ needs.prepare.outputs.logs_dir }}/." .release/windows/ 2>/dev/null || true
+          cd .release && zip -r windows-link.zip windows >/dev/null 2>&1 || true
+
+      - name: Upload artifact (windows)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-link-logs
-          path: ${{ needs.prepare.outputs.logs_dir }}
+          name: release-windows
+          path: .release/windows-link.zip
 
-  finalize:
+  # ▶ 서비스별 릴리즈 생성: 매트릭스로 개별 Release 생성/업로드
+  service-releases:
     needs:
       - prepare
       - linux-bind-mount
@@ -474,11 +518,71 @@ jobs:
       - linux-network-mounts
       - k8s-manifests
       - windows-link
+    if: ${{ needs.prepare.outputs.do_release == 'true' }}
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - { name: "linux",   artifact: "release-linux",   zip: "linux-bind.zip" }
+          - { name: "docker",  artifact: "release-docker",  zip: "docker-mount.zip" }
+          - { name: "compose", artifact: "release-compose", zip: "compose-logs.zip" }
+          - { name: "podman",  artifact: "release-podman",  zip: "podman-logs.zip" }
+          - { name: "network", artifact: "release-network", zip: "network-logs.zip" }
+          - { name: "k8s",     artifact: "release-k8s",     zip: "k8s-manifests.zip" }
+          - { name: "windows", artifact: "release-windows", zip: "windows-link.zip" }
+    steps:
+      - name: Make timestamp/tag
+        id: stamp
+        shell: bash
+        run: |
+          TS=$(date -u "+%Y%m%dT%H%M%SZ")
+          echo "ts=$TS" >> $GITHUB_OUTPUT
+          echo "tag=mount-${{ matrix.service.name }}-$TS" >> $GITHUB_OUTPUT
+          echo "name=Mount ${{ matrix.service.name }} — $TS" >> $GITHUB_OUTPUT
+
+      - name: Download service artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.service.artifact }}
+          path: _dl
+
+      - name: Guard if artifact exists
+        id: guard
+        shell: bash
+        run: |
+          FILE="_dl/${{ matrix.service.zip }}"
+          if [ ! -f "$FILE" ]; then
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No artifact file: $FILE — skipping release."
+          else
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "Artifact: $FILE"
+          fi
+
+      - name: Create GitHub Release (per-service)
+        if: steps.guard.outputs.found == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.stamp.outputs.tag }}
+          name: ${{ steps.stamp.outputs.name }}
+          draft: false
+          prerelease: false
+          files: |
+            _dl/${{ matrix.service.zip }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  finalize:
+    needs:
+      - prepare
+      - service-releases
     runs-on: ubuntu-24.04
     continue-on-error: true
     steps:
-      - name: Force success (summary)
+      - name: Summary
         if: always()
         shell: bash
         run: |
-          echo "✅ Mount Master completed. Errors may be logged above, but workflow stayed green by design."
+          echo "✅ Mount Master finished. Service releases attempted per matrix; missing artifacts were skipped safely."
