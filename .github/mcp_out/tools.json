@@ -1,0 +1,33 @@
+{
+  "tools": [
+    {
+      "name": "ping",
+      "description": "Return the message back (health-check).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "default": "pong",
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "title": "pingArguments"
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "result": {
+            "additionalProperties": true,
+            "title": "Result",
+            "type": "object"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "pingOutput"
+      }
+    }
+  ]
+}
